@@ -89,6 +89,10 @@ pub struct UiState {
     pub undo_press: f64,         // tiempo (s) del ultimo clic en deshacer (animacion de pulsacion)
     pub redo_press: f64,         // tiempo (s) del ultimo clic en rehacer
     pub dot_drag: bool,          // arrastrando el punto colapsado (solo si el gesto empezo dentro)
+    /// TextureId de la miniatura de cada pincel de Photoshop (paralelo al catalogo
+    /// `ps_brushes`), para dibujar los slots que contengan un `PsBrush`. `None` = aun
+    /// no se ha subido a egui.
+    pub ps_thumb_ids: Vec<Option<egui::TextureId>>,
 }
 
 impl Default for UiState {
@@ -134,6 +138,7 @@ impl Default for UiState {
             undo_press: -1.0,
             redo_press: -1.0,
             dot_drag: false,
+            ps_thumb_ids: Vec::new(),
         }
     }
 }
@@ -222,6 +227,11 @@ pub struct UiActions {
     pub redo: bool,
     pub clear: bool,
     pub layers_dirty: bool, // el panel de capas modifico el documento (re-subir malla)
+    /// Se selecciono un slot de la RUEDA con pincel procedural/herramienta: hay que
+    /// salir del pincel de Photoshop y volver al pincel del slot.
+    pub exit_ps: bool,
+    /// Se selecciono un slot de la rueda que contiene un pincel de Photoshop: activarlo.
+    pub activate_ps: Option<u32>,
 }
 
 // --- Geometria de la rueda (mas pequena que antes) ---
@@ -231,12 +241,14 @@ const R_HOLE: f32 = 28.0;
 const N_SEG: usize = 9;
 const SEG_DEG: f32 = 360.0 / N_SEG as f32;
 
-/// Contenido de un slot de la rueda: vacio (X), un pincel o una herramienta.
+/// Contenido de un slot de la rueda: vacio (X), un pincel, una herramienta o un
+/// pincel de Photoshop (indice en el catalogo `ps_brushes`).
 #[derive(Clone, Copy, PartialEq)]
 pub enum SlotItem {
     Empty,
     Brush(usize), // indice en BRUSHES
     Tool(usize),  // indice en TOOLS
+    PsBrush(u32), // indice en el catalogo de pinceles de Photoshop
 }
 
 fn c32(c: [f32; 4]) -> Color32 {
@@ -417,6 +429,36 @@ fn preview_wave(p: &egui::Painter, c: Pos2, w: f32, thick: f32, col: Color32) {
     p.add(Shape::line(pts, Stroke::new(thick, col)));
 }
 
+/// Onda con grosor VARIABLE (fino en los extremos, grueso en el centro): imita el
+/// trazo de una pluma sensible a la presion.
+fn preview_wave_taper(p: &egui::Painter, c: Pos2, w: f32, max_thick: f32, col: Color32) {
+    let n = 22;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            c + egui::vec2(-w + 2.0 * w * t, (t * 7.0).sin() * w * 0.26)
+        })
+        .collect();
+    for i in 0..n {
+        let t = (i as f32 + 0.5) / n as f32;
+        let taper = (t * std::f32::consts::PI).sin(); // 0 en extremos -> 1 en el centro
+        let thick = (0.7 + (max_thick - 0.7) * taper).max(0.5);
+        p.line_segment([pts[i], pts[i + 1]], Stroke::new(thick, col));
+    }
+}
+
+/// Mini "spray" de aerografo: puntos dispersos a lo largo de una linea.
+fn preview_spray(p: &egui::Painter, c: Pos2, w: f32, col: Color32) {
+    for i in 0..22 {
+        let t = i as f32 / 21.0;
+        let x = -w + 2.0 * w * t;
+        let y = (i as f32 * 2.3).sin() * 5.0 + (i as f32 * 0.9).cos() * 2.5;
+        let a = (140.0 + (i as f32 * 1.3).sin() * 90.0).clamp(40.0, 230.0) as u8;
+        let cc = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a);
+        p.circle_filled(c + egui::vec2(x, y), 1.0, cc);
+    }
+}
+
 fn preview_blob(p: &egui::Painter, c: Pos2, rx: f32, ry: f32, col: Color32) {
     let n = 26;
     let pts: Vec<Pos2> = (0..n)
@@ -499,16 +541,30 @@ fn draw_preview(p: &egui::Painter, c: Pos2, name: &str) {
     }
 }
 
-/// Icono pequeno de un pincel/herramienta para mostrarlo en un slot de la rueda.
+/// Mini-trazo de un pincel/herramienta para el slot de la rueda. Cada PINCEL muestra
+/// un trazo con SU estilo (grosor/forma/textura propios) para distinguirlos de un
+/// vistazo, igual que el panel "Mis pinceles" pero en pequeno.
 fn draw_wheel_item(p: &egui::Painter, pos: Pos2, name: &str, col: Color32) {
+    let w = 12.0; // medio-ancho del mini trazo
     match name {
-        "Acuarela" | "Aerógrafo" | "Rellenar" => preview_blob(p, pos, 10.0, 6.0, col),
+        // --- Pinceles: cada uno con su trazo caracteristico ---
+        "Pluma" => preview_wave(p, pos, w, 3.0, col),
+        "Fuente" => preview_wave(p, pos, w, 2.2, col),
+        "Pluma dinámica" => preview_wave_taper(p, pos, w, 4.6, col),
+        "Ancho fijo" => preview_wave(p, pos, w, 2.4, col),
+        "Cable" => preview_wave(p, pos, w, 1.2, col),
+        "Lápiz suave" => preview_pencil(p, pos, w, 2.4, col),
+        "Lápiz duro" => preview_pencil(p, pos, w, 1.5, col),
+        "Rotulador" => preview_wave(p, pos, w, 6.0, col),
+        "Acuarela" | "Rellenar" => preview_blob(p, pos, 10.0, 6.0, col),
+        "Aerógrafo" => preview_spray(p, pos, w, col),
         "Punteado" => {
             for i in 0..5 {
                 let x = -9.0 + 18.0 * (i as f32 / 4.0);
                 p.circle_filled(pos + egui::vec2(x, (i as f32 * 1.6).sin() * 3.0), 1.6, col);
             }
         }
+        // --- Herramientas: sus iconos ---
         "Selección" => icon_select_cursor(p, pos, 9.0, col),
         "Empujar" => icon_wave(p, pos, 9.0, col),
         "Sector" => icon_sector(p, pos, 9.0, col),
@@ -517,7 +573,19 @@ fn draw_wheel_item(p: &egui::Painter, pos: Pos2, name: &str, col: Color32) {
         "Texto" => {
             p.text(pos, Align2::CENTER_CENTER, "Aa", FontId::proportional(15.0), col);
         }
-        _ => icon_brush_sample(p, pos, 12.0, col), // plumas/lapices
+        _ => preview_wave(p, pos, w, 3.0, col),
+    }
+}
+
+/// Mini-trazo de lapiz: onda con granitos a lo largo (textura granulada).
+fn preview_pencil(p: &egui::Painter, c: Pos2, w: f32, thick: f32, col: Color32) {
+    preview_wave(p, c, w, thick, col);
+    for i in 0..10 {
+        let t = i as f32 / 9.0;
+        let x = -w + 2.0 * w * t;
+        let y = (t * 7.0).sin() * w * 0.26 + (i as f32 * 2.1).cos() * 1.6;
+        let a = (90.0 + (i as f32 * 1.7).sin() * 70.0).clamp(30.0, 180.0) as u8;
+        p.circle_filled(c + egui::vec2(x, y), 0.8, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a));
     }
 }
 
@@ -2114,6 +2182,15 @@ pub fn build_panel(
                     SlotItem::Empty => icon_x(&p, ipos, 10.0, fade(if sel { Color32::WHITE } else { Color32::from_gray(125) }, fi)),
                     SlotItem::Brush(bi) => draw_wheel_item(&p, ipos, BRUSHES[bi], col),
                     SlotItem::Tool(ti) => draw_wheel_item(&p, ipos, TOOLS[ti], col),
+                    // Pincel de Photoshop: dibujar su FORMA real (miniatura) en el slot.
+                    SlotItem::PsBrush(pi) => {
+                        if let Some(Some(tid)) = state.ps_thumb_ids.get(pi as usize) {
+                            let rr = egui::Rect::from_center_size(ipos, egui::vec2(27.0, 27.0));
+                            p.image(*tid, rr, egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), fade(col, fi));
+                        } else {
+                            p.circle_filled(ipos, 6.0, col);
+                        }
+                    }
                 }
             }
 
@@ -2233,20 +2310,27 @@ pub fn build_panel(
                             SlotItem::Empty => {
                                 state.editing_slot = seg;
                                 state.brush_panel = true;
+                                actions.exit_ps = true;
                             }
                             SlotItem::Brush(bi) => {
                                 brush.width = brush_width_for(BRUSHES[bi]);
                                 brush.kind = brush_kind_for(BRUSHES[bi]);
+                                actions.exit_ps = true;
                                 if was_selected {
                                     state.editing_slot = seg;
                                     state.brush_panel = true;
                                 }
                             }
                             SlotItem::Tool(_) => {
+                                actions.exit_ps = true;
                                 if was_selected {
                                     state.editing_slot = seg;
                                     state.brush_panel = true;
                                 }
+                            }
+                            // Pincel de Photoshop asignado a este slot: activarlo (no borrarlo).
+                            SlotItem::PsBrush(pi) => {
+                                actions.activate_ps = Some(pi);
                             }
                         }
                     }
@@ -2298,6 +2382,14 @@ pub fn build_panel(
                         SlotItem::Empty => icon_x(&p, c, 9.0, if sel { Color32::WHITE } else { Color32::from_gray(125) }),
                         SlotItem::Brush(bi) => draw_wheel_item(&p, c, BRUSHES[bi], col),
                         SlotItem::Tool(ti) => draw_wheel_item(&p, c, TOOLS[ti], col),
+                        SlotItem::PsBrush(pi) => {
+                            if let Some(Some(tid)) = state.ps_thumb_ids.get(pi as usize) {
+                                let rr = egui::Rect::from_center_size(c, egui::vec2(22.0, 22.0));
+                                p.image(*tid, rr, egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), col);
+                            } else {
+                                p.circle_filled(c, 5.0, col);
+                            }
+                        }
                     }
                 }
 
@@ -2336,20 +2428,26 @@ pub fn build_panel(
                                     SlotItem::Empty => {
                                         state.editing_slot = seg;
                                         state.brush_panel = true;
+                                        actions.exit_ps = true;
                                     }
                                     SlotItem::Brush(bi) => {
                                         brush.width = brush_width_for(BRUSHES[bi]);
                                         brush.kind = brush_kind_for(BRUSHES[bi]);
+                                        actions.exit_ps = true;
                                         if was {
                                             state.editing_slot = seg;
                                             state.brush_panel = true;
                                         }
                                     }
                                     SlotItem::Tool(_) => {
+                                        actions.exit_ps = true;
                                         if was {
                                             state.editing_slot = seg;
                                             state.brush_panel = true;
                                         }
+                                    }
+                                    SlotItem::PsBrush(pi) => {
+                                        actions.activate_ps = Some(pi);
                                     }
                                 }
                             }
@@ -2430,6 +2528,7 @@ pub fn build_panel(
                                 brush.width = brush_width_for(name);
                                 brush.kind = brush_kind_for(name);
                                 state.brush_panel = false;
+                                actions.exit_ps = true;
                             }
                         }
                     });
@@ -2442,6 +2541,7 @@ pub fn build_panel(
                                 state.slots[state.editing_slot] = SlotItem::Tool(ti);
                                 state.selected_seg = state.editing_slot;
                                 state.brush_panel = false;
+                                actions.exit_ps = true;
                             }
                         }
                     });

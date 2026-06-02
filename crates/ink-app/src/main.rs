@@ -106,6 +106,8 @@ struct App {
     ps_committed: HashMap<u32, Vec<StampVertex>>,
     /// Puntas ya subidas a la GPU.
     ps_uploaded: HashSet<u32>,
+    /// Ajustes por pincel PS (para que cada uno recuerde sus dinamicas al cambiar).
+    ps_settings_map: HashMap<u32, BrushSettings>,
     /// Miniaturas (imagen RGBA) de cada punta, para el selector (estilo PS).
     ps_thumb_imgs: Vec<egui::ColorImage>,
     /// Texturas egui de las miniaturas (carga diferida en el primer frame).
@@ -164,6 +166,7 @@ impl App {
             ps_active_verts: Vec::new(),
             ps_committed: HashMap::new(),
             ps_uploaded: HashSet::new(),
+            ps_settings_map: HashMap::new(),
             ps_thumb_imgs: Vec::new(),
             ps_thumbs: Vec::new(),
             ps_packs: Vec::new(),
@@ -416,23 +419,50 @@ impl App {
         }
     }
 
-    /// Activa un pincel PS del catalogo (lo deja listo para dibujar con stamps).
-    fn select_ps_brush(&mut self, i: u32) {
+    /// Guarda los ajustes del pincel PS activo (si hay) en el mapa por-pincel, para
+    /// que no se pierdan al cambiar de pincel.
+    fn save_ps_settings(&mut self) {
+        if let Some(s) = self.ps_settings.clone() {
+            if let TipKind::Sampled(cur) = s.tip {
+                self.ps_settings_map.insert(cur, s);
+            }
+        }
+    }
+
+    /// Activa el pincel PS `i`: recupera sus ajustes guardados o crea unos por defecto
+    /// (presion -> tamano y flujo, como Photoshop). No reasigna ningun slot.
+    fn activate_ps_brush(&mut self, i: u32) {
         if !self.ensure_tip(i) {
             return;
         }
-        let mut s = BrushSettings::default();
-        s.tip = TipKind::Sampled(i);
-        s.name = self.ps_brushes[i as usize].name.clone().unwrap_or_else(|| format!("Pincel {}", i + 1));
-        s.size = 40.0;
-        s.spacing = 0.10;
-        // Dinamicas por defecto tipo PS: presion -> tamano y flujo.
-        s.shape_dyn = true;
-        s.size_control = ink_core::DynControl::PenPressure;
-        s.min_diameter = 0.0;
-        s.transfer_on = true;
-        s.flow_control = ink_core::DynControl::PenPressure;
+        self.save_ps_settings(); // preservar los del pincel anterior
+        let s = self.ps_settings_map.get(&i).cloned().unwrap_or_else(|| {
+            let mut s = BrushSettings::default();
+            s.tip = TipKind::Sampled(i);
+            s.name = self
+                .ps_brushes
+                .get(i as usize)
+                .and_then(|b| b.name.clone())
+                .unwrap_or_else(|| format!("Pincel {}", i + 1));
+            s.size = 40.0;
+            s.spacing = 0.10;
+            s.shape_dyn = true;
+            s.size_control = ink_core::DynControl::PenPressure;
+            s.min_diameter = 0.0;
+            s.transfer_on = true;
+            s.flow_control = ink_core::DynControl::PenPressure;
+            s
+        });
         self.ps_settings = Some(s);
+    }
+
+    /// Asigna el pincel PS `i` al slot ACTIVO de la rueda y lo activa.
+    fn select_ps_brush(&mut self, i: u32) {
+        let seg = self.ui.selected_seg;
+        if let Some(slot) = self.ui.slots.get_mut(seg) {
+            *slot = ui::SlotItem::PsBrush(i);
+        }
+        self.activate_ps_brush(i);
     }
 
     fn start_stroke_ps(&mut self, pressure: f32) {
@@ -1196,6 +1226,8 @@ impl ApplicationHandler for App {
                         self.ps_thumbs[i] = Some(tex);
                     }
                 }
+                // Pasar a la rueda las miniaturas de los pinceles PS (para los slots PsBrush).
+                self.ui.ps_thumb_ids = self.ps_thumbs.iter().map(|t| t.as_ref().map(|h| h.id())).collect();
 
                 let mut actions = UiActions::default();
                 let mut ps_select: Option<u32> = None;
@@ -1262,7 +1294,9 @@ impl ApplicationHandler for App {
                                                 .horizontal(|ui| {
                                                     let mut c = false;
                                                     if let Some(Some(tex)) = thumbs.get(i) {
-                                                        let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), egui::vec2(44.0, 44.0)));
+                                                        // Miniatura blanca tintada de oscuro (fondo claro del panel).
+                                                        let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), egui::vec2(44.0, 44.0)))
+                                                            .tint(egui::Color32::from_gray(45));
                                                         if ui.add(egui::ImageButton::new(img).selected(selected)).clicked() {
                                                             c = true;
                                                         }
@@ -1312,6 +1346,14 @@ impl ApplicationHandler for App {
                     self.select_ps_brush(i);
                 }
                 if ps_clear {
+                    self.save_ps_settings();
+                    self.ps_settings = None;
+                }
+                // Tocar un slot de la rueda: activar su pincel PS, o salir del modo PS.
+                if let Some(i) = actions.activate_ps {
+                    self.activate_ps_brush(i);
+                } else if actions.exit_ps {
+                    self.save_ps_settings();
                     self.ps_settings = None;
                 }
 
@@ -1443,6 +1485,7 @@ fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings) {
         .default_width(280.0)
         .resizable(false)
         .collapsible(true)
+        .default_open(false)
         .show(ctx, |ui| {
             ui.label(RichText::new(&s.name).italics().color(egui::Color32::from_rgb(40, 120, 220)));
             egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, false]).show(ui, |ui| {
@@ -1560,9 +1603,10 @@ fn make_thumb(b: &ink_brush::SampledBrush, size: usize) -> egui::ColorImage {
         for x in 0..tw.min(size.saturating_sub(ox)) {
             let a = data[y * tw + x];
             let idx = ((oy + y) * size + (ox + x)) * 4;
-            rgba[idx] = 30;
-            rgba[idx + 1] = 30;
-            rgba[idx + 2] = 40;
+            // Blanca: se tinta segun el fondo (oscuro en el selector, claro en la rueda).
+            rgba[idx] = 255;
+            rgba[idx + 1] = 255;
+            rgba[idx + 2] = 255;
             rgba[idx + 3] = a;
         }
     }
