@@ -180,6 +180,70 @@ pub fn tessellate_stroke(samples: &[InputSample], brush: &Brush, out: &mut Vec<V
     }
 }
 
+/// Teselado INCREMENTAL del trazo en vivo: anexa a `out` solo la geometria de la
+/// ULTIMA muestra recien agregada, en vez de re-teselar todo el trazo (que es O(n)
+/// por punto -> O(n^2) por trazo y causa lag al escribir trazos largos).
+///
+/// `out` debe contener ya la geometria de las muestras previas. Devuelve `false` si
+/// el pincel no soporta incremental (tiene estado entre segmentos); en ese caso el
+/// llamador debe re-teselar el trazo completo. No modifica `out` cuando devuelve `false`.
+pub fn tessellate_incremental(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) -> bool {
+    let n = samples.len();
+    if n == 0 {
+        return true;
+    }
+    match brush.kind {
+        BrushKind::Pen | BrushKind::FixedWidth | BrushKind::Marker => {
+            let use_pressure = matches!(brush.kind, BrushKind::Pen);
+            let color = brush.color;
+            if n == 1 {
+                // Punta inicial.
+                emit_circle(out, samples[0].pos, half_width(brush, samples[0].pressure, use_pressure), color);
+            } else {
+                // Cuadrilatero del nuevo segmento + circulo de union/punta del nuevo punto.
+                let p0 = samples[n - 2].pos;
+                let p1 = samples[n - 1].pos;
+                let dir = safe_dir(p1 - p0);
+                let nrm = Vec2::new(-dir.y, dir.x);
+                let hw0 = half_width(brush, samples[n - 2].pressure, use_pressure);
+                let hw1 = half_width(brush, samples[n - 1].pressure, use_pressure);
+                let l0 = p0 + nrm * hw0;
+                let r0 = p0 - nrm * hw0;
+                let l1 = p1 + nrm * hw1;
+                let r1 = p1 - nrm * hw1;
+                out.push(Vertex::new(l0, color));
+                out.push(Vertex::new(r0, color));
+                out.push(Vertex::new(l1, color));
+                out.push(Vertex::new(r0, color));
+                out.push(Vertex::new(r1, color));
+                out.push(Vertex::new(l1, color));
+                emit_circle(out, p1, hw1, color);
+            }
+            true
+        }
+        BrushKind::Pencil => {
+            // Granos del ultimo segmento (mismo hash/indice que el teselado completo).
+            if n >= 2 {
+                pencil_segment(samples[n - 2].pos, samples[n - 1].pos, n - 2, brush, out);
+            }
+            true
+        }
+        BrushKind::Watercolor => {
+            if n >= 2 {
+                watercolor_segment(samples[n - 2].pos, samples[n - 1].pos, n - 2, brush, out);
+            }
+            true
+        }
+        BrushKind::Airbrush => {
+            // El aerografo rocia por MUESTRA (no por segmento): solo la nueva muestra.
+            airbrush_sample(samples[n - 1].pos, n - 1, brush, out);
+            true
+        }
+        // El punteado acumula distancia entre segmentos: no es incremental trivial.
+        BrushKind::Dotted => false,
+    }
+}
+
 /// Trazo de ancho (variable por presion o constante): pluma / ancho fijo / marcador.
 fn stroke_variable(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>, use_pressure: bool) {
     let color = brush.color;
@@ -211,61 +275,74 @@ fn stroke_variable(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>
     }
 }
 
+/// Granos de lapiz de UN segmento (`wi` = indice de ventana, para el hash estable).
+fn pencil_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Vec<Vertex>) {
+    let hw = brush.width * 0.5;
+    let seg = p1 - p0;
+    let len = seg.length();
+    if len < 1e-4 {
+        return;
+    }
+    let dir = seg / len;
+    let nrm = Vec2::new(-dir.y, dir.x);
+    let steps = ((len / (brush.width * 0.3).max(0.5)).ceil() as usize).max(1);
+    for s in 0..steps {
+        let t = s as f32 / steps as f32;
+        let base = p0 + seg * t;
+        for k in 0..3 {
+            let r1 = hash01(wi as i32 * 31 + s as i32, k, 7);
+            let r2 = hash01(wi as i32 * 31 + s as i32, k, 13);
+            let off = nrm * ((r1 - 0.5) * 2.0 * hw);
+            emit_circle(out, base + off, brush.width * 0.16 + 0.4, with_alpha(brush.color, 0.22 + 0.5 * r2));
+        }
+    }
+}
+
 /// Lapiz: granos pequenos con jitter y alfa variable -> textura granulada.
 fn stroke_pencil(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
-    let hw = brush.width * 0.5;
     for (wi, w) in samples.windows(2).enumerate() {
-        let p0 = w[0].pos;
-        let seg = w[1].pos - p0;
-        let len = seg.length();
-        if len < 1e-4 {
-            continue;
-        }
-        let dir = seg / len;
-        let nrm = Vec2::new(-dir.y, dir.x);
-        let steps = ((len / (brush.width * 0.3).max(0.5)).ceil() as usize).max(1);
-        for s in 0..steps {
-            let t = s as f32 / steps as f32;
-            let base = p0 + seg * t;
-            for k in 0..3 {
-                let r1 = hash01(wi as i32 * 31 + s as i32, k, 7);
-                let r2 = hash01(wi as i32 * 31 + s as i32, k, 13);
-                let off = nrm * ((r1 - 0.5) * 2.0 * hw);
-                emit_circle(out, base + off, brush.width * 0.16 + 0.4, with_alpha(brush.color, 0.22 + 0.5 * r2));
-            }
-        }
+        pencil_segment(w[0].pos, w[1].pos, wi, brush, out);
+    }
+}
+
+/// Manchas de acuarela de UN segmento.
+fn watercolor_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Vec<Vertex>) {
+    let col = with_alpha(brush.color, 0.16);
+    let seg = p1 - p0;
+    let len = seg.length();
+    let steps = ((len / (brush.width * 0.4).max(0.5)).ceil() as usize).max(1);
+    for s in 0..=steps {
+        let t = s as f32 / steps as f32;
+        let r = hash01(wi as i32, s as i32, 3);
+        emit_circle(out, p0 + seg * t, brush.width * (1.05 + 0.35 * r), col);
     }
 }
 
 /// Acuarela: manchas grandes de baja opacidad que se acumulan al solaparse.
 fn stroke_watercolor(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
-    let col = with_alpha(brush.color, 0.16);
     for (wi, w) in samples.windows(2).enumerate() {
-        let p0 = w[0].pos;
-        let seg = w[1].pos - p0;
-        let len = seg.length();
-        let steps = ((len / (brush.width * 0.4).max(0.5)).ceil() as usize).max(1);
-        for s in 0..=steps {
-            let t = s as f32 / steps as f32;
-            let r = hash01(wi as i32, s as i32, 3);
-            emit_circle(out, p0 + seg * t, brush.width * (1.05 + 0.35 * r), col);
-        }
+        watercolor_segment(w[0].pos, w[1].pos, wi, brush, out);
+    }
+}
+
+/// Spray de aerografo de UNA muestra (`i` = indice de muestra, para el hash estable).
+fn airbrush_sample(pos: Vec2, i: usize, brush: &Brush, out: &mut Vec<Vertex>) {
+    let col = with_alpha(brush.color, 0.10);
+    for k in 0..18 {
+        let r1 = hash01(i as i32, k, 5);
+        let r2 = hash01(i as i32, k, 9);
+        let r3 = hash01(i as i32, k, 11);
+        let ang = r1 * std::f32::consts::TAU;
+        let rad = r2.sqrt() * brush.width * 0.9;
+        let off = Vec2::new(ang.cos() * rad, ang.sin() * rad);
+        emit_circle(out, pos + off, 1.4, with_alpha(col, 0.5 + 0.5 * r3));
     }
 }
 
 /// Aerografo: spray de puntos pequenos alrededor del trazo.
 fn stroke_airbrush(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
-    let col = with_alpha(brush.color, 0.10);
     for (i, s) in samples.iter().enumerate() {
-        for k in 0..18 {
-            let r1 = hash01(i as i32, k, 5);
-            let r2 = hash01(i as i32, k, 9);
-            let r3 = hash01(i as i32, k, 11);
-            let ang = r1 * std::f32::consts::TAU;
-            let rad = r2.sqrt() * brush.width * 0.9;
-            let off = Vec2::new(ang.cos() * rad, ang.sin() * rad);
-            emit_circle(out, s.pos + off, 1.4, with_alpha(col, 0.5 + 0.5 * r3));
-        }
+        airbrush_sample(s.pos, i, brush, out);
     }
 }
 

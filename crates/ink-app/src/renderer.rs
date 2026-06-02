@@ -4,9 +4,10 @@
 //! calculada por `ink-core` (trazos confirmados y trazo activo) y la dibuja. Toda
 //! la logica de tinta vive en el nucleo; aqui solo subimos buffers y dibujamos.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use ink_core::Vertex;
+use ink_core::{StampVertex, Vertex};
 use winit::window::Window;
 
 /// Color de fondo (papel). Off-white suave.
@@ -25,6 +26,23 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+const STAMP_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+
+fn stamp_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<StampVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &STAMP_ATTRS,
+    }
+}
+
+/// Una punta de pincel ya subida a GPU: bind group con su textura + aspecto (w/h).
+struct TipGpu {
+    bind_group: wgpu::BindGroup,
+    aspect: f32,
+}
+
 /// Buffer de vertices que crece bajo demanda y se actualiza con `write_buffer`
 /// (evita reasignar en cada frame mientras se dibuja).
 struct DynBuffer {
@@ -38,7 +56,7 @@ impl DynBuffer {
         Self { buf: None, capacity: 0, len: 0 }
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[Vertex]) {
+    fn upload<T: bytemuck::Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, verts: &[T]) {
         self.len = verts.len() as u32;
         if verts.is_empty() {
             return;
@@ -57,6 +75,25 @@ impl DynBuffer {
         }
         queue.write_buffer(self.buf.as_ref().unwrap(), 0, bytes);
     }
+
+    /// Anexa SOLO los vertices nuevos al final del buffer (teselado incremental del
+    /// trazo en vivo: O(1) por punto en vez de re-subir todo). Devuelve `false` si no
+    /// caben (hay que crecer); en ese caso el llamador debe hacer `upload` completo.
+    fn append<T: bytemuck::Pod>(&mut self, queue: &wgpu::Queue, new_verts: &[T]) -> bool {
+        if new_verts.is_empty() {
+            return true;
+        }
+        let stride = std::mem::size_of::<T>() as u64;
+        let offset = self.len as u64 * stride;
+        let bytes: &[u8] = bytemuck::cast_slice(new_verts);
+        let needed = offset + bytes.len() as u64;
+        if self.buf.is_none() || needed > self.capacity {
+            return false; // no cabe: el llamador re-sube el mesh completo (crece el buffer)
+        }
+        queue.write_buffer(self.buf.as_ref().unwrap(), offset, bytes);
+        self.len += new_verts.len() as u32;
+        true
+    }
 }
 
 pub struct GpuState {
@@ -74,6 +111,18 @@ pub struct GpuState {
     bg: wgpu::Color,
     pub supported_present_modes: Vec<wgpu::PresentMode>,
     egui_renderer: egui_wgpu::Renderer,
+
+    // --- Pinceles texturizados estilo Photoshop (estampados) ---
+    stamp_pipeline: wgpu::RenderPipeline,
+    tip_bgl: wgpu::BindGroupLayout,
+    tip_sampler: wgpu::Sampler,
+    /// Puntas subidas a GPU, por id.
+    tips: HashMap<u32, TipGpu>,
+    /// Estampados confirmados, agrupados por punta (cada punta = una textura).
+    committed_stamps: HashMap<u32, DynBuffer>,
+    /// Estampados del trazo en curso + su punta.
+    active_stamps: DynBuffer,
+    active_stamp_tip: Option<u32>,
 }
 
 impl GpuState {
@@ -210,6 +259,82 @@ impl GpuState {
             cache: None,
         });
 
+        // --- Pipeline de ESTAMPADOS texturizados (pinceles estilo Photoshop) ---
+        let tip_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tip bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let tip_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tip sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let stamp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("stamp shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("stamp.wgsl").into()),
+        });
+        let stamp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("stamp pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&tip_bgl)],
+            immediate_size: 0,
+        });
+        let stamp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("stamp pipeline"),
+            layout: Some(&stamp_layout),
+            vertex: wgpu::VertexState {
+                module: &stamp_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[stamp_vertex_layout()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &stamp_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: SAMPLE_COUNT,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Renderizador de egui (UI). Debe usar el MISMO numero de muestras MSAA
         // que nuestro render pass, porque dibuja en el mismo attachment.
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -238,6 +363,13 @@ impl GpuState {
             bg: BG,
             supported_present_modes,
             egui_renderer,
+            stamp_pipeline,
+            tip_bgl,
+            tip_sampler,
+            tips: HashMap::new(),
+            committed_stamps: HashMap::new(),
+            active_stamps: DynBuffer::new(),
+            active_stamp_tip: None,
         }
     }
 
@@ -293,6 +425,84 @@ impl GpuState {
 
     pub fn set_active(&mut self, verts: &[Vertex]) {
         self.active.upload(&self.device, &self.queue, verts);
+    }
+
+    /// Anexa vertices al buffer activo (teselado incremental). Devuelve `false` si el
+    /// buffer tuvo que crecer y el llamador debe re-subir el mesh activo completo.
+    pub fn append_active(&mut self, new_verts: &[Vertex]) -> bool {
+        self.active.append(&self.queue, new_verts)
+    }
+
+    // ---------------- Pinceles texturizados (estampados) ----------------
+
+    /// Aspecto (ancho/alto) de una punta ya subida; 1.0 si no existe.
+    pub fn tip_aspect(&self, id: u32) -> f32 {
+        self.tips.get(&id).map_or(1.0, |t| t.aspect)
+    }
+
+    /// Sube una punta (mascara alfa en escala de grises, `w*h` bytes) como textura R8.
+    pub fn upload_tip(&mut self, id: u32, w: u32, h: u32, alpha: &[u8]) {
+        let need = (w as usize) * (h as usize);
+        if w == 0 || h == 0 || alpha.len() < need {
+            return;
+        }
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tip tex"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &alpha[..need],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tip bg"),
+            layout: &self.tip_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.tip_sampler) },
+            ],
+        });
+        self.tips.insert(id, TipGpu { bind_group, aspect: w as f32 / h as f32 });
+    }
+
+    /// Reemplaza los estampados del trazo en curso (de la punta `tip`).
+    pub fn set_active_stamps(&mut self, tip: u32, verts: &[StampVertex]) {
+        self.active_stamp_tip = Some(tip);
+        self.active_stamps.upload(&self.device, &self.queue, verts);
+    }
+
+    /// Anexa estampados al trazo en curso. `false` si hay que re-subir completo.
+    pub fn append_active_stamps(&mut self, new: &[StampVertex]) -> bool {
+        self.active_stamps.append(&self.queue, new)
+    }
+
+    pub fn clear_active_stamps(&mut self) {
+        self.active_stamps.len = 0;
+        self.active_stamp_tip = None;
+    }
+
+    /// Reemplaza los estampados CONFIRMADOS de la punta `tip`.
+    pub fn set_committed_stamps(&mut self, tip: u32, verts: &[StampVertex]) {
+        let buf = self.committed_stamps.entry(tip).or_insert_with(DynBuffer::new);
+        buf.upload(&self.device, &self.queue, verts);
     }
 
     pub fn render(
@@ -379,6 +589,28 @@ impl GpuState {
                 if self.active.len > 0 {
                     rpass.set_vertex_buffer(0, buf.slice(..));
                     rpass.draw(0..self.active.len, 0..1);
+                }
+            }
+
+            // --- Estampados texturizados (pinceles estilo Photoshop) ---
+            rpass.set_pipeline(&self.stamp_pipeline);
+            rpass.set_bind_group(0, &self.camera_bg, &[]);
+            for (tip_id, sbuf) in &self.committed_stamps {
+                if sbuf.len > 0 {
+                    if let (Some(t), Some(b)) = (self.tips.get(tip_id), &sbuf.buf) {
+                        rpass.set_bind_group(1, &t.bind_group, &[]);
+                        rpass.set_vertex_buffer(0, b.slice(..));
+                        rpass.draw(0..sbuf.len, 0..1);
+                    }
+                }
+            }
+            if let (Some(tip_id), Some(b)) = (self.active_stamp_tip, &self.active_stamps.buf) {
+                if self.active_stamps.len > 0 {
+                    if let Some(t) = self.tips.get(&tip_id) {
+                        rpass.set_bind_group(1, &t.bind_group, &[]);
+                        rpass.set_vertex_buffer(0, b.slice(..));
+                        rpass.draw(0..self.active_stamps.len, 0..1);
+                    }
                 }
             }
 

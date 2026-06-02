@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ink-core", "crates/ink-app"]
+members = ["crates/ink-core", "crates/ink-app", "crates/ink-brush"]
 
 [workspace.package]
 version = "0.1.0"

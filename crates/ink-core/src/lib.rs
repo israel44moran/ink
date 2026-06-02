@@ -16,6 +16,7 @@ pub mod camera;
 pub mod document;
 pub mod grid;
 pub mod smoothing;
+pub mod stamping;
 pub mod stroke;
 pub mod tools;
 
@@ -25,7 +26,8 @@ pub use camera::Camera;
 pub use document::{Document, Layer};
 pub use grid::{build_grid, GridKind};
 pub use smoothing::OneEuroFilter;
-pub use stroke::{tessellate_stroke, Brush, BrushKind, InputSample, Stroke, Vertex};
+pub use stamping::{push_stamp_quad, stamp_path, BlendMode, BrushSettings, DynControl, Stamp, StampOutput, StampVertex, TipKind};
+pub use stroke::{tessellate_incremental, tessellate_stroke, Brush, BrushKind, InputSample, Stroke, Vertex};
 pub use tools::{Aabb, TextItem, Tool};
 
 #[cfg(test)]
@@ -59,6 +61,64 @@ mod tests {
         tessellate_stroke(&samples, &brush, &mut out);
         assert!(out.len() % 3 == 0, "deben salir triangulos completos");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn incremental_tessellation_matches_full() {
+        // El teselado incremental (punto a punto, en vivo) debe producir EXACTAMENTE
+        // la misma geometria que el teselado completo (mismo multiset de vertices).
+        let kinds = [
+            BrushKind::Pen,
+            BrushKind::FixedWidth,
+            BrushKind::Marker,
+            BrushKind::Pencil,
+            BrushKind::Watercolor,
+            BrushKind::Airbrush,
+        ];
+        let pts = [
+            vec2(0.0, 0.0),
+            vec2(10.0, 2.0),
+            vec2(22.0, -3.0),
+            vec2(30.0, 5.0),
+            vec2(45.0, 0.5),
+        ];
+        let key = |v: &Vertex| {
+            (
+                v.pos[0].to_bits(),
+                v.pos[1].to_bits(),
+                v.color[0].to_bits(),
+                v.color[1].to_bits(),
+                v.color[2].to_bits(),
+                v.color[3].to_bits(),
+            )
+        };
+        for kind in kinds {
+            let brush = Brush { kind, ..Brush::default() };
+            // Completo.
+            let mut s = Stroke::new(brush);
+            for p in pts {
+                s.push(InputSample { pos: p, pressure: 0.8 });
+            }
+            let mut full = Vec::new();
+            s.tessellate(&mut full);
+            // Incremental: agregar muestra por muestra.
+            let mut samples = Vec::new();
+            let mut inc = Vec::new();
+            for p in pts {
+                samples.push(InputSample { pos: p, pressure: 0.8 });
+                assert!(
+                    tessellate_incremental(&samples, &brush, &mut inc),
+                    "{:?} deberia soportar incremental",
+                    kind
+                );
+            }
+            assert_eq!(full.len(), inc.len(), "conteo de vertices difiere en {:?}", kind);
+            let mut a: Vec<_> = full.iter().map(key).collect();
+            let mut b: Vec<_> = inc.iter().map(key).collect();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "geometria (multiset) difiere en {:?}", kind);
+        }
     }
 
     #[test]

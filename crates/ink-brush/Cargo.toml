@@ -1,0 +1,18 @@
+[package]
+name = "ink-brush"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Parser de pinceles Adobe Photoshop (.abr) -> puntas (mascaras alfa) + metadatos.
+# Portable, sin dependencias de GPU (igual que ink-core): solo produce los datos
+# de cada punta para que la capa de app los suba como texturas.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+# Solo para el ejemplo `dump_abr` que vuelca las puntas a PNG para verificar.
+png = "0.17"

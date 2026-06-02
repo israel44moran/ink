@@ -18,11 +18,13 @@ mod renderer;
 mod settings;
 mod ui;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use ink_core::{
-    vec2, Brush, Camera, Document, InputSample, OneEuroFilter, Stroke, TextItem, Tool, Vec2, Vertex,
+    push_stamp_quad, stamp_path, vec2, Brush, BrushSettings, Camera, Document, InputSample,
+    OneEuroFilter, StampVertex, Stroke, TextItem, TipKind, Tool, Vec2, Vertex,
 };
 use renderer::{present_mode_name, GpuState};
 use settings::Settings;
@@ -65,6 +67,10 @@ struct App {
     panning: bool,
     space_down: bool,
     last_move_time: Instant,
+    /// Instante del ultimo evento tactil/lapiz. Windows genera ademas eventos de
+    /// raton SINTETICOS a partir del tacto; si llegan justo despues de un Touch los
+    /// ignoramos para no dibujar el trazo DOS veces (los "garabatos extra").
+    last_touch: Option<Instant>,
 
     // Trazo activo
     filter: OneEuroFilter,
@@ -84,6 +90,28 @@ struct App {
     selected: Vec<usize>,
     texts: Vec<TextItem>,
     active_text: Option<usize>,
+
+    // --- Pinceles texturizados estilo Photoshop (estampados) ---
+    /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
+    ps_brushes: Vec<ink_brush::SampledBrush>,
+    /// Pincel PS activo (None = usar el pincel procedural normal de la rueda).
+    ps_settings: Option<BrushSettings>,
+    /// Trazo PS en curso.
+    ps_drawing: bool,
+    ps_samples: Vec<InputSample>,
+    ps_index: u32,
+    ps_residual: f32,
+    ps_active_verts: Vec<StampVertex>,
+    /// Estampados confirmados por punta (id -> geometria).
+    ps_committed: HashMap<u32, Vec<StampVertex>>,
+    /// Puntas ya subidas a la GPU.
+    ps_uploaded: HashSet<u32>,
+    /// Miniaturas (imagen RGBA) de cada punta, para el selector (estilo PS).
+    ps_thumb_imgs: Vec<egui::ColorImage>,
+    /// Texturas egui de las miniaturas (carga diferida en el primer frame).
+    ps_thumbs: Vec<Option<egui::TextureHandle>>,
+    /// Packs .abr disponibles en el disco: (nombre, ruta, cargado?).
+    ps_packs: Vec<(String, String, bool)>,
 
     // Ajustes (area de trabajo + interaccion) y geometria de rejilla.
     settings: Settings,
@@ -113,6 +141,7 @@ impl App {
             panning: false,
             space_down: false,
             last_move_time: now,
+            last_touch: None,
             filter: OneEuroFilter::default(),
             active: None,
             active_mesh: Vec::new(),
@@ -126,6 +155,18 @@ impl App {
             selected: Vec::new(),
             texts: Vec::new(),
             active_text: None,
+            ps_brushes: Vec::new(),
+            ps_settings: None,
+            ps_drawing: false,
+            ps_samples: Vec::new(),
+            ps_index: 0,
+            ps_residual: 0.0,
+            ps_active_verts: Vec::new(),
+            ps_committed: HashMap::new(),
+            ps_uploaded: HashSet::new(),
+            ps_thumb_imgs: Vec::new(),
+            ps_thumbs: Vec::new(),
+            ps_packs: Vec::new(),
             settings: Settings::default(),
             grid_mesh: Vec::new(),
             eyedropper_ripple: None,
@@ -135,8 +176,19 @@ impl App {
         }
     }
 
+    /// ¿Hubo un evento tactil/lapiz hace muy poco? Los eventos de raton que llegan en
+    /// esa ventana son SINTETICOS de Windows (eco del tacto) y deben ignorarse.
+    fn touch_recent(&self) -> bool {
+        self.last_touch.map_or(false, |t| t.elapsed().as_millis() < 300)
+    }
+
     fn start_stroke(&mut self, initial_pressure: f32) {
         self.commit_text();
+        // Pincel de Photoshop activo: dibujar con estampados texturizados.
+        if self.ps_settings.is_some() {
+            self.start_stroke_ps(initial_pressure);
+            return;
+        }
         // Las herramientas (seleccion, etc.) y los slots vacios no dibujan tinta.
         if !self.ui.drawing_enabled() {
             return;
@@ -184,6 +236,24 @@ impl App {
     }
 
     fn add_point(&mut self, raw_world: Vec2, pressure: f32) {
+        if self.ps_drawing {
+            self.add_point_ps(raw_world, pressure);
+            return;
+        }
+        // Guarda ANTI-SALTO: si el punto nuevo salta una distancia descomunal en
+        // PANTALLA (el cursor "reaparecio" lejos: lapiz que se levanta y baja en otro
+        // sitio, evento perdido, re-entrada a la ventana), no trazamos la recta que
+        // cruzaria el lienzo. Cerramos el trazo actual; el siguiente movimiento o toque
+        // empezara uno nuevo. El umbral es alto para no cortar trazos rapidos legitimos.
+        if self.active.as_ref().map_or(false, |s| !s.samples.is_empty()) {
+            let jump_px = (raw_world - self.last_sample_pos).length() * self.camera.zoom;
+            let limit = self.camera.viewport.min_element() * 0.5;
+            if jump_px > limit {
+                self.finish_stroke();
+                return;
+            }
+        }
+
         let now = Instant::now();
         let dt = (now - self.last_sample_time).as_secs_f32().max(1e-4);
         let filtered = self.filter.filter(raw_world, dt);
@@ -201,17 +271,36 @@ impl App {
         }
 
         if changed {
-            self.active_mesh.clear();
-            if let Some(st) = &self.active {
+            self.upload_active_incremental();
+        }
+    }
+
+    /// Sube la geometria del trazo en vivo a la GPU de forma INCREMENTAL: tesela solo
+    /// la ultima muestra y la anexa (O(1) por punto). Si el pincel tiene estado entre
+    /// segmentos, o el buffer tuvo que crecer, re-tesela/re-sube el trazo completo.
+    fn upload_active_incremental(&mut self) {
+        let Some(st) = self.active.as_ref() else { return };
+        let prev = self.active_mesh.len();
+        let incremental = ink_core::tessellate_incremental(&st.samples, &st.brush, &mut self.active_mesh);
+        if let Some(g) = self.gpu.as_mut() {
+            if incremental {
+                // Anexar solo lo nuevo; si el buffer crecio, re-subir todo.
+                if !g.append_active(&self.active_mesh[prev..]) {
+                    g.set_active(&self.active_mesh);
+                }
+            } else {
+                self.active_mesh.clear();
                 st.tessellate(&mut self.active_mesh);
-            }
-            if let Some(g) = self.gpu.as_mut() {
                 g.set_active(&self.active_mesh);
             }
         }
     }
 
     fn finish_stroke(&mut self) {
+        if self.ps_drawing {
+            self.finish_stroke_ps();
+            return;
+        }
         self.drawing = false;
         if let Some(stroke) = self.active.take() {
             if !stroke.samples.is_empty() {
@@ -230,6 +319,221 @@ impl App {
             g.set_committed(self.doc.committed_vertices());
         }
     }
+
+    // =====================================================================
+    // Pinceles texturizados estilo Photoshop (estampados)
+    // =====================================================================
+
+    /// Carga un pack .abr al catalogo (parsea las puntas; reduce el alfa para controlar
+    /// la RAM y genera las miniaturas; las texturas se suben luego bajo demanda).
+    fn load_ps_pack(&mut self, path: &str) -> usize {
+        // Evitar recargar un pack ya cargado.
+        if self.ps_packs.iter().any(|(_, pp, loaded)| pp == path && *loaded) {
+            return 0;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => match ink_brush::parse_abr(&bytes) {
+                Ok(brushes) => {
+                    let n = brushes.len();
+                    for mut b in brushes {
+                        // Reducir a un maximo de 512px: ahorra mucha RAM con cientos de
+                        // puntas grandes y a tamanos de pincel normales no se nota.
+                        let (w, h, data) = downscale_alpha(b.width, b.height, &b.alpha, 512);
+                        b.width = w;
+                        b.height = h;
+                        b.alpha = data;
+                        self.ps_thumb_imgs.push(make_thumb(&b, 46));
+                        self.ps_thumbs.push(None);
+                        self.ps_brushes.push(b);
+                    }
+                    if let Some(p) = self.ps_packs.iter_mut().find(|(_, pp, _)| pp == path) {
+                        p.2 = true;
+                    }
+                    log::info!("Pincel PS: cargadas {n} puntas de {path}");
+                    n
+                }
+                Err(e) => {
+                    log::warn!("No se pudo parsear {path}: {e}");
+                    0
+                }
+            },
+            Err(e) => {
+                log::warn!("No se pudo leer {path}: {e}");
+                0
+            }
+        }
+    }
+
+    /// Crea un pincel REDONDO procedural (punta generada por dureza) y lo activa.
+    /// Es el caso mas simple de "crear pincel nuevo".
+    fn create_round_brush(&mut self, hardness: f32) {
+        let size = 128usize;
+        let r = size as f32 / 2.0;
+        let mut alpha = vec![0u8; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 - r + 0.5;
+                let dy = y as f32 - r + 0.5;
+                let d = (dx * dx + dy * dy).sqrt() / r;
+                // Falloff: opaco hasta `hardness`, decae a 0 en el borde.
+                let a = if d >= 1.0 {
+                    0.0
+                } else if d <= hardness {
+                    1.0
+                } else {
+                    1.0 - (d - hardness) / (1.0 - hardness).max(1e-3)
+                };
+                alpha[y * size + x] = (a.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+        let idx = self.ps_brushes.len();
+        let b = ink_brush::SampledBrush {
+            id: format!("round-{idx}"),
+            name: Some(if hardness > 0.5 { "Redondo duro".into() } else { "Redondo suave".into() }),
+            width: size as u32,
+            height: size as u32,
+            alpha,
+        };
+        self.ps_thumb_imgs.push(make_thumb(&b, 46));
+        self.ps_thumbs.push(None);
+        self.ps_brushes.push(b);
+        self.select_ps_brush(idx as u32);
+    }
+
+    /// Sube la punta `i` del catalogo a la GPU si aun no esta (con reduccion de tamano).
+    fn ensure_tip(&mut self, i: u32) -> bool {
+        if self.ps_uploaded.contains(&i) {
+            return true;
+        }
+        let Some(b) = self.ps_brushes.get(i as usize) else { return false };
+        let (w, h, data) = downscale_alpha(b.width, b.height, &b.alpha, 1024);
+        if let Some(g) = self.gpu.as_mut() {
+            g.upload_tip(i, w, h, &data);
+            self.ps_uploaded.insert(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Activa un pincel PS del catalogo (lo deja listo para dibujar con stamps).
+    fn select_ps_brush(&mut self, i: u32) {
+        if !self.ensure_tip(i) {
+            return;
+        }
+        let mut s = BrushSettings::default();
+        s.tip = TipKind::Sampled(i);
+        s.name = self.ps_brushes[i as usize].name.clone().unwrap_or_else(|| format!("Pincel {}", i + 1));
+        s.size = 40.0;
+        s.spacing = 0.10;
+        // Dinamicas por defecto tipo PS: presion -> tamano y flujo.
+        s.shape_dyn = true;
+        s.size_control = ink_core::DynControl::PenPressure;
+        s.min_diameter = 0.0;
+        s.transfer_on = true;
+        s.flow_control = ink_core::DynControl::PenPressure;
+        self.ps_settings = Some(s);
+    }
+
+    fn start_stroke_ps(&mut self, pressure: f32) {
+        self.ps_drawing = true;
+        self.ps_samples.clear();
+        self.ps_index = 0;
+        self.ps_residual = 0.0;
+        self.ps_active_verts.clear();
+        let world = self.camera.screen_to_world(self.cursor);
+        let min_cutoff = 3.0 - 2.6 * 0.4;
+        self.filter = OneEuroFilter::new(min_cutoff, 0.015, 1.0);
+        self.last_sample_time = Instant::now();
+        let f = self.filter.filter(world, 1.0 / 120.0);
+        self.last_sample_pos = f;
+        self.ps_samples.push(InputSample { pos: f, pressure: pressure.clamp(0.05, 1.0) });
+        if let Some(g) = self.gpu.as_mut() {
+            g.clear_active_stamps();
+        }
+    }
+
+    fn add_point_ps(&mut self, raw_world: Vec2, pressure: f32) {
+        // Guarda anti-salto (igual que el motor procedural).
+        if !self.ps_samples.is_empty() {
+            let jump = (raw_world - self.last_sample_pos).length() * self.camera.zoom;
+            if jump > self.camera.viewport.min_element() * 0.5 {
+                self.finish_stroke_ps();
+                return;
+            }
+        }
+        let now = Instant::now();
+        let dt = (now - self.last_sample_time).as_secs_f32().max(1e-4);
+        let f = self.filter.filter(raw_world, dt);
+        let min_d = (1.0 / self.camera.zoom).max(1e-4);
+        if self.ps_samples.len() > 1 && (f - self.last_sample_pos).length() < min_d {
+            return;
+        }
+        self.last_sample_pos = f;
+        self.last_sample_time = now;
+        self.ps_samples.push(InputSample { pos: f, pressure });
+
+        let Some(s) = self.ps_settings.clone() else { return };
+        let n = self.ps_samples.len();
+        let out = stamp_path(&self.ps_samples[n - 2..n], &s, self.ps_index, self.ps_residual);
+        self.ps_index = out.next_index;
+        self.ps_residual = out.residual;
+        if out.stamps.is_empty() {
+            return;
+        }
+        let tip = match s.tip {
+            TipKind::Sampled(id) => id,
+            _ => 0,
+        };
+        let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
+        let rgb = [self.brush.color[0], self.brush.color[1], self.brush.color[2]];
+        let prev_len = self.ps_active_verts.len();
+        for st in &out.stamps {
+            push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
+        }
+        if let Some(g) = self.gpu.as_mut() {
+            if prev_len == 0 {
+                g.set_active_stamps(tip, &self.ps_active_verts);
+            } else if !g.append_active_stamps(&self.ps_active_verts[prev_len..]) {
+                g.set_active_stamps(tip, &self.ps_active_verts);
+            }
+        }
+    }
+
+    fn finish_stroke_ps(&mut self) {
+        self.ps_drawing = false;
+        let s = match self.ps_settings.clone() {
+            Some(s) => s,
+            None => return,
+        };
+        let tip = match s.tip {
+            TipKind::Sampled(id) => id,
+            _ => 0,
+        };
+        // Un solo toque sin movimiento: estampar un punto.
+        if self.ps_active_verts.is_empty() && self.ps_samples.len() == 1 {
+            let out = stamp_path(&self.ps_samples, &s, 0, 0.0);
+            let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
+            let rgb = [self.brush.color[0], self.brush.color[1], self.brush.color[2]];
+            for st in &out.stamps {
+                push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
+            }
+        }
+        if !self.ps_active_verts.is_empty() {
+            let v = self.ps_committed.entry(tip).or_default();
+            v.extend_from_slice(&self.ps_active_verts);
+            let verts = v.clone();
+            if let Some(g) = self.gpu.as_mut() {
+                g.set_committed_stamps(tip, &verts);
+            }
+        }
+        self.ps_active_verts.clear();
+        self.ps_samples.clear();
+        if let Some(g) = self.gpu.as_mut() {
+            g.clear_active_stamps();
+        }
+    }
+
 
     // =====================================================================
     // Motores de las herramientas (seleccion, empujar, sector, mascaras, texto)
@@ -579,6 +883,21 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.egui_state = Some(egui_state);
+
+        // Descubrir todos los packs .abr del usuario y cargar uno por defecto.
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let base = format!(r"{home}\Downloads\Photoshop Brushes");
+        self.ps_packs = scan_packs(&base);
+        let default_path = self
+            .ps_packs
+            .iter()
+            .find(|(n, _, _)| n.contains("Size Flow"))
+            .or_else(|| self.ps_packs.first())
+            .map(|(_, p, _)| p.clone());
+        if let Some(p) = default_path {
+            self.load_ps_pack(&p);
+        }
+
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -605,7 +924,20 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::CursorLeft { .. } => {
+                // El cursor/lapiz salio del area: cerrar el trazo en curso para no
+                // trazar una recta al re-entrar lejos (evita las "rayas que cruzan").
+                if self.drawing {
+                    self.finish_stroke();
+                }
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
+                // Ignorar el movimiento de raton SINTETICO que Windows genera tras un
+                // toque del lapiz (el Touch ya lo maneja); evita el trazo duplicado.
+                if self.touch_recent() {
+                    return;
+                }
                 let now = Instant::now();
                 let cur = vec2(position.x as f32, position.y as f32);
                 let dt_move = (now - self.last_move_time).as_secs_f32().max(1e-4);
@@ -618,7 +950,7 @@ impl ApplicationHandler for App {
                 } else if self.gesture.is_some() {
                     self.cursor = cur;
                     self.tool_drag();
-                } else if self.drawing {
+                } else if self.drawing || self.ps_drawing {
                     let world = self.camera.screen_to_world(cur);
                     let pressure = (1.0 - (speed / 2600.0).clamp(0.0, 0.7)).clamp(0.05, 1.0);
                     self.add_point(world, pressure);
@@ -626,6 +958,12 @@ impl ApplicationHandler for App {
 
                 self.cursor = cur;
                 self.last_cursor = cur;
+            }
+
+            WindowEvent::MouseInput { state, button, .. } if self.touch_recent() => {
+                // Clic de raton SINTETICO (eco del lapiz/tacto): ignorar para no iniciar
+                // un segundo trazo encima del tactil.
+                let _ = (state, button);
             }
 
             WindowEvent::MouseInput { state, button, .. } => match button {
@@ -642,6 +980,9 @@ impl ApplicationHandler for App {
                             self.ui.show_colors = false;
                             if self.space_down {
                                 self.panning = true;
+                            } else if self.ps_settings.is_some() {
+                                // Pincel PS activo: tiene prioridad sobre herramientas.
+                                self.start_stroke(0.5);
                             } else if let Some(tool) = self.ui.active_tool() {
                                 self.tool_press(tool);
                             } else {
@@ -686,6 +1027,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Touch(t) => {
+                // Marca el instante del tacto/lapiz para suprimir el eco de raton sintetico.
+                self.last_touch = Some(Instant::now());
                 let loc = vec2(t.location.x as f32, t.location.y as f32);
                 let pressure = match t.force {
                     Some(Force::Normalized(n)) => n as f32,
@@ -701,13 +1044,20 @@ impl ApplicationHandler for App {
                 match t.phase {
                     TouchPhase::Started => {
                         if !egui_consumed {
+                            // Si quedo un trazo sin cerrar (se perdio el Ended), ciERRalo
+                            // antes de empezar otro para no encadenar una recta entre ambos.
+                            if self.drawing {
+                                self.finish_stroke();
+                            }
                             self.cursor = loc;
                             self.last_cursor = loc;
                             if self.try_eyedropper() {
                                 // Cuentagotas: solo toma color.
                             } else {
                                 self.ui.show_colors = false; // tocar el lienzo cierra el selector
-                                if let Some(tool) = self.ui.active_tool() {
+                                if self.ps_settings.is_some() {
+                                    self.start_stroke(pressure);
+                                } else if let Some(tool) = self.ui.active_tool() {
                                     self.tool_press(tool);
                                 } else {
                                     self.start_stroke(pressure);
@@ -838,15 +1188,131 @@ impl ApplicationHandler for App {
                     can_undo: self.doc.can_undo(),
                     can_redo: self.doc.can_redo(),
                 };
+                // Subir a egui las miniaturas de pincel que falten (carga diferida).
+                for i in 0..self.ps_thumbs.len() {
+                    if self.ps_thumbs[i].is_none() {
+                        let img = self.ps_thumb_imgs[i].clone();
+                        let tex = self.egui_ctx.load_texture(format!("psthumb{i}"), img, egui::TextureOptions::LINEAR);
+                        self.ps_thumbs[i] = Some(tex);
+                    }
+                }
+
                 let mut actions = UiActions::default();
+                let mut ps_select: Option<u32> = None;
+                let mut ps_clear = false;
+                let mut ps_load_pack: Option<String> = None;
+                let mut ps_load_all = false;
+                let mut ps_new_round: Option<f32> = None;
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
                     actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
                     self.draw_overlays(ctx);
+
+                    // --- Panel provisional de pinceles de Photoshop (selector) ---
+                    {
+                        let brushes = &self.ps_brushes;
+                        let thumbs = &self.ps_thumbs;
+                        let packs = &self.ps_packs;
+                        let active_tip = self.ps_settings.as_ref().and_then(|s| match s.tip {
+                            ink_core::TipKind::Sampled(id) => Some(id),
+                            _ => None,
+                        });
+                        egui::Area::new(egui::Id::new("ps_brushes_panel"))
+                            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 56.0))
+                            .show(ctx, |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_max_width(250.0);
+                                    ui.label(egui::RichText::new(format!("Pinceles Photoshop ({})", brushes.len())).strong());
+                                    // Gestor de packs.
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt("pack_combo")
+                                            .selected_text(format!("+ Cargar pack ({})", packs.len()))
+                                            .width(160.0)
+                                            .show_ui(ui, |ui| {
+                                                for (name, path, loaded) in packs {
+                                                    let lbl = if *loaded { format!("✓ {name}") } else { name.clone() };
+                                                    if ui.selectable_label(false, lbl).clicked() {
+                                                        ps_load_pack = Some(path.clone());
+                                                    }
+                                                }
+                                            });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Cargar todos").clicked() {
+                                            ps_load_all = true;
+                                        }
+                                        if ui.button("+ Redondo").clicked() {
+                                            ps_new_round = Some(1.0);
+                                        }
+                                        if ui.button("+ Suave").clicked() {
+                                            ps_new_round = Some(0.0);
+                                        }
+                                    });
+                                    if active_tip.is_some() {
+                                        if ui.button("Volver al pincel normal").clicked() {
+                                            ps_clear = true;
+                                        }
+                                    }
+                                    ui.separator();
+                                    egui::ScrollArea::vertical().max_height(470.0).auto_shrink([false, false]).show(ui, |ui| {
+                                        for (i, b) in brushes.iter().enumerate() {
+                                            let selected = active_tip == Some(i as u32);
+                                            let clicked = ui
+                                                .horizontal(|ui| {
+                                                    let mut c = false;
+                                                    if let Some(Some(tex)) = thumbs.get(i) {
+                                                        let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), egui::vec2(44.0, 44.0)));
+                                                        if ui.add(egui::ImageButton::new(img).selected(selected)).clicked() {
+                                                            c = true;
+                                                        }
+                                                    }
+                                                    let label = egui::RichText::new(format!("Pincel {}\n{}×{}", i + 1, b.width, b.height)).size(12.0);
+                                                    if ui.selectable_label(selected, label).clicked() {
+                                                        c = true;
+                                                    }
+                                                    c
+                                                })
+                                                .inner;
+                                            if clicked {
+                                                ps_select = Some(i as u32);
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                    }
+
+                    // Panel "Ajustes del pincel" del pincel PS activo (edita en vivo).
+                    if let Some(s) = self.ps_settings.as_mut() {
+                        brush_settings_panel(ctx, s);
+                    }
                 });
                 if let Some(s) = self.egui_state.as_mut() {
                     s.handle_platform_output(window.as_ref(), full_output.platform_output);
+                }
+                if let Some(p) = ps_load_pack {
+                    self.load_ps_pack(&p);
+                }
+                if ps_load_all {
+                    let paths: Vec<String> = self
+                        .ps_packs
+                        .iter()
+                        .filter(|(_, _, loaded)| !*loaded)
+                        .map(|(_, p, _)| p.clone())
+                        .collect();
+                    for p in paths {
+                        self.load_ps_pack(&p);
+                    }
+                }
+                if let Some(h) = ps_new_round {
+                    self.create_round_brush(h);
+                }
+                if let Some(i) = ps_select {
+                    self.select_ps_brush(i);
+                }
+                if ps_clear {
+                    self.ps_settings = None;
                 }
 
                 // Aplicar acciones del panel.
@@ -913,6 +1379,225 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+/// Escanea (recursivo) una carpeta en busca de archivos .abr; devuelve (nombre, ruta).
+fn scan_packs(base: &str) -> Vec<(String, String, bool)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String, bool)>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("abr")) {
+                    let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    out.push((name, p.to_string_lossy().into_owned(), false));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(std::path::Path::new(base), &mut out);
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// Combo de "Control:" (que dinamica modula un parametro), estilo Photoshop.
+fn dyn_combo(ui: &mut egui::Ui, id: &str, ctrl: &mut ink_core::DynControl) {
+    use ink_core::DynControl as D;
+    let label = match ctrl {
+        D::Off => "Desactivado",
+        D::Fade(_) => "Desvanecer",
+        D::PenPressure => "Presión de la pluma",
+        D::PenTilt => "Inclinación",
+        D::StylusWheel => "Rueda del stylus",
+        D::Direction => "Dirección",
+        D::Rotation => "Rotación",
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label)
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(ctrl, D::Off, "Desactivado");
+            ui.selectable_value(ctrl, D::PenPressure, "Presión de la pluma");
+            ui.selectable_value(ctrl, D::Fade(50), "Desvanecer");
+            ui.selectable_value(ctrl, D::Direction, "Dirección");
+        });
+}
+
+/// Una fila "etiqueta + slider 0..100%" para un factor 0..1.
+fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Slider::new(v, 0.0..=1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)));
+        ui.label(label);
+    });
+}
+
+/// Panel "Ajustes del pincel" estilo Photoshop: edita `s` en vivo (el motor de
+/// estampado lo aplica al siguiente trazo). Devuelve nada; muta `s`.
+fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings) {
+    use egui::{CollapsingHeader, RichText, Slider};
+    egui::Window::new(RichText::new("Ajustes del pincel").strong())
+        .id(egui::Id::new("ps_settings_window"))
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 64.0))
+        .default_width(280.0)
+        .resizable(false)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            ui.label(RichText::new(&s.name).italics().color(egui::Color32::from_rgb(40, 120, 220)));
+            egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, false]).show(ui, |ui| {
+                // ---- Forma de la punta del pincel ----
+                CollapsingHeader::new("Forma de la punta").default_open(true).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(Slider::new(&mut s.size, 1.0..=400.0).suffix(" px"));
+                        ui.label("Tamaño");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.flip_x, "Voltear X");
+                        ui.checkbox(&mut s.flip_y, "Voltear Y");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(Slider::new(&mut s.angle, -180.0..=180.0).suffix("°"));
+                        ui.label("Ángulo");
+                    });
+                    pct_row(ui, "Redondez", &mut s.roundness);
+                    pct_row(ui, "Dureza", &mut s.hardness);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.spacing_on, "");
+                        ui.add(Slider::new(&mut s.spacing, 0.01..=2.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)));
+                        ui.label("Espaciado");
+                    });
+                });
+
+                // ---- Dinamica de forma ----
+                CollapsingHeader::new("Dinámica de forma").show(ui, |ui| {
+                    ui.checkbox(&mut s.shape_dyn, "Activar");
+                    ui.add_enabled_ui(s.shape_dyn, |ui| {
+                        pct_row(ui, "Variación del tamaño", &mut s.size_jitter);
+                        ui.horizontal(|ui| {
+                            ui.label("Control:");
+                            dyn_combo(ui, "size_ctrl", &mut s.size_control);
+                        });
+                        pct_row(ui, "Diámetro mínimo", &mut s.min_diameter);
+                        pct_row(ui, "Variación del ángulo", &mut s.angle_jitter);
+                        pct_row(ui, "Variación de la redondez", &mut s.roundness_jitter);
+                        pct_row(ui, "Redondez mínima", &mut s.min_roundness);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut s.flip_x_jitter, "Vibración X");
+                            ui.checkbox(&mut s.flip_y_jitter, "Vibración Y");
+                        });
+                    });
+                });
+
+                // ---- Dispersion ----
+                CollapsingHeader::new("Dispersión").show(ui, |ui| {
+                    ui.checkbox(&mut s.scatter_on, "Activar");
+                    ui.add_enabled_ui(s.scatter_on, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(Slider::new(&mut s.scatter, 0.0..=10.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)));
+                            ui.checkbox(&mut s.scatter_both_axes, "Ambos ejes");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(Slider::new(&mut s.count, 1..=16));
+                            ui.label("Cantidad");
+                        });
+                        pct_row(ui, "Variación de la cantidad", &mut s.count_jitter);
+                    });
+                });
+
+                // ---- Transferencia ----
+                CollapsingHeader::new("Transferencia").show(ui, |ui| {
+                    ui.checkbox(&mut s.transfer_on, "Activar");
+                    ui.add_enabled_ui(s.transfer_on, |ui| {
+                        pct_row(ui, "Variación de opacidad", &mut s.opacity_jitter);
+                        ui.horizontal(|ui| {
+                            ui.label("Control:");
+                            dyn_combo(ui, "op_ctrl", &mut s.opacity_control);
+                        });
+                        pct_row(ui, "Variación de flujo", &mut s.flow_jitter);
+                        ui.horizontal(|ui| {
+                            ui.label("Control:");
+                            dyn_combo(ui, "flow_ctrl", &mut s.flow_control);
+                        });
+                    });
+                });
+
+                // ---- Dinamica de color ----
+                CollapsingHeader::new("Dinámica de color").show(ui, |ui| {
+                    ui.checkbox(&mut s.color_dyn, "Activar");
+                    ui.add_enabled_ui(s.color_dyn, |ui| {
+                        pct_row(ui, "Variación de tono", &mut s.hue_jitter);
+                        pct_row(ui, "Variación de saturación", &mut s.sat_jitter);
+                        pct_row(ui, "Variación de brillo", &mut s.bright_jitter);
+                    });
+                });
+
+                // ---- Casillas simples (estado real; algunas se conectan despues) ----
+                CollapsingHeader::new("Más opciones").show(ui, |ui| {
+                    ui.checkbox(&mut s.noise, "Ruido");
+                    ui.checkbox(&mut s.wet_edges, "Bordes húmedos");
+                    ui.checkbox(&mut s.buildup, "Concentración");
+                    ui.checkbox(&mut s.smoothing, "Suavizar");
+                    ui.checkbox(&mut s.protect_texture, "Proteger textura");
+                });
+
+                ui.separator();
+                pct_row(ui, "Opacidad", &mut s.opacity);
+                pct_row(ui, "Flujo", &mut s.flow);
+            });
+        });
+}
+
+/// Crea una miniatura cuadrada (estilo Photoshop) de una punta: la forma del pincel en
+/// oscuro sobre fondo transparente, centrada, de `size`x`size` px.
+fn make_thumb(b: &ink_brush::SampledBrush, size: usize) -> egui::ColorImage {
+    let (tw, th, data) = downscale_alpha(b.width, b.height, &b.alpha, size as u32);
+    let (tw, th) = (tw as usize, th as usize);
+    let mut rgba = vec![0u8; size * size * 4];
+    let ox = size.saturating_sub(tw) / 2;
+    let oy = size.saturating_sub(th) / 2;
+    for y in 0..th.min(size.saturating_sub(oy)) {
+        for x in 0..tw.min(size.saturating_sub(ox)) {
+            let a = data[y * tw + x];
+            let idx = ((oy + y) * size + (ox + x)) * 4;
+            rgba[idx] = 30;
+            rgba[idx + 1] = 30;
+            rgba[idx + 2] = 40;
+            rgba[idx + 3] = a;
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([size, size], &rgba)
+}
+
+/// Reduce una mascara alfa a un lado maximo `max_dim` (promedio por bloque). Las puntas
+/// .abr pueden ser enormes (hasta 4000px); a tamanos de pincel normales no se nota.
+fn downscale_alpha(w: u32, h: u32, alpha: &[u8], max_dim: u32) -> (u32, u32, Vec<u8>) {
+    let m = w.max(h);
+    if m <= max_dim || w == 0 || h == 0 {
+        return (w, h, alpha.to_vec());
+    }
+    let scale = max_dim as f32 / m as f32;
+    let nw = ((w as f32 * scale).round() as u32).max(1);
+    let nh = ((h as f32 * scale).round() as u32).max(1);
+    let mut out = vec![0u8; (nw * nh) as usize];
+    for y in 0..nh {
+        let y0 = (y * h / nh).min(h - 1);
+        let y1 = (((y + 1) * h / nh).max(y0 + 1)).min(h);
+        for x in 0..nw {
+            let x0 = (x * w / nw).min(w - 1);
+            let x1 = (((x + 1) * w / nw).max(x0 + 1)).min(w);
+            let mut sum = 0u32;
+            let mut cnt = 0u32;
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    sum += alpha[(yy * w + xx) as usize] as u32;
+                    cnt += 1;
+                }
+            }
+            out[(y * nw + x) as usize] = (sum / cnt.max(1)) as u8;
+        }
+    }
+    (nw, nh, out)
 }
 
 fn main() {
