@@ -305,3 +305,201 @@ fn rle_decode(r: &mut Reader, out: &mut [u8], width: usize, height: usize) -> Re
     }
     Ok(())
 }
+
+// ===================================================================
+// Parser del bloque 'desc' (Action Descriptor de Photoshop): nombres,
+// grupos y el UUID de la punta de cada PRESET de pincel.
+// ===================================================================
+
+/// Un preset de pincel del bloque 'desc': nombre legible + UUID de la punta + grupo.
+#[derive(Clone, Debug)]
+pub struct BrushPreset {
+    pub name: String,
+    pub uuid: String,
+    pub group: String,
+}
+
+/// Valor de un Action Descriptor (subconjunto suficiente para pinceles).
+enum OsValue {
+    Descriptor(OsDesc),
+    List(Vec<OsValue>),
+    Text(String),
+    Other,
+}
+
+struct OsDesc {
+    items: Vec<(String, OsValue)>,
+}
+impl OsDesc {
+    fn get(&self, key: &str) -> Option<&OsValue> {
+        self.items.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    fn text(&self, key: &str) -> Option<String> {
+        match self.get(key) {
+            Some(OsValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// String Unicode de PS: u32 (numero de chars) + chars UTF-16BE (terminado en \0).
+fn read_unicode(r: &mut Reader) -> Result<String, AbrError> {
+    let n = r.u32()? as usize;
+    if n > 200_000 {
+        return Err(AbrError::Truncated);
+    }
+    let mut s = String::with_capacity(n);
+    for _ in 0..n {
+        let c = r.u16()?;
+        if c != 0 {
+            s.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}'));
+        }
+    }
+    Ok(s)
+}
+
+/// String "compacto" de PS: u32 len; si len==0 se leen 4 bytes (clave de 4 chars).
+fn read_compact(r: &mut Reader) -> Result<String, AbrError> {
+    let n = r.u32()? as usize;
+    let len = if n == 0 { 4 } else { n };
+    let b = r.take(len)?;
+    Ok(String::from_utf8_lossy(b).trim_end_matches('\0').to_string())
+}
+
+fn read_descriptor(r: &mut Reader, depth: u32) -> Result<OsDesc, AbrError> {
+    let _class_name = read_unicode(r)?;
+    let _class_id = read_compact(r)?;
+    let count = r.u32()? as usize;
+    if count > 100_000 {
+        return Err(AbrError::Truncated);
+    }
+    let mut items = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let key = read_compact(r)?;
+        let val = read_value(r, depth)?;
+        items.push((key, val));
+    }
+    Ok(OsDesc { items })
+}
+
+fn read_value(r: &mut Reader, depth: u32) -> Result<OsValue, AbrError> {
+    if depth > 40 {
+        return Err(AbrError::Truncated);
+    }
+    let t = r.take(4)?.to_vec();
+    let v = match &t[..] {
+        b"Objc" | b"GlbO" => OsValue::Descriptor(read_descriptor(r, depth + 1)?),
+        b"VlLs" => {
+            let n = r.u32()? as usize;
+            if n > 200_000 {
+                return Err(AbrError::Truncated);
+            }
+            let mut list = Vec::with_capacity(n.min(512));
+            for _ in 0..n {
+                list.push(read_value(r, depth + 1)?);
+            }
+            OsValue::List(list)
+        }
+        b"TEXT" => OsValue::Text(read_unicode(r)?),
+        b"tdta" | b"alis" => {
+            let n = r.u32()? as usize;
+            r.skip(n)?;
+            OsValue::Other
+        }
+        b"long" => {
+            r.skip(4)?;
+            OsValue::Other
+        }
+        b"doub" | b"comp" => {
+            r.skip(8)?;
+            OsValue::Other
+        }
+        b"bool" => {
+            r.skip(1)?;
+            OsValue::Other
+        }
+        b"UntF" => {
+            r.skip(12)?; // unidad (4) + f64 (8)
+            OsValue::Other
+        }
+        b"enum" => {
+            let _ = read_compact(r)?;
+            let _ = read_compact(r)?;
+            OsValue::Other
+        }
+        b"type" | b"GlbC" => {
+            let _ = read_unicode(r)?;
+            let _ = read_compact(r)?;
+            OsValue::Other
+        }
+        // Referencias y otros tipos no soportados: abortar esta rama de forma segura.
+        _ => return Err(AbrError::Truncated),
+    };
+    Ok(v)
+}
+
+/// Busca recursivamente un valor TEXT bajo la clave `key`.
+fn find_text(d: &OsDesc, key: &str, depth: u32) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    for (k, v) in &d.items {
+        if k == key {
+            if let OsValue::Text(s) = v {
+                return Some(s.clone());
+            }
+        }
+        if let OsValue::Descriptor(sub) = v {
+            if let Some(s) = find_text(sub, key, depth + 1) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn walk_presets(list: &[OsValue], group: &str, out: &mut Vec<BrushPreset>) {
+    for v in list {
+        if let OsValue::Descriptor(d) = v {
+            // Grupo si contiene una sub-LISTA "Brsh"; preset si su "Brsh" es un Objc.
+            if let Some(OsValue::List(sub)) = d.get("Brsh") {
+                let g = d.text("Nm  ").unwrap_or_else(|| group.to_string());
+                walk_presets(sub, &g, out);
+            } else {
+                // El nombre suele venir como "$$$/Presets/Brushes/Clave=Nombre legible".
+                let raw = d.text("Nm  ").unwrap_or_default();
+                let clean = raw.rsplit('=').next().unwrap_or("").trim();
+                let name = if clean.is_empty() { raw.clone() } else { clean.to_string() };
+                if let Some(uuid) = find_text(d, "sampledData", 0) {
+                    out.push(BrushPreset { name, uuid, group: group.to_string() });
+                }
+            }
+        }
+    }
+}
+
+fn find_sig(bytes: &[u8], sig: &[u8]) -> Option<usize> {
+    bytes.windows(sig.len()).position(|w| w == sig)
+}
+
+/// Parsea los PRESETS de pincel (nombre + grupo + UUID de la punta) del bloque 'desc'.
+/// Localiza la firma `8BIMdesc` directamente (robusto ante el relleno de secciones).
+pub fn parse_presets(bytes: &[u8]) -> Vec<BrushPreset> {
+    let Some(off) = find_sig(bytes, b"8BIMdesc") else {
+        return Vec::new();
+    };
+    let mut r = Reader::new(bytes);
+    r.pos = off + 8; // tras "8BIMdesc"
+    if r.u32().is_err() || r.u32().is_err() {
+        return Vec::new(); // length + version
+    }
+    let root = match read_descriptor(&mut r, 0) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(OsValue::List(list)) = root.get("Brsh") {
+        walk_presets(list, "", &mut out);
+    }
+    out
+}

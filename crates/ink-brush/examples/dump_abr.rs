@@ -27,6 +27,18 @@ fn main() {
         }
     };
 
+    // Presets del bloque 'desc': nombre + grupo + uuid.
+    let presets = ink_brush::parse_presets(&bytes);
+    println!("Presets (con nombre/grupo): {}", presets.len());
+    let mut last_group = String::new();
+    for p in presets.iter().take(60) {
+        if p.group != last_group {
+            println!("  [GRUPO] {}", p.group);
+            last_group = p.group.clone();
+        }
+        println!("      {}  (uuid={})", p.name, p.uuid);
+    }
+
     println!("Puntas encontradas: {}", brushes.len());
     let mut min_d = u32::MAX;
     let mut max_d = 0u32;

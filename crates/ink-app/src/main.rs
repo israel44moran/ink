@@ -30,6 +30,12 @@ use renderer::{present_mode_name, GpuState};
 use settings::Settings;
 use ui::{Stats, UiActions, UiState};
 
+// Pinceles de Photoshop EMPOTRADOS en el binario: el programa "viene con" estos
+// (de fabrica de PS). Default = 18 basicos modernos; Legacy = 214 heredados (incluye
+// secos, humedos y efectos especiales heredados).
+const DEFAULT_BRUSHES_ABR: &[u8] = include_bytes!("../assets/brushes/Default Brushes.abr");
+const LEGACY_BRUSHES_ABR: &[u8] = include_bytes!("../assets/brushes/Legacy Brushes.abr");
+
 /// Gesto de herramienta en curso (coordenadas de mundo).
 enum Gesture {
     /// Seleccion por rectangulo (marquee).
@@ -94,6 +100,10 @@ struct App {
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
     ps_brushes: Vec<ink_brush::SampledBrush>,
+    /// Nombres de las categorias del catalogo (basicos de PS, heredados, packs...).
+    ps_cat_names: Vec<String>,
+    /// Indices de los pinceles que pertenecen a cada categoria (paralelo a ps_cat_names).
+    ps_cat_members: Vec<Vec<u32>>,
     /// Pincel PS activo (None = usar el pincel procedural normal de la rueda).
     ps_settings: Option<BrushSettings>,
     /// Trazo PS en curso.
@@ -158,6 +168,8 @@ impl App {
             texts: Vec::new(),
             active_text: None,
             ps_brushes: Vec::new(),
+            ps_cat_names: Vec::new(),
+            ps_cat_members: Vec::new(),
             ps_settings: None,
             ps_drawing: false,
             ps_samples: Vec::new(),
@@ -327,39 +339,56 @@ impl App {
     // Pinceles texturizados estilo Photoshop (estampados)
     // =====================================================================
 
-    /// Carga un pack .abr al catalogo (parsea las puntas; reduce el alfa para controlar
-    /// la RAM y genera las miniaturas; las texturas se suben luego bajo demanda).
+    /// Anade un conjunto de puntas al catalogo como una CATEGORIA (reduce el alfa para
+    /// controlar la RAM y genera las miniaturas; las texturas se suben bajo demanda).
+    fn load_ps_brushes(&mut self, brushes: Vec<ink_brush::SampledBrush>, cat_name: &str) -> usize {
+        if brushes.is_empty() {
+            return 0;
+        }
+        // Obtener (o crear) la categoria.
+        let cat = self.ps_cat_names.iter().position(|n| n == cat_name).unwrap_or_else(|| {
+            self.ps_cat_names.push(cat_name.to_string());
+            self.ps_cat_members.push(Vec::new());
+            self.ps_cat_names.len() - 1
+        });
+        let mut count = 0;
+        for mut b in brushes {
+            let (w, h, data) = downscale_alpha(b.width, b.height, &b.alpha, 512);
+            b.width = w;
+            b.height = h;
+            b.alpha = data;
+            let idx = self.ps_brushes.len() as u32;
+            self.ps_thumb_imgs.push(make_thumb(&b, 46));
+            self.ps_thumbs.push(None);
+            self.ps_brushes.push(b);
+            self.ps_cat_members[cat].push(idx);
+            count += 1;
+        }
+        count
+    }
+
+    /// Carga un pack .abr del disco al catalogo como una categoria (con nombres reales).
     fn load_ps_pack(&mut self, path: &str) -> usize {
-        // Evitar recargar un pack ya cargado.
         if self.ps_packs.iter().any(|(_, pp, loaded)| pp == path && *loaded) {
             return 0;
         }
+        let cat_name = self
+            .ps_packs
+            .iter()
+            .find(|(_, pp, _)| pp == path)
+            .map(|(n, _, _)| n.clone())
+            .unwrap_or_else(|| "Pack".to_string());
         match std::fs::read(path) {
-            Ok(bytes) => match ink_brush::parse_abr(&bytes) {
-                Ok(brushes) => {
-                    let n = brushes.len();
-                    for mut b in brushes {
-                        // Reducir a un maximo de 512px: ahorra mucha RAM con cientos de
-                        // puntas grandes y a tamanos de pincel normales no se nota.
-                        let (w, h, data) = downscale_alpha(b.width, b.height, &b.alpha, 512);
-                        b.width = w;
-                        b.height = h;
-                        b.alpha = data;
-                        self.ps_thumb_imgs.push(make_thumb(&b, 46));
-                        self.ps_thumbs.push(None);
-                        self.ps_brushes.push(b);
-                    }
-                    if let Some(p) = self.ps_packs.iter_mut().find(|(_, pp, _)| pp == path) {
-                        p.2 = true;
-                    }
-                    log::info!("Pincel PS: cargadas {n} puntas de {path}");
-                    n
+            Ok(bytes) => {
+                let before = self.ps_brushes.len();
+                self.load_ps_named(&bytes, &cat_name);
+                let n = self.ps_brushes.len() - before;
+                if let Some(p) = self.ps_packs.iter_mut().find(|(_, pp, _)| pp == path) {
+                    p.2 = true;
                 }
-                Err(e) => {
-                    log::warn!("No se pudo parsear {path}: {e}");
-                    0
-                }
-            },
+                log::info!("Pincel PS: cargadas {n} puntas de {path}");
+                n
+            }
             Err(e) => {
                 log::warn!("No se pudo leer {path}: {e}");
                 0
@@ -368,39 +397,61 @@ impl App {
     }
 
     /// Crea un pincel REDONDO procedural (punta generada por dureza) y lo activa.
-    /// Es el caso mas simple de "crear pincel nuevo".
     fn create_round_brush(&mut self, hardness: f32) {
-        let size = 128usize;
-        let r = size as f32 / 2.0;
-        let mut alpha = vec![0u8; size * size];
-        for y in 0..size {
-            for x in 0..size {
-                let dx = x as f32 - r + 0.5;
-                let dy = y as f32 - r + 0.5;
-                let d = (dx * dx + dy * dy).sqrt() / r;
-                // Falloff: opaco hasta `hardness`, decae a 0 en el borde.
-                let a = if d >= 1.0 {
-                    0.0
-                } else if d <= hardness {
-                    1.0
-                } else {
-                    1.0 - (d - hardness) / (1.0 - hardness).max(1e-3)
-                };
-                alpha[y * size + x] = (a.clamp(0.0, 1.0) * 255.0) as u8;
+        let idx = self.ps_brushes.len();
+        let name = if hardness > 0.5 { "Redondo duro" } else { "Redondo suave" };
+        let b = generate_round_brush(hardness, name, idx);
+        self.load_ps_brushes(vec![b], "Mis pinceles");
+        self.select_ps_brush(idx as u32);
+    }
+
+    /// Precarga los pinceles de fabrica de PS CLASIFICADOS en las 4 categorias
+    /// (generales/secos/humedos/efectos), con sus nombres reales del bloque 'desc'.
+    fn preload_ps_default(&mut self, bytes: &[u8]) {
+        // Crear las 4 categorias en orden (aunque alguna quede vacia).
+        for c in ["Pinceles generales", "Pinceles secos", "Pinceles húmedos", "Pinceles de efectos especiales"] {
+            if !self.ps_cat_names.iter().any(|n| n == c) {
+                self.ps_cat_names.push(c.to_string());
+                self.ps_cat_members.push(Vec::new());
             }
         }
-        let idx = self.ps_brushes.len();
-        let b = ink_brush::SampledBrush {
-            id: format!("round-{idx}"),
-            name: Some(if hardness > 0.5 { "Redondo duro".into() } else { "Redondo suave".into() }),
-            width: size as u32,
-            height: size as u32,
-            alpha,
-        };
-        self.ps_thumb_imgs.push(make_thumb(&b, 46));
-        self.ps_thumbs.push(None);
-        self.ps_brushes.push(b);
-        self.select_ps_brush(idx as u32);
+        // Generales: dos puntas redondas (difusa y definida).
+        let i0 = self.ps_brushes.len();
+        self.load_ps_brushes(vec![generate_round_brush(1.0, "Circular definido", i0)], "Pinceles generales");
+        let i1 = self.ps_brushes.len();
+        self.load_ps_brushes(vec![generate_round_brush(0.0, "Circular difuso", i1)], "Pinceles generales");
+        // Resto: clasificar cada punta de fabrica por su nombre (del 'desc').
+        let puntas = ink_brush::parse_abr(bytes).unwrap_or_default();
+        let presets = ink_brush::parse_presets(bytes);
+        let mut name_by_uuid: HashMap<String, String> = HashMap::new();
+        for p in presets {
+            name_by_uuid.entry(p.uuid).or_insert(p.name);
+        }
+        for mut b in puntas {
+            let name = name_by_uuid.get(&b.id).cloned();
+            let cat = classify_brush(name.as_deref().unwrap_or(""));
+            b.name = name;
+            self.load_ps_brushes(vec![b], cat);
+        }
+    }
+
+    /// Carga puntas desde bytes aplicando los NOMBRES reales del bloque 'desc', en una
+    /// sola categoria `cat_name`.
+    fn load_ps_named(&mut self, bytes: &[u8], cat_name: &str) {
+        let presets = ink_brush::parse_presets(bytes);
+        let mut name_by_uuid: HashMap<String, String> = HashMap::new();
+        for p in presets {
+            name_by_uuid.entry(p.uuid).or_insert(p.name);
+        }
+        let puntas: Vec<_> = ink_brush::parse_abr(bytes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut b| {
+                b.name = name_by_uuid.get(&b.id).cloned();
+                b
+            })
+            .collect();
+        self.load_ps_brushes(puntas, cat_name);
     }
 
     /// Sube la punta `i` del catalogo a la GPU si aun no esta (con reduccion de tamano).
@@ -472,7 +523,8 @@ impl App {
         self.ps_residual = 0.0;
         self.ps_active_verts.clear();
         let world = self.camera.screen_to_world(self.cursor);
-        let min_cutoff = 3.0 - 2.6 * 0.4;
+        // La suavidad de la rueda (brush.smoothing) controla tambien el trazo PS.
+        let min_cutoff = 3.0 - 2.6 * self.brush.smoothing.clamp(0.0, 1.0);
         self.filter = OneEuroFilter::new(min_cutoff, 0.015, 1.0);
         self.last_sample_time = Instant::now();
         let f = self.filter.filter(world, 1.0 / 120.0);
@@ -914,19 +966,14 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu);
         self.egui_state = Some(egui_state);
 
-        // Descubrir todos los packs .abr del usuario y cargar uno por defecto.
+        // Pinceles de Photoshop PRECARGADOS (empotrados en el programa), clasificados
+        // en las 4 categorias de PS con nombres reales + los heredados.
+        self.preload_ps_default(DEFAULT_BRUSHES_ABR);
+        self.load_ps_named(LEGACY_BRUSHES_ABR, "Pinceles heredados (Photoshop)");
+        // Packs .abr del usuario en disco: disponibles para cargar bajo demanda.
         let home = std::env::var("USERPROFILE").unwrap_or_default();
         let base = format!(r"{home}\Downloads\Photoshop Brushes");
         self.ps_packs = scan_packs(&base);
-        let default_path = self
-            .ps_packs
-            .iter()
-            .find(|(n, _, _)| n.contains("Size Flow"))
-            .or_else(|| self.ps_packs.first())
-            .map(|(_, p, _)| p.clone());
-        if let Some(p) = default_path {
-            self.load_ps_pack(&p);
-        }
 
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1229,6 +1276,15 @@ impl ApplicationHandler for App {
                 // Pasar a la rueda las miniaturas de los pinceles PS (para los slots PsBrush).
                 self.ui.ps_thumb_ids = self.ps_thumbs.iter().map(|t| t.as_ref().map(|h| h.id())).collect();
 
+                // Sincronizacion rueda <-> "Ajustes del pincel": el pincel PS comparte el
+                // tamano y la opacidad con la rueda. Al inicio del frame la rueda parte del
+                // valor del pincel PS; al final se propaga el que haya cambiado.
+                let ps_sync_prev = self.ps_settings.as_ref().map(|s| (s.size, s.opacity));
+                if let Some((sz, op)) = ps_sync_prev {
+                    self.brush.width = sz;
+                    self.brush.opacity = op;
+                }
+
                 let mut actions = UiActions::default();
                 let mut ps_select: Option<u32> = None;
                 let mut ps_clear = false;
@@ -1246,6 +1302,8 @@ impl ApplicationHandler for App {
                         let brushes = &self.ps_brushes;
                         let thumbs = &self.ps_thumbs;
                         let packs = &self.ps_packs;
+                        let cat_names = &self.ps_cat_names;
+                        let members = &self.ps_cat_members;
                         let active_tip = self.ps_settings.as_ref().and_then(|s| match s.tip {
                             ink_core::TipKind::Sampled(id) => Some(id),
                             _ => None,
@@ -1287,30 +1345,40 @@ impl ApplicationHandler for App {
                                         }
                                     }
                                     ui.separator();
-                                    egui::ScrollArea::vertical().max_height(470.0).auto_shrink([false, false]).show(ui, |ui| {
-                                        for (i, b) in brushes.iter().enumerate() {
-                                            let selected = active_tip == Some(i as u32);
-                                            let clicked = ui
-                                                .horizontal(|ui| {
-                                                    let mut c = false;
-                                                    if let Some(Some(tex)) = thumbs.get(i) {
-                                                        // Miniatura blanca tintada de oscuro (fondo claro del panel).
-                                                        let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), egui::vec2(44.0, 44.0)))
-                                                            .tint(egui::Color32::from_gray(45));
-                                                        if ui.add(egui::ImageButton::new(img).selected(selected)).clicked() {
-                                                            c = true;
+                                    egui::ScrollArea::vertical().max_height(500.0).auto_shrink([false, false]).show(ui, |ui| {
+                                        // Agrupado por CATEGORIAS (basicos PS, heredados, packs...).
+                                        for (ci, cname) in cat_names.iter().enumerate() {
+                                            let mem = &members[ci];
+                                            egui::CollapsingHeader::new(egui::RichText::new(format!("{cname}  ({})", mem.len())).strong())
+                                                .id_salt(format!("pscat{ci}"))
+                                                .default_open(ci <= 3)
+                                                .show(ui, |ui| {
+                                                    for &gi in mem {
+                                                        let i = gi as usize;
+                                                        let Some(b) = brushes.get(i) else { continue };
+                                                        let selected = active_tip == Some(gi);
+                                                        let clicked = ui
+                                                            .horizontal(|ui| {
+                                                                let mut c = false;
+                                                                if let Some(Some(tex)) = thumbs.get(i) {
+                                                                    let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), egui::vec2(40.0, 40.0)))
+                                                                        .tint(egui::Color32::from_gray(45));
+                                                                    if ui.add(egui::ImageButton::new(img).selected(selected)).clicked() {
+                                                                        c = true;
+                                                                    }
+                                                                }
+                                                                let name = b.name.clone().unwrap_or_else(|| format!("Pincel {}", i + 1));
+                                                                if ui.selectable_label(selected, egui::RichText::new(name).size(12.0)).clicked() {
+                                                                    c = true;
+                                                                }
+                                                                c
+                                                            })
+                                                            .inner;
+                                                        if clicked {
+                                                            ps_select = Some(gi);
                                                         }
                                                     }
-                                                    let label = egui::RichText::new(format!("Pincel {}\n{}×{}", i + 1, b.width, b.height)).size(12.0);
-                                                    if ui.selectable_label(selected, label).clicked() {
-                                                        c = true;
-                                                    }
-                                                    c
-                                                })
-                                                .inner;
-                                            if clicked {
-                                                ps_select = Some(i as u32);
-                                            }
+                                                });
                                         }
                                     });
                                 });
@@ -1319,7 +1387,7 @@ impl ApplicationHandler for App {
 
                     // Panel "Ajustes del pincel" del pincel PS activo (edita en vivo).
                     if let Some(s) = self.ps_settings.as_mut() {
-                        brush_settings_panel(ctx, s);
+                        brush_settings_panel(ctx, s, &self.settings);
                     }
                 });
                 if let Some(s) = self.egui_state.as_mut() {
@@ -1355,6 +1423,28 @@ impl ApplicationHandler for App {
                 } else if actions.exit_ps {
                     self.save_ps_settings();
                     self.ps_settings = None;
+                }
+
+                // Propagar el tamano/opacidad entre la rueda y el pincel PS.
+                let ps_activated = ps_select.is_some() || actions.activate_ps.is_some() || ps_new_round.is_some();
+                if ps_activated {
+                    // Pincel recien activado: su tamano/opacidad mandan en la rueda.
+                    if let Some(s) = self.ps_settings.as_ref() {
+                        self.brush.width = s.size;
+                        self.brush.opacity = s.opacity;
+                    }
+                } else if let (Some((prev_sz, prev_op)), Some(s)) = (ps_sync_prev, self.ps_settings.as_mut()) {
+                    // El que cambio (rueda o ajustes) gana y se copia al otro.
+                    if (self.brush.width - prev_sz).abs() > 1e-4 {
+                        s.size = self.brush.width;
+                    } else {
+                        self.brush.width = s.size;
+                    }
+                    if (self.brush.opacity - prev_op).abs() > 1e-4 {
+                        s.opacity = self.brush.opacity;
+                    } else {
+                        self.brush.opacity = s.opacity;
+                    }
                 }
 
                 // Aplicar acciones del panel.
@@ -1476,8 +1566,9 @@ fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
 }
 
 /// Panel "Ajustes del pincel" estilo Photoshop: edita `s` en vivo (el motor de
-/// estampado lo aplica al siguiente trazo). Devuelve nada; muta `s`.
-fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings) {
+/// estampado lo aplica al siguiente trazo). `cfg` da la unidad de medida (misma que
+/// la rueda). Devuelve nada; muta `s`.
+fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings, cfg: &Settings) {
     use egui::{CollapsingHeader, RichText, Slider};
     egui::Window::new(RichText::new("Ajustes del pincel").strong())
         .id(egui::Id::new("ps_settings_window"))
@@ -1492,7 +1583,8 @@ fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings) {
                 // ---- Forma de la punta del pincel ----
                 CollapsingHeader::new("Forma de la punta").default_open(true).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(Slider::new(&mut s.size, 1.0..=400.0).suffix(" px"));
+                        // Misma unidad de medida que la rueda (pts/px/mm... segun ajustes).
+                        ui.add(Slider::new(&mut s.size, 1.0..=400.0).custom_formatter(|v, _| cfg.format_measure(v as f32)));
                         ui.label("Tamaño");
                     });
                     ui.horizontal(|ui| {
@@ -1589,6 +1681,44 @@ fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings) {
                 pct_row(ui, "Flujo", &mut s.flow);
             });
         });
+}
+
+/// Clasifica un pincel en una de las 4 categorias de Photoshop por su nombre.
+fn classify_brush(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    let has = |kws: &[&str]| kws.iter().any(|k| n.contains(k));
+    if has(&["pencil", "charcoal", "pastel", "drawing", "eraser", "crayon", "lápiz", "lapiz", "carboncillo", "pastel", "borrador"]) {
+        "Pinceles secos"
+    } else if has(&["ink", "oil", "paint", "blender", "wet", "watercolor", "gouache", "tinta", "óleo", "oleo", "acuarela", "húmedo", "humedo", "entintado", "mezclador"]) {
+        "Pinceles húmedos"
+    } else if has(&["spatter", "concept", "foliage", "texture", "scatter", "grunge", "splat", "salpicadura", "concepto", "trama", "efecto"]) {
+        "Pinceles de efectos especiales"
+    } else {
+        "Pinceles generales"
+    }
+}
+
+/// Genera una punta REDONDA procedural (mascara alfa con falloff por dureza).
+fn generate_round_brush(hardness: f32, name: &str, idx: usize) -> ink_brush::SampledBrush {
+    let size = 128usize;
+    let r = size as f32 / 2.0;
+    let mut alpha = vec![0u8; size * size];
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - r + 0.5;
+            let dy = y as f32 - r + 0.5;
+            let d = (dx * dx + dy * dy).sqrt() / r;
+            let a = if d >= 1.0 {
+                0.0
+            } else if d <= hardness {
+                1.0
+            } else {
+                1.0 - (d - hardness) / (1.0 - hardness).max(1e-3)
+            };
+            alpha[y * size + x] = (a.clamp(0.0, 1.0) * 255.0) as u8;
+        }
+    }
+    ink_brush::SampledBrush { id: format!("round-{idx}"), name: Some(name.to_string()), width: size as u32, height: size as u32, alpha }
 }
 
 /// Crea una miniatura cuadrada (estilo Photoshop) de una punta: la forma del pincel en

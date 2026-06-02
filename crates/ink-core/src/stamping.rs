@@ -490,7 +490,8 @@ fn emit_stamps_at(out: &mut Vec<Stamp>, pos: Vec2, pressure: f32, seg_angle: f32
         }
 
         // --- Opacidad / Flujo (Transferencia) ---
-        let mut alpha = s.flow.clamp(0.0, 1.0);
+        // Base = flujo * opacidad (aprox. sin render-por-trazo: la opacidad atenua).
+        let mut alpha = (s.flow * s.opacity).clamp(0.0, 1.0);
         if s.transfer_on {
             if s.flow_jitter > 0.0 {
                 alpha *= 1.0 - hash01(i, 0xF1) * s.flow_jitter;
