@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/ink-core", "crates/ink-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Israel Rivera <israelrivera465@gmail.com>"]
+
+# --- Perfiles de compilacion ---
+# Dev: algo de optimizacion para que una app grafica no vaya a tirones al depurar.
+[profile.dev]
+opt-level = 1
+
+# Las dependencias siempre optimizadas, incluso en dev (wgpu/naga son pesados).
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release: maximo rendimiento. Esto es lo que el usuario final ejecutara.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

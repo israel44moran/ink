@@ -1,0 +1,18 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo lock se versiona para binarios (lo mantenemos)
+# pero ignoramos artefactos locales
+/.cargo/
+
+# IDE / editores
+/.vscode/
+/.idea/
+*.swp
+.DS_Store
+
+# Documentos de prueba generados por la app
+/scratch/
+*.ink
