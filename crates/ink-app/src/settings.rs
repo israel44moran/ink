@@ -165,7 +165,7 @@ impl Default for Settings {
             scale_from: 1.0,
             scale_to: 1.0,
             unit_tab: UnitTab::Digital,
-            unit: Unit::Pts,
+            unit: Unit::Px,
             name_full: false,
             tenths: true,
             show_stroke_length: false,

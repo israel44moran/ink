@@ -2469,33 +2469,33 @@ pub fn build_panel(
         egui::Area::new(egui::Id::new("value_popup"))
             .fixed_pos(pos)
             .show(ctx, |ui| match state.popup {
-                Popup::Size => draw_popup(
-                    ui,
-                    "TAMAÑO",
-                    &[("1.5 pts", 1.5), ("2.5 pts", 2.5), ("4 pts", 4.0), ("6.5 pts", 6.5)],
-                    &mut brush.width,
-                    0.3,
-                    60.0,
-                    icon_grip,
-                ),
-                Popup::Smoothing => draw_popup(
-                    ui,
-                    "SUAVIDAD",
-                    &[("0%", 0.0), ("10%", 0.10), ("50%", 0.50), ("100%", 1.0)],
-                    &mut brush.smoothing,
-                    0.0,
-                    1.0,
-                    icon_brush_sample,
-                ),
-                Popup::Opacity => draw_popup(
-                    ui,
-                    "OPACIDAD",
-                    &[("0%", 0.0), ("25%", 0.25), ("50%", 0.50), ("100%", 1.0)],
-                    &mut brush.opacity,
-                    0.0,
-                    1.0,
-                    icon_opacity,
-                ),
+                Popup::Size => {
+                    // Presets de tamano en la unidad actual (px por defecto), rango amplio
+                    // para cubrir pinceles grandes.
+                    let presets: Vec<(String, f32)> = [4.0_f32, 20.0, 60.0, 150.0]
+                        .iter()
+                        .map(|&v| (cfg.format_measure(v), v))
+                        .collect();
+                    draw_popup(ui, "TAMAÑO", &presets, &mut brush.width, 1.0, 300.0, icon_grip);
+                }
+                Popup::Smoothing => {
+                    let presets = [
+                        ("0%".to_string(), 0.0),
+                        ("10%".to_string(), 0.10),
+                        ("50%".to_string(), 0.50),
+                        ("100%".to_string(), 1.0),
+                    ];
+                    draw_popup(ui, "SUAVIDAD", &presets, &mut brush.smoothing, 0.0, 1.0, icon_brush_sample);
+                }
+                Popup::Opacity => {
+                    let presets = [
+                        ("0%".to_string(), 0.0),
+                        ("25%".to_string(), 0.25),
+                        ("50%".to_string(), 0.50),
+                        ("100%".to_string(), 1.0),
+                    ];
+                    draw_popup(ui, "OPACIDAD", &presets, &mut brush.opacity, 0.0, 1.0, icon_opacity);
+                }
                 Popup::None => {}
             });
     }
@@ -2888,7 +2888,7 @@ fn p_circle(ui: &egui::Ui, c: Pos2, r: f32, fill: Color32) {
 fn draw_popup(
     ui: &mut egui::Ui,
     title: &str,
-    presets: &[(&str, f32)],
+    presets: &[(String, f32)],
     value: &mut f32,
     min: f32,
     max: f32,
@@ -2919,7 +2919,7 @@ fn draw_popup(
         p.text(
             egui::pos2(cx, py),
             Align2::CENTER_CENTER,
-            *lbl,
+            lbl.as_str(),
             FontId::proportional(15.0),
             if sel { Color32::from_gray(20) } else { Color32::from_gray(95) },
         );
