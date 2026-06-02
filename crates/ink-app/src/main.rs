@@ -89,6 +89,9 @@ struct App {
     settings: Settings,
     grid_mesh: Vec<Vertex>,
 
+    // Onda de confirmacion del cuentagotas: (posicion en pantalla, color, instante).
+    eyedropper_ripple: Option<(Vec2, [f32; 4], Instant)>,
+
     // UI (egui)
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
@@ -125,6 +128,7 @@ impl App {
             active_text: None,
             settings: Settings::default(),
             grid_mesh: Vec::new(),
+            eyedropper_ripple: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
             ui: UiState::default(),
@@ -172,6 +176,8 @@ impl App {
         let world = self.camera.screen_to_world(self.cursor);
         if let Some(c) = self.doc.color_at(world) {
             self.brush.color = [c[0], c[1], c[2], self.brush.opacity.clamp(0.0, 1.0)];
+            // Onda de confirmacion en el punto del clic, con el color tomado.
+            self.eyedropper_ripple = Some((self.cursor, c, Instant::now()));
         }
         self.ui.eyedropper = false;
         true
@@ -488,6 +494,33 @@ impl App {
             let c = Pos2::new(self.cursor.x / ppp, self.cursor.y / ppp);
             p.circle_stroke(c, rpx / ppp, Stroke::new(1.0, Color32::from_gray(140)));
         }
+
+        // Cursor de cuentagotas: el icono del gotero sigue al raton (su punta en el cursor).
+        if self.ui.eyedropper {
+            let cur = Pos2::new(self.cursor.x / ppp, self.cursor.y / ppp);
+            let s = 13.0;
+            let c_icon = cur + egui::vec2(0.7071, -0.7071) * s;
+            ui::icon_dropper(&p, c_icon, s, Color32::from_rgb(40, 120, 220));
+        }
+
+        // Onda tipo "agua" al copiar un color con el cuentagotas (del color tomado).
+        if let Some((pos, col, t0)) = self.eyedropper_ripple {
+            let age = t0.elapsed().as_secs_f32();
+            if age < 0.7 {
+                let center = Pos2::new(pos.x / ppp, pos.y / ppp);
+                let base = Color32::from_rgb((col[0] * 255.0) as u8, (col[1] * 255.0) as u8, (col[2] * 255.0) as u8);
+                for k in 0..3 {
+                    let ph = ((age / 0.7) + k as f32 * 0.16).min(1.0);
+                    let radius = (14.0 + ph * 92.0) / ppp;
+                    let a = ((1.0 - ph).powf(1.2).clamp(0.0, 1.0) * 200.0) as u8;
+                    p.circle_stroke(
+                        center,
+                        radius,
+                        Stroke::new(5.0 / ppp, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)),
+                    );
+                }
+            }
+        }
     }
 
     fn set_color(&mut self, idx: usize) {
@@ -599,15 +632,21 @@ impl ApplicationHandler for App {
                 MouseButton::Left => match state {
                     ElementState::Pressed => {
                         if egui_consumed {
-                            // Interaccion con la UI: no dibujar.
+                            // Interaccion con la UI: no dibujar. Si el cuentagotas estaba
+                            // activo y se toca otra opcion, se cancela (vuelve la flecha).
+                            self.ui.eyedropper = false;
                         } else if self.try_eyedropper() {
                             // Cuentagotas: tomo el color y no dibujo.
-                        } else if self.space_down {
-                            self.panning = true;
-                        } else if let Some(tool) = self.ui.active_tool() {
-                            self.tool_press(tool);
                         } else {
-                            self.start_stroke(0.5);
+                            // Tocar el lienzo cierra el selector de color (con animacion).
+                            self.ui.show_colors = false;
+                            if self.space_down {
+                                self.panning = true;
+                            } else if let Some(tool) = self.ui.active_tool() {
+                                self.tool_press(tool);
+                            } else {
+                                self.start_stroke(0.5);
+                            }
                         }
                     }
                     ElementState::Released => {
@@ -666,10 +705,13 @@ impl ApplicationHandler for App {
                             self.last_cursor = loc;
                             if self.try_eyedropper() {
                                 // Cuentagotas: solo toma color.
-                            } else if let Some(tool) = self.ui.active_tool() {
-                                self.tool_press(tool);
                             } else {
-                                self.start_stroke(pressure);
+                                self.ui.show_colors = false; // tocar el lienzo cierra el selector
+                                if let Some(tool) = self.ui.active_tool() {
+                                    self.tool_press(tool);
+                                } else {
+                                    self.start_stroke(pressure);
+                                }
                             }
                         }
                     }
@@ -800,7 +842,7 @@ impl ApplicationHandler for App {
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
-                    actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, stats);
+                    actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
                     self.draw_overlays(ctx);
                 });
                 if let Some(s) = self.egui_state.as_mut() {
@@ -820,17 +862,31 @@ impl ApplicationHandler for App {
                     self.doc.clear();
                     self.sync_committed();
                 }
+                if actions.layers_dirty {
+                    // El panel de capas modifico el documento: re-subir la malla.
+                    self.sync_committed();
+                }
 
                 let ppp = ctx.pixels_per_point();
                 let primitives = ctx.tessellate(full_output.shapes, ppp);
 
                 // Rejilla del lienzo (geometria que se dibuja detras de la tinta).
                 self.grid_mesh.clear();
+                let grid_limit = if self.settings.grid_limit_artboard {
+                    self.settings
+                        .artboard_size()
+                        .map(|(w, h)| (vec2(-w * 0.5, -h * 0.5), vec2(w * 0.5, h * 0.5)))
+                } else {
+                    None
+                };
                 ink_core::build_grid(
                     &mut self.grid_mesh,
                     self.settings.grid,
                     &self.camera,
                     self.settings.grid_size,
+                    self.settings.grid_divisions,
+                    self.settings.grid_line_width,
+                    grid_limit,
                     self.settings.grid_color(),
                 );
                 let bg = self.settings.bg_color();

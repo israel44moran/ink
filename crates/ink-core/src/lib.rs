@@ -22,7 +22,7 @@ pub mod tools;
 pub use glam::{vec2, Vec2};
 
 pub use camera::Camera;
-pub use document::Document;
+pub use document::{Document, Layer};
 pub use grid::{build_grid, GridKind};
 pub use smoothing::OneEuroFilter;
 pub use stroke::{tessellate_stroke, Brush, BrushKind, InputSample, Stroke, Vertex};
@@ -111,7 +111,7 @@ mod tests {
         let mut doc = Document::new();
         doc.add_stroke(line_stroke(vec2(0.0, 0.0), vec2(10.0, 0.0)));
         doc.translate_strokes(&[0], vec2(5.0, -3.0));
-        let s = &doc.strokes[0];
+        let s = &doc.strokes()[0];
         assert!((s.samples[0].pos - vec2(5.0, -3.0)).length() < 1e-4);
         assert!((s.samples[1].pos - vec2(15.0, -3.0)).length() < 1e-4);
     }
@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(doc.stroke_count(), 1);
         // El que queda es el de y=50.
-        assert!((doc.strokes[0].samples[0].pos.y - 50.0).abs() < 1e-4);
+        assert!((doc.strokes()[0].samples[0].pos.y - 50.0).abs() < 1e-4);
     }
 
     #[test]
@@ -135,7 +135,7 @@ mod tests {
         // Empujar cerca del extremo izquierdo.
         let changed = doc.smudge(vec2(0.0, 0.0), vec2(0.0, 20.0), 10.0);
         assert!(changed);
-        let s = &doc.strokes[0];
+        let s = &doc.strokes()[0];
         assert!(s.samples[0].pos.y > 1.0, "la muestra cercana se desplaza");
         assert!(s.samples[1].pos.y.abs() < 1e-3, "la muestra lejana no se mueve");
     }

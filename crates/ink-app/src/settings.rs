@@ -106,7 +106,13 @@ pub struct Settings {
     pub bg: BgKind,
     pub bg_custom: [f32; 4],
     pub grid: GridKind,
-    pub grid_size: f32, // separacion base de celda en unidades de mundo
+    pub grid_size: f32,         // espaciado entre lineas principales (unidades de mundo)
+    pub grid_divisions: u32,    // divisiones entre lineas principales (1 = solo principales)
+    pub grid_line_width: f32,   // grosor de linea (pts)
+    pub grid_color_auto: bool,  // color automatico (segun fondo) o personalizado
+    pub grid_color_custom: [f32; 4],
+    pub grid_opacity: f32,      // opacidad de la rejilla 0..1
+    pub grid_limit_artboard: bool, // solo dibujar dentro de la mesa de trabajo
 
     // --- Mesa de trabajo ---
     pub artboard: Artboard,
@@ -149,6 +155,12 @@ impl Default for Settings {
             bg_custom: [0.96, 0.96, 0.98, 1.0],
             grid: GridKind::None,
             grid_size: 24.0,
+            grid_divisions: 1,
+            grid_line_width: 1.0,
+            grid_color_auto: true,
+            grid_color_custom: [0.55, 0.72, 0.90, 1.0],
+            grid_opacity: 0.2,
+            grid_limit_artboard: false,
             artboard: Artboard::Infinite,
             scale_from: 1.0,
             scale_to: 1.0,
@@ -199,13 +211,19 @@ impl Settings {
         0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
     }
 
-    /// Color de las lineas de rejilla (claras sobre fondo oscuro y viceversa).
+    /// Color de las lineas de rejilla. Automatico = se adapta al fondo (claras sobre
+    /// oscuro y viceversa); personalizado = el color elegido. Aplica la opacidad.
     pub fn grid_color(&self) -> [f32; 4] {
-        if self.bg_luma() > 0.5 {
-            [0.0, 0.0, 0.05, 0.16]
+        let rgb = if self.grid_color_auto {
+            if self.bg_luma() > 0.5 {
+                [0.0, 0.0, 0.05]
+            } else {
+                [1.0, 1.0, 1.0]
+            }
         } else {
-            [1.0, 1.0, 1.0, 0.20]
-        }
+            [self.grid_color_custom[0], self.grid_color_custom[1], self.grid_color_custom[2]]
+        };
+        [rgb[0], rgb[1], rgb[2], self.grid_opacity.clamp(0.0, 1.0)]
     }
 
     /// Color de tinta por defecto sugerido segun el fondo (oscuro sobre claro).

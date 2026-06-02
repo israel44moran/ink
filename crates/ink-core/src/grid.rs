@@ -115,14 +115,24 @@ fn parallel_lines(
 
 /// Construye la rejilla visible y la anexa a `out`.
 ///
-/// - `base`  = separacion base de celda en unidades de mundo.
-/// - `color` = color de las lineas principales (las menores usan menos alfa).
-pub fn build_grid(out: &mut Vec<Vertex>, kind: GridKind, cam: &Camera, base: f32, color: [f32; 4]) {
+/// - `base`      = espaciado entre lineas PRINCIPALES (unidades de mundo).
+/// - `divisions` = subdivisiones entre principales (1 = solo principales).
+/// - `line_width`= grosor de linea (pts).
+/// - `color`     = color de las lineas principales (las menores usan menos alfa).
+pub fn build_grid(out: &mut Vec<Vertex>, kind: GridKind, cam: &Camera, base: f32, divisions: u32, line_width: f32, limit: Option<(Vec2, Vec2)>, color: [f32; 4]) {
     use GridKind::*;
     if matches!(kind, None) || base <= 0.0 {
         return;
     }
-    let (min, max) = visible_rect(cam);
+    let (mut min, mut max) = visible_rect(cam);
+    // "Limitar a la mesa de trabajo": recortar la region a la mesa.
+    if let Some((lmin, lmax)) = limit {
+        min = min.max(lmin);
+        max = max.min(lmax);
+        if min.x >= max.x || min.y >= max.y {
+            return;
+        }
+    }
     // LOD: agrandar la celda hasta que mida >= ~14 px en pantalla.
     let mut step = base.max(0.5);
     let mut guard = 0;
@@ -130,19 +140,26 @@ pub fn build_grid(out: &mut Vec<Vertex>, kind: GridKind, cam: &Camera, base: f32
         step *= 2.0;
         guard += 1;
     }
-    let half = (0.6 / cam.zoom).max(0.0006); // ~1.2 px de grosor
+    let half = (line_width.max(0.2) * 0.55 / cam.zoom).max(0.0004);
     let minor = [color[0], color[1], color[2], color[3] * 0.5];
+    // Espaciado de las subdivisiones (si caben en pantalla).
+    let sub = if divisions > 1 { step / divisions as f32 } else { 0.0 };
+    let draw_sub = sub > 0.0 && sub * cam.zoom >= 6.0;
 
     match kind {
         None => {}
         Squares => {
-            parallel_lines(out, 0.0, step, min, max, half, minor);
-            parallel_lines(out, 90.0, step, min, max, half, minor);
-            // Lineas mayores cada 5 celdas, un poco mas marcadas.
-            parallel_lines(out, 0.0, step * 5.0, min, max, half * 1.5, color);
-            parallel_lines(out, 90.0, step * 5.0, min, max, half * 1.5, color);
+            if draw_sub {
+                parallel_lines(out, 0.0, sub, min, max, half * 0.6, minor);
+                parallel_lines(out, 90.0, sub, min, max, half * 0.6, minor);
+            }
+            parallel_lines(out, 0.0, step, min, max, half, color);
+            parallel_lines(out, 90.0, step, min, max, half, color);
         }
         Lines => {
+            if draw_sub {
+                parallel_lines(out, 0.0, sub, min, max, half * 0.6, minor);
+            }
             parallel_lines(out, 0.0, step, min, max, half, color);
         }
         Dots => {
@@ -189,10 +206,40 @@ pub fn build_grid(out: &mut Vec<Vertex>, kind: GridKind, cam: &Camera, base: f32
             // Linea de horizonte.
             push_line(out, Vec2::new(min.x, vp.y), Vec2::new(max.x, vp.y), half * 1.6, color);
         }
-        // 2 y 3 puntos son funciones Pro: si llegaran a estar activas, caemos a cuadricula.
-        P2 | P3 => {
-            parallel_lines(out, 0.0, step, min, max, half, minor);
-            parallel_lines(out, 90.0, step, min, max, half, minor);
+        P2 => {
+            // Perspectiva de 2 puntos: dos fugas en el horizonte (izquierda y derecha)
+            // + verticales. Rayos en abanico desde cada punto de fuga.
+            let vp_y = cam.screen_to_world(cam.viewport * 0.5).y;
+            let w = max.x - min.x;
+            let r = (max - min).length() * 2.0;
+            let vps = [Vec2::new(min.x - w * 0.35, vp_y), Vec2::new(max.x + w * 0.35, vp_y)];
+            for vp in vps {
+                for i in 0..22 {
+                    let a = (i as f32 / 22.0) * std::f32::consts::TAU;
+                    push_line(out, vp, vp + Vec2::new(a.cos(), a.sin()) * r, half, minor);
+                }
+            }
+            parallel_lines(out, 90.0, step * 1.5, min, max, half, minor);
+            push_line(out, Vec2::new(min.x, vp_y), Vec2::new(max.x, vp_y), half * 1.6, color);
+        }
+        P3 => {
+            // Perspectiva de 3 puntos: dos fugas en el horizonte + una cenital (arriba).
+            let mid = cam.screen_to_world(cam.viewport * 0.5);
+            let w = max.x - min.x;
+            let h = max.y - min.y;
+            let r = (max - min).length() * 2.2;
+            let vps = [
+                Vec2::new(min.x - w * 0.35, mid.y),
+                Vec2::new(max.x + w * 0.35, mid.y),
+                Vec2::new(mid.x, min.y - h * 0.55),
+            ];
+            for vp in vps {
+                for i in 0..22 {
+                    let a = (i as f32 / 22.0) * std::f32::consts::TAU;
+                    push_line(out, vp, vp + Vec2::new(a.cos(), a.sin()) * r, half, minor);
+                }
+            }
+            push_line(out, Vec2::new(min.x, mid.y), Vec2::new(max.x, mid.y), half * 1.4, color);
         }
     }
 }
