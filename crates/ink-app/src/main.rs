@@ -358,12 +358,10 @@ impl App {
         if !self.ui.drawing_enabled() {
             return;
         }
-        // Suavidad -> frecuencia de corte del filtro One-Euro (mas suave = menor corte).
-        // Valores altos = trazo MUY preciso (pegado a la punta, sin recortar esquinas ni
-        // ir con retraso); `beta` alto deja que el filtro "se abra" con la velocidad para
-        // seguir fielmente los trazos rapidos. La suavidad de la rueda solo modula el corte.
-        let min_cutoff = 9.0 - 7.0 * self.brush.smoothing.clamp(0.0, 1.0);
-        self.filter = OneEuroFilter::new(min_cutoff, 0.07, 1.0);
+        // Suavidad (0%=crudo/preciso, 100%=muy estabilizado), calibrada como el Suavizado de
+        // Photoshop. Misma curva para todos los pinceles.
+        let (min_cutoff, beta) = smoothing_filter_params(self.brush.smoothing);
+        self.filter = OneEuroFilter::new(min_cutoff, beta, 1.0);
         self.last_sample_time = Instant::now();
         let world = self.camera.screen_to_world(self.cursor);
         let filtered = self.filter.filter(world, 1.0 / 120.0);
@@ -1058,9 +1056,10 @@ impl App {
         self.ps_residual = 0.0;
         self.ps_active_verts.clear();
         let world = self.camera.screen_to_world(self.cursor);
-        // La suavidad de la rueda (brush.smoothing) controla tambien el trazo PS.
-        let min_cutoff = 3.0 - 2.6 * self.brush.smoothing.clamp(0.0, 1.0);
-        self.filter = OneEuroFilter::new(min_cutoff, 0.015, 1.0);
+        // La suavidad (brush.smoothing) controla el trazo PS con la MISMA calibracion que los
+        // pinceles basicos (0%=crudo, 100%=muy estabilizado).
+        let (min_cutoff, beta) = smoothing_filter_params(self.brush.smoothing);
+        self.filter = OneEuroFilter::new(min_cutoff, beta, 1.0);
         self.last_sample_time = Instant::now();
         let f = self.filter.filter(world, 1.0 / 120.0);
         self.last_sample_pos = f;
@@ -2718,6 +2717,20 @@ fn dyn_combo(ui: &mut egui::Ui, id: &str, ctrl: &mut ink_core::DynControl) {
 }
 
 /// Una fila "etiqueta + slider 0..100%" para un factor 0..1.
+/// Mapea la SUAVIDAD del pincel (0..1, estilo Photoshop) a los parametros del filtro
+/// One-Euro `(min_cutoff, beta)`. Calibrado como el "Suavizado" de Photoshop y comun a TODOS
+/// los pinceles (basicos y de Photoshop):
+///  - 0%   = trazo crudo, sin estabilizar (sigue exactamente la punta).
+///  - 100% = muy estabilizado (linea muy suave, con la "cuerda" elastica tipo PS).
+/// La curva del corte es exponencial para que el efecto se note en todo el rango; `beta`
+/// hace el filtro responsivo a baja suavidad y un paso-bajo puro a suavidad alta.
+fn smoothing_filter_params(smoothing: f32) -> (f32, f32) {
+    let s = smoothing.clamp(0.0, 1.0);
+    let min_cutoff = 64.0 * (0.5f32 / 64.0).powf(s); // ~64 Hz (crudo) -> ~0.5 Hz (muy suave)
+    let beta = 0.15 * (1.0 - s);
+    (min_cutoff, beta)
+}
+
 fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
     ui.horizontal(|ui| {
         ui.add(egui::Slider::new(v, 0.0..=1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)));
