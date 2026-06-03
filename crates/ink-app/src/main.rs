@@ -134,6 +134,12 @@ struct App {
     drawing: bool,
     panning: bool,
     space_down: bool,
+    /// Alt presionado (para Alt + rueda = zoom en los cuadernos de hojas).
+    alt_down: bool,
+    /// Zoom por ARRASTRE (Alt + deslizar el lapiz/raton): activo mientras se arrastra.
+    zooming: bool,
+    /// Punto (pantalla) sobre el que se centra el zoom por arrastre.
+    zoom_anchor: Vec2,
     last_move_time: Instant,
     /// Instante del ultimo evento tactil/lapiz. Windows genera ademas eventos de
     /// raton SINTETICOS a partir del tacto; si llegan justo despues de un Touch los
@@ -278,6 +284,9 @@ impl App {
             drawing: false,
             panning: false,
             space_down: false,
+            alt_down: false,
+            zooming: false,
+            zoom_anchor: Vec2::ZERO,
             last_move_time: now,
             last_touch: None,
             string_pos: Vec2::ZERO,
@@ -1871,7 +1880,15 @@ impl ApplicationHandler for App {
                 let speed = (cur - self.last_cursor).length() / dt_move;
                 self.last_move_time = now;
 
-                if self.panning {
+                if self.zooming {
+                    // Alt + arrastrar = zoom: deslizar hacia ARRIBA acerca, hacia abajo aleja.
+                    if !self.page_locked() {
+                        let dy = self.last_cursor.y - cur.y;
+                        if dy != 0.0 {
+                            self.camera.zoom_at(self.zoom_anchor, 1.01_f32.powf(dy));
+                        }
+                    }
+                } else if self.panning {
                     // Si la hoja esta fijada, no se mueve la camara.
                     if !self.page_locked() {
                         let delta = cur - self.last_cursor;
@@ -1916,7 +1933,11 @@ impl ApplicationHandler for App {
                             // Dibujar/usar herramienta cierra los deslizadores de la rueda
                             // (tamano / opacidad / suavidad).
                             self.ui.popup = ui::Popup::None;
-                            if self.space_down {
+                            if self.alt_down {
+                                // Alt + arrastrar = zoom (deslizar para acercar/alejar).
+                                self.zooming = true;
+                                self.zoom_anchor = self.cursor;
+                            } else if self.space_down {
                                 self.panning = true;
                             } else if self.eraser_mode {
                                 // Goma activa: borra la zona tocada (prioridad maxima).
@@ -1937,7 +1958,9 @@ impl ApplicationHandler for App {
                     }
                     ElementState::Released => {
                         // Siempre cerramos el trazo/pan/gesto para no quedar "pegados".
-                        if self.panning {
+                        if self.zooming {
+                            self.zooming = false;
+                        } else if self.panning {
                             self.panning = false;
                         } else if self.ui.active_tool() == Some(Tool::PolyLasso) {
                             // El lazo poligonal se cierra por clic/doble clic/Enter, no al soltar.
@@ -1971,6 +1994,10 @@ impl ApplicationHandler for App {
                 _ => {}
             },
 
+            WindowEvent::ModifiersChanged(m) => {
+                self.alt_down = m.state().alt_key();
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
                 if !egui_consumed && self.app_mode == AppMode::Canvas {
                     let amount = match delta {
@@ -1978,8 +2005,11 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                     };
                     if amount != 0.0 {
-                        if matches!(self.settings.artboard, settings::Artboard::Infinite) {
-                            // Lienzo infinito: la rueda hace zoom.
+                        // Hace zoom el lienzo infinito siempre; en los cuadernos de hojas la
+                        // rueda pasa de pagina, salvo con Alt (zoom) cuando la hoja no esta fija.
+                        let zoom_now = matches!(self.settings.artboard, settings::Artboard::Infinite)
+                            || (self.alt_down && !self.page_locked());
+                        if zoom_now {
                             let factor = 1.12_f32.powf(amount);
                             self.camera.zoom_at(self.cursor, factor);
                         } else {
@@ -2035,7 +2065,11 @@ impl ApplicationHandler for App {
                                 self.ui.show_ps_panel = false;
                                 self.ui.show_brush_settings = false;
                                 self.ui.popup = ui::Popup::None; // y los deslizadores de la rueda
-                                if self.eraser_mode {
+                                if self.alt_down {
+                                    // Alt + arrastrar el lapiz = zoom (deslizar para acercar/alejar).
+                                    self.zooming = true;
+                                    self.zoom_anchor = loc;
+                                } else if self.eraser_mode {
                                     self.start_stroke(pressure);
                                 } else if self.ps_settings.is_some() {
                                     self.start_stroke(pressure);
@@ -2052,18 +2086,31 @@ impl ApplicationHandler for App {
                         }
                     }
                     TouchPhase::Moved => {
-                        self.cursor = loc;
-                        if self.ui.active_tool() == Some(Tool::PolyLasso) {
-                            // Lazo poligonal: el toque-arrastre solo mueve el preview; no dibuja.
-                        } else if self.gesture.is_some() {
-                            self.tool_drag();
+                        if self.zooming {
+                            // Alt + arrastrar = zoom (arriba acerca, abajo aleja).
+                            if !self.page_locked() {
+                                let dy = self.cursor.y - loc.y;
+                                if dy != 0.0 {
+                                    self.camera.zoom_at(self.zoom_anchor, 1.01_f32.powf(dy));
+                                }
+                            }
+                            self.cursor = loc;
                         } else {
-                            let world = self.camera.screen_to_world(loc);
-                            self.add_point(world, pressure);
+                            self.cursor = loc;
+                            if self.ui.active_tool() == Some(Tool::PolyLasso) {
+                                // Lazo poligonal: el toque-arrastre solo mueve el preview; no dibuja.
+                            } else if self.gesture.is_some() {
+                                self.tool_drag();
+                            } else {
+                                let world = self.camera.screen_to_world(loc);
+                                self.add_point(world, pressure);
+                            }
                         }
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
-                        if self.ui.active_tool() == Some(Tool::PolyLasso) {
+                        if self.zooming {
+                            self.zooming = false;
+                        } else if self.ui.active_tool() == Some(Tool::PolyLasso) {
                             // El lazo poligonal se cierra por toque en el inicio/doble toque/Enter.
                         } else if self.gesture.is_some() {
                             self.tool_release();
