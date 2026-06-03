@@ -2320,17 +2320,53 @@ impl ApplicationHandler for App {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             for (name, infinite, path) in &nb_list {
                                 ui.horizontal(|ui| {
-                                    let tag = if *infinite { "∞" } else { "▭" };
+                                    // Icono del TIPO de cuaderno, DIBUJADO (no glifos: la fuente
+                                    // no trae varios y saldrian como cuadros).
+                                    let (trect, _) = ui.allocate_exact_size(egui::vec2(34.0, 36.0), egui::Sense::hover());
+                                    let tp = ui.painter().clone();
+                                    let tc = trect.center();
+                                    let tcol = egui::Color32::from_gray(150);
+                                    if *infinite {
+                                        // Lienzo infinito: simbolo de infinito (dos aros).
+                                        tp.circle_stroke(tc - egui::vec2(5.5, 0.0), 5.0, egui::Stroke::new(2.0, tcol));
+                                        tp.circle_stroke(tc + egui::vec2(5.5, 0.0), 5.0, egui::Stroke::new(2.0, tcol));
+                                    } else {
+                                        // Cuaderno de hojas: dos paginas apiladas.
+                                        let r1 = egui::Rect::from_min_size(tc + egui::vec2(-8.0, -7.0), egui::vec2(13.0, 16.0));
+                                        let r2 = egui::Rect::from_min_size(tc + egui::vec2(-3.0, -10.0), egui::vec2(13.0, 16.0));
+                                        tp.rect_stroke(r1, egui::CornerRadius::same(2), egui::Stroke::new(1.6, tcol), egui::StrokeKind::Inside);
+                                        tp.rect_filled(r2, egui::CornerRadius::same(2), egui::Color32::from_gray(248));
+                                        tp.rect_stroke(r2, egui::CornerRadius::same(2), egui::Stroke::new(1.6, tcol), egui::StrokeKind::Inside);
+                                    }
+                                    // Boton con el nombre del cuaderno.
                                     if ui
                                         .add(
-                                            egui::Button::new(egui::RichText::new(format!("{tag}   {name}")).size(16.0))
-                                                .min_size(egui::vec2(340.0, 36.0)),
+                                            egui::Button::new(egui::RichText::new(name).size(16.0))
+                                                .min_size(egui::vec2(320.0, 36.0)),
                                         )
                                         .clicked()
                                     {
                                         lib_open = Some(path.clone());
                                     }
-                                    if ui.button("🗑").on_hover_text("Borrar cuaderno").clicked() {
+                                    // Boton BORRAR con icono de papelera dibujado.
+                                    let (drect, dresp) =
+                                        ui.allocate_exact_size(egui::vec2(40.0, 36.0), egui::Sense::click());
+                                    let hovered = dresp.hovered();
+                                    let dp = ui.painter().clone();
+                                    let bg = if hovered { egui::Color32::from_gray(224) } else { egui::Color32::from_gray(238) };
+                                    dp.rect_filled(drect, egui::CornerRadius::same(6), bg);
+                                    let dc = drect.center();
+                                    let dcol = if hovered { egui::Color32::from_rgb(196, 64, 64) } else { egui::Color32::from_gray(110) };
+                                    let st = egui::Stroke::new(1.7, dcol);
+                                    let body = egui::Rect::from_min_max(dc + egui::vec2(-6.0, -2.0), dc + egui::vec2(6.0, 9.0));
+                                    dp.rect_stroke(body, egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
+                                    dp.line_segment([dc + egui::vec2(-8.0, -2.0), dc + egui::vec2(8.0, -2.0)], st); // borde de la tapa
+                                    dp.line_segment([dc + egui::vec2(-3.0, -2.0), dc + egui::vec2(-3.0, -5.0)], st); // asa izquierda
+                                    dp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(3.0, -5.0)], st); // asa arriba
+                                    dp.line_segment([dc + egui::vec2(3.0, -5.0), dc + egui::vec2(3.0, -2.0)], st); // asa derecha
+                                    dp.line_segment([dc + egui::vec2(-2.0, 1.0), dc + egui::vec2(-2.0, 6.0)], st); // ranura izq
+                                    dp.line_segment([dc + egui::vec2(2.0, 1.0), dc + egui::vec2(2.0, 6.0)], st); // ranura der
+                                    if dresp.clicked() {
                                         lib_delete = Some(path.clone());
                                     }
                                 });
