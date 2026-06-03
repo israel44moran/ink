@@ -1568,7 +1568,7 @@ fn workspace_tab(ui: &mut egui::Ui, cfg: &mut crate::settings::Settings, state: 
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        for (a, name) in [(Artboard::Infinite, "Infinito"), (Artboard::R1024x768, "1024x768"), (Artboard::A4, "A4"), (Artboard::R1080p, "1080p")] {
+        for (a, name) in [(Artboard::Infinite, "Lienzo infinito"), (Artboard::R1024x768, "1024x768"), (Artboard::A4, "A4"), (Artboard::R1080p, "1080p")] {
             if ui.selectable_label(cfg.artboard == a, name).clicked() {
                 cfg.artboard = a;
             }

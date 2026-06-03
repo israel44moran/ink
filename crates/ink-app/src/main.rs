@@ -1788,6 +1788,9 @@ impl ApplicationHandler for App {
                             self.ui.brush_panel = false;
                             self.ui.show_ps_panel = false;
                             self.ui.show_brush_settings = false;
+                            // Dibujar/usar herramienta cierra los deslizadores de la rueda
+                            // (tamano / opacidad / suavidad).
+                            self.ui.popup = ui::Popup::None;
                             if self.space_down {
                                 self.panning = true;
                             } else if self.eraser_mode {
@@ -1906,6 +1909,7 @@ impl ApplicationHandler for App {
                                 self.ui.brush_panel = false;
                                 self.ui.show_ps_panel = false;
                                 self.ui.show_brush_settings = false;
+                                self.ui.popup = ui::Popup::None; // y los deslizadores de la rueda
                                 if self.eraser_mode {
                                     self.start_stroke(pressure);
                                 } else if self.ps_settings.is_some() {
@@ -2297,9 +2301,9 @@ impl ApplicationHandler for App {
                                     .hint_text("Mi cuaderno")
                                     .desired_width(220.0),
                             );
-                            ui.selectable_value(&mut self.new_nb_infinite, true, "♾ Infinito");
-                            ui.selectable_value(&mut self.new_nb_infinite, false, "▭ Hojas");
-                            if ui.button(egui::RichText::new("➕ Crear").strong()).clicked() {
+                            ui.selectable_value(&mut self.new_nb_infinite, true, "Lienzo infinito");
+                            ui.selectable_value(&mut self.new_nb_infinite, false, "Cuaderno de hojas");
+                            if ui.button(egui::RichText::new("Crear").strong()).clicked() {
                                 lib_create = true;
                             }
                         });
@@ -2316,7 +2320,7 @@ impl ApplicationHandler for App {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             for (name, infinite, path) in &nb_list {
                                 ui.horizontal(|ui| {
-                                    let tag = if *infinite { "♾" } else { "▭" };
+                                    let tag = if *infinite { "∞" } else { "▭" };
                                     if ui
                                         .add(
                                             egui::Button::new(egui::RichText::new(format!("{tag}   {name}")).size(16.0))
