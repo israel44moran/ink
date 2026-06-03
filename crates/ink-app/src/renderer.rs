@@ -44,6 +44,18 @@ fn stamp_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+// Instancia de disco de borrado: [center.x, center.y, radio, fuerza] = 16 bytes.
+const ERASE_INST_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+
+fn erase_inst_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: 16,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &ERASE_INST_ATTRS,
+    }
+}
+
 /// Una punta de pincel ya subida a GPU: bind group con su textura + aspecto (w/h).
 struct TipGpu {
     bind_group: wgpu::BindGroup,
@@ -143,8 +155,9 @@ pub struct GpuState {
     /// Buffer de parametros de la mascara (origen.xy, inv_size.xy). El origen se MUEVE
     /// para que la ventana de borrado siga al contenido (lienzo infinito).
     mask_params_buf: wgpu::Buffer,
-    /// Buffer de parametros de borrado (centro, radio, fuerza); se actualiza por trazo.
-    erase_params_buf: wgpu::Buffer,
+    /// Buffer de INSTANCIAS de discos de borrado (se reusa entre llamadas). Permite borrar
+    /// muchos discos en un solo draw (sin un submit por disco).
+    erase_inst: DynBuffer,
     /// Pipeline que resta un disco suave en M (goma).
     mask_erase_pipeline: wgpu::RenderPipeline,
     /// Pipeline que sube M bajo geometria de trazo nuevo (para no quedar borrado).
@@ -246,12 +259,6 @@ impl GpuState {
             mapped_at_creation: false,
         });
         queue.write_buffer(&mask_params_buf, 0, bytemuck::cast_slice(&mask_params));
-        let erase_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("erase params"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("erase mask"),
@@ -362,31 +369,21 @@ impl GpuState {
             ],
         });
 
-        // BGL para ESCRIBIR en M (parametros de mascara + de borrado).
+        // BGL para ESCRIBIR en M: solo los parametros de mascara (origen + inv_size). Los
+        // discos de borrado llegan como INSTANCIAS (vertex buffer), no por uniform.
         let mask_render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mask render bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-            ],
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
         });
         let mask_render_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mask render bg"),
             layout: &mask_render_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: mask_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: erase_params_buf.as_entire_binding() },
-            ],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: mask_params_buf.as_entire_binding() }],
         });
 
         // Pipelines que escriben en M (sin MSAA, target R8).
@@ -402,7 +399,7 @@ impl GpuState {
         let mask_erase_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mask erase pipeline"),
             layout: Some(&mask_render_layout),
-            vertex: wgpu::VertexState { module: &mask_shader, entry_point: Some("vs_erase"), buffers: &[], compilation_options: Default::default() },
+            vertex: wgpu::VertexState { module: &mask_shader, entry_point: Some("vs_erase"), buffers: &[erase_inst_layout()], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
                 module: &mask_shader,
                 entry_point: Some("fs_erase"),
@@ -613,7 +610,7 @@ impl GpuState {
             white_sample_bg,
             mask_render_bg,
             mask_params_buf,
-            erase_params_buf,
+            erase_inst: DynBuffer::new(),
             mask_erase_pipeline,
             mask_restore_pipeline,
         }
@@ -658,6 +655,13 @@ impl GpuState {
 
     pub fn set_committed(&mut self, verts: &[Vertex]) {
         self.committed.upload(&self.device, &self.queue, verts);
+    }
+
+    /// Anexa SOLO los vertices de un trazo recien confirmado al buffer committed (sin
+    /// re-subir toda la malla). Devuelve `false` si el buffer tuvo que crecer y el
+    /// llamador debe re-subir el mesh completo con `set_committed`.
+    pub fn append_committed(&mut self, new_verts: &[Vertex]) -> bool {
+        self.committed.append(&self.queue, new_verts)
     }
 
     pub fn set_grid(&mut self, verts: &[Vertex]) {
@@ -766,11 +770,16 @@ impl GpuState {
         self.queue.write_buffer(&self.mask_params_buf, 0, bytemuck::cast_slice(&params));
     }
 
-    /// Borra un DISCO suave en la mascara, en coordenadas de MUNDO. `strength` (0..1) es
-    /// la opacidad/fuerza de la goma. Resta cobertura de M (varias pasadas desvanecen).
-    pub fn erase_mask(&mut self, center: [f32; 2], radius: f32, strength: f32) {
-        let params: [f32; 4] = [center[0], center[1], radius.max(0.5), strength.clamp(0.0, 1.0)];
-        self.queue.write_buffer(&self.erase_params_buf, 0, bytemuck::cast_slice(&params));
+    /// Borra una lista de DISCOS suaves en la mascara en coordenadas de MUNDO. Cada disco
+    /// es `[center.x, center.y, radio, fuerza]`. Todos se dibujan en UN solo draw (una
+    /// instancia por disco) -> sin un submit por disco (clave para que la goma y su
+    /// undo/redo vayan rapidos).
+    pub fn erase_mask(&mut self, discs: &[[f32; 4]]) {
+        if discs.is_empty() {
+            return;
+        }
+        self.erase_inst.upload(&self.device, &self.queue, discs);
+        let Some(inst_buf) = self.erase_inst.buf.as_ref() else { return };
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("erase mask enc") });
@@ -790,7 +799,8 @@ impl GpuState {
             });
             rp.set_pipeline(&self.mask_erase_pipeline);
             rp.set_bind_group(0, &self.mask_render_bg, &[]);
-            rp.draw(0..6, 0..1);
+            rp.set_vertex_buffer(0, inst_buf.slice(..));
+            rp.draw(0..6, 0..discs.len() as u32);
         }
         self.queue.submit(std::iter::once(enc.finish()));
     }

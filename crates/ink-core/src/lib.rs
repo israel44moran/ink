@@ -240,4 +240,25 @@ mod tests {
         let eroded = doc.strokes()[0].samples.iter().any(|sm| sm.erosion > 0.0);
         assert!(eroded, "la goma suave marca erosion en la zona tocada");
     }
+
+    #[test]
+    fn add_stroke_incremental_matches_full_tessellation() {
+        // El committed construido por anexado incremental debe ser identico a teselar
+        // todos los trazos en orden (la malla no se corrompe al optimizar add_stroke).
+        let mut doc = Document::new();
+        let mut expected: Vec<Vertex> = Vec::new();
+        for i in 0..6 {
+            let mut s = Stroke::new(Brush::default());
+            s.push(InputSample { pos: vec2(i as f32 * 5.0, 0.0), pressure: 1.0, erosion: 0.0 });
+            s.push(InputSample { pos: vec2(i as f32 * 5.0 + 4.0, 3.0), pressure: 0.7, erosion: 0.0 });
+            doc.add_stroke(s.clone());
+            assert!(doc.last_add_was_incremental(), "una sola capa visible -> incremental");
+            s.tessellate(&mut expected);
+        }
+        let got = doc.committed_vertices();
+        assert_eq!(got.len(), expected.len(), "mismo numero de vertices");
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!((a.pos[0] - b.pos[0]).abs() < 1e-4 && (a.pos[1] - b.pos[1]).abs() < 1e-4);
+        }
+    }
 }

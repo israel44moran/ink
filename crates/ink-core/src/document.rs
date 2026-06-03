@@ -31,11 +31,14 @@ pub struct Document {
     committed: Vec<Vertex>,
     /// Pila de rehacer: (indice de capa, trazo deshecho).
     undone: Vec<(usize, Stroke)>,
+    /// `true` si el ultimo `add_stroke` solo ANEXO el trazo nuevo al final de `committed`
+    /// (sin reconstruir). Permite al renderer subir solo ese trazo a la GPU (incremental).
+    last_incremental: bool,
 }
 
 impl Default for Document {
     fn default() -> Self {
-        Self { layers: vec![Layer::new("Capa 1")], active: 0, committed: Vec::new(), undone: Vec::new() }
+        Self { layers: vec![Layer::new("Capa 1")], active: 0, committed: Vec::new(), undone: Vec::new(), last_incremental: false }
     }
 }
 
@@ -163,8 +166,27 @@ impl Document {
             return;
         }
         self.undone.clear();
-        self.active_layer_mut().strokes.push(stroke);
-        self.rebuild();
+        let ai = self.ai();
+        // Se puede ANEXAR incrementalmente (teselar solo el trazo nuevo, O(trazo) en vez de
+        // O(documento)) si la capa activa es la ULTIMA visible y tiene opacidad plena: en
+        // ese caso el trazo nuevo va justo al final de `committed`.
+        let last_visible = self.layers.iter().rposition(|l| l.visible);
+        let can_append = last_visible == Some(ai) && self.layers[ai].opacity >= 0.999;
+        self.layers[ai].strokes.push(stroke);
+        if can_append {
+            let s = self.layers[ai].strokes.last().unwrap();
+            tessellate_stroke(&s.samples, &s.brush, &mut self.committed);
+            self.last_incremental = true;
+        } else {
+            self.rebuild();
+            self.last_incremental = false;
+        }
+    }
+
+    /// ¿El ultimo `add_stroke` solo anexo el trazo nuevo (sin reconstruir todo)? El
+    /// renderer lo usa para subir solo ese trazo a la GPU.
+    pub fn last_add_was_incremental(&self) -> bool {
+        self.last_incremental
     }
 
     fn rebuild(&mut self) {

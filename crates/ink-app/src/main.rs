@@ -398,14 +398,18 @@ impl App {
         self.drawing = false;
         if let Some(stroke) = self.active.take() {
             if !stroke.samples.is_empty() {
-                // Subir la mascara de borrado bajo este trazo nuevo: si se dibuja sobre una
-                // zona antes borrada, el trazo nuevo se ve completo (no heredada el borrado).
+                // Teselar el trazo nuevo una vez: sirve para la mascara de borrado y para
+                // subir SOLO este trazo a la GPU (incremental, sin re-subir toda la malla).
                 let mut mesh: Vec<Vertex> = Vec::new();
                 stroke.tessellate(&mut mesh);
                 self.doc.add_stroke(stroke);
+                let incremental = self.doc.last_add_was_incremental();
                 if let Some(g) = self.gpu.as_mut() {
                     g.restore_mask(&mesh);
-                    g.set_committed(self.doc.committed_vertices());
+                    // Anexar solo el trazo nuevo; si no cupo o el doc reconstruyo, re-subir todo.
+                    if !incremental || !g.append_committed(&mesh) {
+                        g.set_committed(self.doc.committed_vertices());
+                    }
                     g.set_active(&[]);
                 }
                 // Registrar en el historial unificado de deshacer.
@@ -703,18 +707,6 @@ impl App {
         self.brush.opacity.clamp(0.05, 1.0)
     }
 
-    /// Borra un disco en la MASCARA raster (en `world`), a nivel de pixel: la goma quita
-    /// exactamente su area/forma/opacidad, sin importar el grosor del trazo de debajo.
-    /// Acumula el disco en `cur_erase` para poder deshacer el trazo de goma.
-    fn erase_mask_at(&mut self, world: Vec2) {
-        let r = self.eraser_radius();
-        let st = self.eraser_strength();
-        self.cur_erase.push([world.x, world.y, r, st]);
-        if let Some(g) = self.gpu.as_mut() {
-            g.erase_mask([world.x, world.y], r, st);
-        }
-    }
-
     /// Asegura que la ventana de mascara cubra el punto `p` (mundo). Si `p` se acerca al
     /// borde de la ventana, la RE-CENTRA en `p` y reconstruye la mascara desde el historial
     /// (los borrados no se pierden: viven en `erase_strokes`). Permite borrar en el lienzo
@@ -741,23 +733,36 @@ impl App {
     fn start_erase(&mut self) {
         self.erasing = true;
         self.cur_erase.clear();
-        self.last_sample_pos = self.camera.screen_to_world(self.cursor);
-        self.ensure_mask_covers(self.last_sample_pos);
-        self.erase_mask_at(self.last_sample_pos);
+        let w = self.camera.screen_to_world(self.cursor);
+        self.last_sample_pos = w;
+        self.ensure_mask_covers(w);
+        let disc = [w.x, w.y, self.eraser_radius(), self.eraser_strength()];
+        self.cur_erase.push(disc);
+        if let Some(g) = self.gpu.as_mut() {
+            g.erase_mask(&[disc]);
+        }
     }
 
     /// Continua el borrado en `world` (interpola para no dejar huecos al mover rapido).
+    /// Todos los discos del movimiento se borran en UN solo draw (instanciado).
     fn do_erase(&mut self, world: Vec2) {
         let r = self.eraser_radius();
-        // Pasos finos (~0.4 r) para que los discos solapen y el borrado sea continuo.
+        let st = self.eraser_strength();
         let from = self.last_sample_pos;
         let seg = world - from;
         let len = seg.length();
-        let step = (r * 0.4).max(0.75);
+        let step = (r * 0.4).max(0.75); // pasos finos para que los discos solapen
         let n = (len / step).ceil().max(1.0) as usize;
+        let mut new_discs: Vec<[f32; 4]> = Vec::with_capacity(n);
         for i in 1..=n {
             let p = from + seg * (i as f32 / n as f32);
-            self.erase_mask_at(p);
+            new_discs.push([p.x, p.y, r, st]);
+        }
+        if !new_discs.is_empty() {
+            self.cur_erase.extend_from_slice(&new_discs);
+            if let Some(g) = self.gpu.as_mut() {
+                g.erase_mask(&new_discs);
+            }
         }
         self.last_sample_pos = world;
     }
@@ -784,16 +789,13 @@ impl App {
                 ps_verts.push(Vertex { pos: s.pos, color: [0.0, 0.0, 0.0, s.color[3]] });
             }
         }
-        let strokes = self.erase_strokes.clone();
+        // Todos los discos de todos los trazos de goma, en un solo lote (un draw).
+        let all_discs: Vec<[f32; 4]> = self.erase_strokes.iter().flatten().copied().collect();
         if let Some(g) = self.gpu.as_mut() {
             g.clear_mask();
             g.restore_mask(&content);
             g.restore_mask(&ps_verts);
-            for stroke in &strokes {
-                for d in stroke {
-                    g.erase_mask([d[0], d[1]], d[2], d[3]);
-                }
-            }
+            g.erase_mask(&all_discs);
         }
     }
 
