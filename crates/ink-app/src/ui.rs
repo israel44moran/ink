@@ -187,6 +187,7 @@ fn tool_kind_for(name: &str) -> ink_core::Tool {
         "Empujar" => Push,
         "Sector" => Sector,
         "Lazo" => Lasso,
+        "Lazo poligonal" => PolyLasso,
         "Máscara dura" => MaskHard,
         "Máscara suave" => MaskSoft,
         "Texto" => Text,
@@ -199,7 +200,7 @@ const BRUSHES: [&str; 12] = [
     "Pluma", "Fuente", "Pluma dinámica", "Ancho fijo", "Cable", "Lápiz suave",
     "Lápiz duro", "Rotulador", "Acuarela", "Aerógrafo", "Rellenar", "Punteado",
 ];
-const TOOLS: [&str; 7] = ["Selección", "Empujar", "Sector", "Lazo", "Máscara dura", "Máscara suave", "Texto"];
+const TOOLS: [&str; 8] = ["Selección", "Empujar", "Sector", "Lazo", "Lazo poligonal", "Máscara dura", "Máscara suave", "Texto"];
 
 fn brush_width_for(name: &str) -> f32 {
     match name {
@@ -531,6 +532,24 @@ fn icon_lasso(p: &egui::Painter, c: Pos2, s: f32, col: Color32) {
     ));
 }
 
+fn icon_poly_lasso(p: &egui::Painter, c: Pos2, s: f32, col: Color32) {
+    // Contorno POLIGONAL (lineas rectas) con vertices marcados, como el lazo poligonal de PS.
+    let v: Vec<Pos2> = [
+        egui::vec2(-0.95, -0.35),
+        egui::vec2(-0.15, -0.95),
+        egui::vec2(0.95, -0.45),
+        egui::vec2(0.55, 0.85),
+        egui::vec2(-0.6, 0.7),
+    ]
+    .iter()
+    .map(|d| c + *d * s)
+    .collect();
+    p.add(Shape::closed_line(v.clone(), Stroke::new(1.6, col)));
+    for pt in &v {
+        p.circle_filled(*pt, 1.6, col);
+    }
+}
+
 fn icon_mask(p: &egui::Painter, c: Pos2, s: f32, col: Color32, soft: bool) {
     let r = egui::Rect::from_center_size(c, egui::vec2(2.2 * s, 1.4 * s));
     let rr = if soft {
@@ -562,6 +581,7 @@ fn draw_preview(p: &egui::Painter, c: Pos2, name: &str) {
         "Empujar" => preview_wave(p, c, 24.0, 2.6, ink),
         "Sector" => icon_sector(p, c, 14.0, ink),
         "Lazo" => icon_lasso(p, c, 13.0, ink),
+        "Lazo poligonal" => icon_poly_lasso(p, c, 13.0, ink),
         "Máscara dura" => icon_mask(p, c, 13.0, ink, false),
         "Máscara suave" => icon_mask(p, c, 13.0, ink, true),
         "Texto" => {
@@ -600,6 +620,7 @@ fn draw_wheel_item(p: &egui::Painter, pos: Pos2, name: &str, col: Color32) {
         "Empujar" => icon_wave(p, pos, 9.0, col),
         "Sector" => icon_sector(p, pos, 9.0, col),
         "Lazo" => icon_lasso(p, pos, 9.0, col),
+        "Lazo poligonal" => icon_poly_lasso(p, pos, 9.0, col),
         "Máscara dura" => icon_mask(p, pos, 8.0, col, false),
         "Máscara suave" => icon_mask(p, pos, 8.0, col, true),
         "Texto" => {

@@ -19,6 +19,9 @@ pub enum Tool {
     /// Lazo: selecciona a mano alzada RECORTANDO los trazos por el contorno; solo la parte
     /// DENTRO del area se selecciona (y se puede mover), no el trazo entero.
     Lasso,
+    /// Lazo POLIGONAL: como el Lazo (recorta por el contorno) pero el contorno se traza con
+    /// CLICS, en lineas rectas entre vertices (igual que el lazo poligonal de Photoshop).
+    PolyLasso,
     /// Mascara dura: borra por completo los trazos que toca el trazo de borrado.
     MaskHard,
     /// Mascara suave: atenua (baja el alfa) de los trazos cercanos.

@@ -149,6 +149,12 @@ struct App {
     /// Estampados de pincel de Photoshop seleccionados por el lazo: tip -> indices de
     /// estampado (cada estampado son 6 vertices consecutivos en `ps_committed[tip]`).
     selected_stamps: HashMap<u32, Vec<usize>>,
+    /// Lazo POLIGONAL en curso: vertices ya colocados (en mundo). Vacio = inactivo. A
+    /// diferencia de los demas gestos, se construye con CLICS y se cierra con doble clic,
+    /// clic en el primer vertice o Enter (Escape cancela).
+    poly_lasso: Vec<Vec2>,
+    /// Instante del ultimo clic del lazo poligonal (para detectar el doble clic de cierre).
+    last_poly_click: Option<Instant>,
     texts: Vec<TextItem>,
     active_text: Option<usize>,
 
@@ -266,6 +272,8 @@ impl App {
             gesture: None,
             selected: Vec::new(),
             selected_stamps: HashMap::new(),
+            poly_lasso: Vec::new(),
+            last_poly_click: None,
             texts: Vec::new(),
             active_text: None,
             ps_brushes: Vec::new(),
@@ -639,6 +647,7 @@ impl App {
         self.erase_redo.clear();
         self.cur_erase.clear();
         self.clear_selection();
+        self.cancel_poly_lasso();
         self.gesture = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -1297,6 +1306,8 @@ impl App {
                 }
                 self.gesture = None;
             }
+            // El lazo poligonal se construye con clics (poly_lasso_click), no con press/drag.
+            Tool::PolyLasso => {}
         }
     }
 
@@ -1402,6 +1413,51 @@ impl App {
         }
     }
 
+    // ===================== Lazo poligonal (clic a clic, como Photoshop) =====================
+
+    /// Un clic del lazo poligonal: anade un vertice o CIERRA el contorno (si el clic cae
+    /// cerca del primer vertice, o es un doble clic, con al menos 3 vertices).
+    fn poly_lasso_click(&mut self) {
+        let w = self.camera.screen_to_world(self.cursor);
+        let now = Instant::now();
+        let zoom = self.camera.zoom.max(1e-4);
+        let close = 12.0 / zoom; // "cerca" = ~12 px de pantalla, en unidades de mundo
+        if self.poly_lasso.len() >= 3 {
+            // Clic sobre el primer vertice -> cerrar.
+            if (w - self.poly_lasso[0]).length() <= close {
+                self.finish_poly_lasso();
+                return;
+            }
+            // Doble clic (rapido y cerca del ultimo) -> cerrar.
+            if let Some(t0) = self.last_poly_click {
+                let last = *self.poly_lasso.last().unwrap();
+                if now.duration_since(t0).as_millis() < 350 && (w - last).length() <= close {
+                    self.finish_poly_lasso();
+                    return;
+                }
+            }
+        }
+        self.poly_lasso.push(w);
+        self.last_poly_click = Some(now);
+    }
+
+    /// Cierra el lazo poligonal y aplica el recorte (igual que el lazo a mano alzada).
+    fn finish_poly_lasso(&mut self) {
+        let pts = std::mem::take(&mut self.poly_lasso);
+        self.last_poly_click = None;
+        if pts.len() >= 3 {
+            self.selected = self.doc.lasso_split(&pts);
+            self.lasso_cut_stamps(&pts);
+            self.sync_committed();
+        }
+    }
+
+    /// Cancela el lazo poligonal en curso (sin recortar nada).
+    fn cancel_poly_lasso(&mut self) {
+        self.poly_lasso.clear();
+        self.last_poly_click = None;
+    }
+
     /// Dibuja, encima del lienzo, lo propio de las herramientas: texto colocado,
     /// caja de seleccion, marquee/lazo en curso y el anillo del cursor de borrado.
     /// Todo en *puntos* de egui (= pixeles fisicos / ppp).
@@ -1496,6 +1552,27 @@ impl App {
                 }
             }
             _ => {}
+        }
+
+        // Lazo POLIGONAL en curso: segmentos rectos ya colocados + recta "elastica" hasta el
+        // cursor, con los vertices marcados y el primero resaltado (donde se cierra).
+        if self.ui.active_tool() == Some(Tool::PolyLasso) && !self.poly_lasso.is_empty() {
+            let sp: Vec<Pos2> = self.poly_lasso.iter().map(|w| to_pt(*w)).collect();
+            if sp.len() >= 2 {
+                p.add(Shape::line(sp.clone(), Stroke::new(1.5, accent)));
+            }
+            let cur = Pos2::new(self.cursor.x / ppp, self.cursor.y / ppp);
+            if let Some(&last) = sp.last() {
+                p.add(Shape::dashed_line(&[last, cur], Stroke::new(1.0, accent), 5.0, 4.0));
+            }
+            for (i, pt) in sp.iter().enumerate() {
+                if i == 0 {
+                    p.circle_filled(*pt, 4.0, accent);
+                    p.circle_stroke(*pt, 6.5, Stroke::new(1.0, accent));
+                } else {
+                    p.circle_filled(*pt, 2.5, accent);
+                }
+            }
         }
 
         // Anillo del cursor para borrar/empujar (muestra el radio real).
@@ -1717,7 +1794,11 @@ impl ApplicationHandler for App {
                                 // Pincel PS activo: tiene prioridad sobre herramientas.
                                 self.start_stroke(0.5);
                             } else if let Some(tool) = self.ui.active_tool() {
-                                self.tool_press(tool);
+                                if tool == Tool::PolyLasso {
+                                    self.poly_lasso_click();
+                                } else {
+                                    self.tool_press(tool);
+                                }
                             } else {
                                 self.start_stroke(0.5);
                             }
@@ -1727,6 +1808,8 @@ impl ApplicationHandler for App {
                         // Siempre cerramos el trazo/pan/gesto para no quedar "pegados".
                         if self.panning {
                             self.panning = false;
+                        } else if self.ui.active_tool() == Some(Tool::PolyLasso) {
+                            // El lazo poligonal se cierra por clic/doble clic/Enter, no al soltar.
                         } else if self.gesture.is_some() {
                             self.tool_release();
                         } else {
@@ -1825,7 +1908,11 @@ impl ApplicationHandler for App {
                                 } else if self.ps_settings.is_some() {
                                     self.start_stroke(pressure);
                                 } else if let Some(tool) = self.ui.active_tool() {
-                                    self.tool_press(tool);
+                                    if tool == Tool::PolyLasso {
+                                        self.poly_lasso_click();
+                                    } else {
+                                        self.tool_press(tool);
+                                    }
                                 } else {
                                     self.start_stroke(pressure);
                                 }
@@ -1834,7 +1921,9 @@ impl ApplicationHandler for App {
                     }
                     TouchPhase::Moved => {
                         self.cursor = loc;
-                        if self.gesture.is_some() {
+                        if self.ui.active_tool() == Some(Tool::PolyLasso) {
+                            // Lazo poligonal: el toque-arrastre solo mueve el preview; no dibuja.
+                        } else if self.gesture.is_some() {
                             self.tool_drag();
                         } else {
                             let world = self.camera.screen_to_world(loc);
@@ -1842,7 +1931,9 @@ impl ApplicationHandler for App {
                         }
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
-                        if self.gesture.is_some() {
+                        if self.ui.active_tool() == Some(Tool::PolyLasso) {
+                            // El lazo poligonal se cierra por toque en el inicio/doble toque/Enter.
+                        } else if self.gesture.is_some() {
                             self.tool_release();
                         } else {
                             self.finish_stroke();
@@ -1880,6 +1971,22 @@ impl ApplicationHandler for App {
                         }
                     }
                     return;
+                }
+
+                // Lazo poligonal en curso: Enter cierra el contorno, Escape lo cancela. Se
+                // maneja aqui para que Escape NO cierre la app mientras se traza.
+                if !self.poly_lasso.is_empty() && pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                            self.finish_poly_lasso();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.cancel_poly_lasso();
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
 
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -2324,6 +2431,10 @@ impl ApplicationHandler for App {
                 // Persistencia por item: al RESELECCIONAR un slot (pincel/herramienta/goma),
                 // restaurar su ultima configuracion guardada (tamano/opacidad/suavidad).
                 if let Some(seg) = actions.slot_selected {
+                    // Cambiar de herramienta/pincel cancela un lazo poligonal a medias.
+                    if self.ui.active_tool() != Some(Tool::PolyLasso) {
+                        self.cancel_poly_lasso();
+                    }
                     if let Some(slot) = self.ui.slots.get(seg).copied() {
                         if let Some(key) = slot_key(slot) {
                             if let Some(c) = self.item_cfg.get(&key).copied() {
