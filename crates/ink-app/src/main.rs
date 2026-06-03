@@ -342,8 +342,11 @@ impl App {
             return;
         }
         // Suavidad -> frecuencia de corte del filtro One-Euro (mas suave = menor corte).
-        let min_cutoff = 3.0 - 2.6 * self.brush.smoothing.clamp(0.0, 1.0);
-        self.filter = OneEuroFilter::new(min_cutoff, 0.015, 1.0);
+        // Valores altos = trazo MUY preciso (pegado a la punta, sin recortar esquinas ni
+        // ir con retraso); `beta` alto deja que el filtro "se abra" con la velocidad para
+        // seguir fielmente los trazos rapidos. La suavidad de la rueda solo modula el corte.
+        let min_cutoff = 9.0 - 7.0 * self.brush.smoothing.clamp(0.0, 1.0);
+        self.filter = OneEuroFilter::new(min_cutoff, 0.07, 1.0);
         self.last_sample_time = Instant::now();
         let world = self.camera.screen_to_world(self.cursor);
         let filtered = self.filter.filter(world, 1.0 / 120.0);
@@ -413,8 +416,9 @@ impl App {
 
         let mut changed = false;
         if let Some(stroke) = self.active.as_mut() {
-            // Espaciado minimo ~1.2 px en pantalla, convertido a unidades de mundo.
-            let min_d = (1.2 / self.camera.zoom).max(1e-4);
+            // Espaciado minimo ~0.6 px en pantalla: muestras mas densas -> curvas mas fieles
+            // (trazo de alta precision). El teselado incremental absorbe el coste extra.
+            let min_d = (0.6 / self.camera.zoom).max(1e-4);
             if stroke.samples.is_empty() || (filtered - self.last_sample_pos).length() >= min_d {
                 stroke.push(InputSample { pos: filtered, pressure, erosion: 0.0 });
                 self.last_sample_pos = filtered;
@@ -632,11 +636,12 @@ impl App {
         else {
             return;
         };
-        // Limpiar estampados de Photoshop previos (no se guardan por pagina en esta fase).
+        // Limpiar los ESTAMPADOS de Photoshop dibujados (no se guardan por pagina en esta
+        // fase). OJO: NO tocar `ps_settings` (la config del pincel activo): debe persistir
+        // entre paginas para poder seguir dibujando con el mismo pincel en la hoja nueva.
         let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
         self.ps_committed.clear();
         self.ps_active_verts.clear();
-        self.ps_settings = None;
 
         self.doc = doc;
         self.doc.refresh(); // reconstruye la malla horneada

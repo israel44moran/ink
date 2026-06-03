@@ -2663,12 +2663,6 @@ pub fn build_panel(
                             actions.slot_selected = Some(state.editing_slot);
                         }
                     });
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("La goma borra solo la zona tocada. Su tamaño y opacidad se ajustan en la rueda (igual que un pincel). Cambia a otro slot para volver a dibujar.")
-                            .size(11.0)
-                            .color(Color32::from_gray(140)),
-                    );
                 });
             });
     }
