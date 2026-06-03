@@ -5,7 +5,7 @@
 //! (fondo -> frente) aplicando la opacidad de cada capa. Las herramientas
 //! (seleccion, borrar, mover, empujar) operan sobre la capa ACTIVA.
 
-use crate::stroke::{tessellate_stroke, Stroke, Vertex};
+use crate::stroke::{tessellate_stroke, InputSample, Stroke, Vertex};
 use crate::tools::{dist_point_segment, point_in_polygon, Aabb};
 use glam::Vec2;
 
@@ -330,6 +330,55 @@ impl Document {
             self.rebuild();
         }
         removed
+    }
+
+    /// Borrado por ZONA (como una goma real): elimina solo las muestras bajo el disco
+    /// `(center, radius)` y PARTE el trazo en sub-trazos con lo que queda fuera. Asi no
+    /// se borra el trazo entero, solo la parte tocada. Es estable: las muestras solo
+    /// disminuyen, por lo que la malla nunca crece.
+    pub fn erase_region(&mut self, center: Vec2, radius: f32) -> bool {
+        let mut changed = false;
+        {
+            let layer = self.active_layer_mut();
+            let strokes = std::mem::take(&mut layer.strokes);
+            let mut out: Vec<Stroke> = Vec::with_capacity(strokes.len());
+            for s in strokes {
+                let thr = radius + (s.brush.width * 0.5).max(1.0);
+                let touched = s.samples.iter().any(|sm| (sm.pos - center).length() <= thr);
+                if !touched {
+                    out.push(s);
+                    continue;
+                }
+                changed = true;
+                // Descartar las muestras dentro del disco, conservando como sub-trazos los
+                // tramos consecutivos que quedan FUERA.
+                let mut cur: Vec<InputSample> = Vec::new();
+                for sm in &s.samples {
+                    if (sm.pos - center).length() <= thr {
+                        if cur.len() >= 2 {
+                            let mut ns = Stroke::new(s.brush);
+                            ns.samples = std::mem::take(&mut cur);
+                            out.push(ns);
+                        } else {
+                            cur.clear();
+                        }
+                    } else {
+                        cur.push(*sm);
+                    }
+                }
+                if cur.len() >= 2 {
+                    let mut ns = Stroke::new(s.brush);
+                    ns.samples = cur;
+                    out.push(ns);
+                }
+            }
+            layer.strokes = out;
+        }
+        if changed {
+            self.undone.clear();
+            self.rebuild();
+        }
+        changed
     }
 
     pub fn erase_soft(&mut self, a: Vec2, b: Vec2, radius: f32, amount: f32) -> bool {

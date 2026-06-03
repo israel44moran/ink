@@ -51,6 +51,43 @@ enum Gesture {
     /// Empujar/smudge a lo largo del arrastre.
     Smudge { last: Vec2 },
 }
+
+/// Operacion de dibujo en el historial unificado de deshacer.
+enum DrawOp {
+    /// Un trazo procedural (vive en el Document, se deshace con doc.undo).
+    Procedural,
+    /// Un trazo de pincel de Photoshop: `count` vertices al final de ps_committed[tip].
+    Ps { tip: u32, count: usize },
+    /// Un trazo de GOMA: los estampados que elimino, por punta (para restaurarlos).
+    Erase { removed: Vec<(u32, Vec<StampVertex>)> },
+}
+
+/// Operacion para rehacer (guarda lo necesario para reconstruir el trazo).
+enum RedoOp {
+    Procedural,
+    Ps { tip: u32, verts: Vec<StampVertex> },
+    Erase { removed: Vec<(u32, Vec<StampVertex>)> },
+}
+
+/// Configuracion persistente de un item de la rueda (lo que el usuario ajusta con los
+/// popups: tamano, opacidad y suavidad). Se guarda por item para restaurarla al volver.
+#[derive(Clone, Copy)]
+struct ItemCfg {
+    width: f32,
+    opacity: f32,
+    smoothing: f32,
+}
+
+/// Clave de `item_cfg` para un slot. `None` = no se persiste aqui (Vacio usa nada;
+/// los pinceles de Photoshop tienen su propio `ps_settings_map`).
+fn slot_key(slot: ui::SlotItem) -> Option<(u8, u32)> {
+    match slot {
+        ui::SlotItem::Brush(bi) => Some((0, bi as u32)),
+        ui::SlotItem::Tool(ti) => Some((1, ti as u32)),
+        ui::SlotItem::Eraser => Some((2, 0)),
+        _ => None,
+    }
+}
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Force, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -118,6 +155,20 @@ struct App {
     ps_uploaded: HashSet<u32>,
     /// Ajustes por pincel PS (para que cada uno recuerde sus dinamicas al cambiar).
     ps_settings_map: HashMap<u32, BrushSettings>,
+    /// Historial unificado de deshacer/rehacer (trazos procedurales + de pincel PS).
+    undo_stack: Vec<DrawOp>,
+    redo_stack: Vec<RedoOp>,
+    /// Estampados eliminados por la goma durante el trazo en curso (por punta), para
+    /// poder deshacer el borrado.
+    erase_removed: HashMap<u32, Vec<StampVertex>>,
+    /// Modo GOMA global: al dibujar se BORRA (con el tamano del pincel activo), sin
+    /// importar que pincel/forma este seleccionado. Cambiar de pincel no lo desactiva.
+    eraser_mode: bool,
+    /// Trazo de borrado en curso.
+    erasing: bool,
+    /// Ultima configuracion (tamano/opacidad/suavidad) de cada item de la rueda
+    /// (pincel procedural, herramienta o goma). Se restaura al reseleccionarlo.
+    item_cfg: HashMap<(u8, u32), ItemCfg>,
     /// Miniaturas (imagen RGBA) de cada punta, para el selector (estilo PS).
     ps_thumb_imgs: Vec<egui::ColorImage>,
     /// Texturas egui de las miniaturas (carga diferida en el primer frame).
@@ -179,6 +230,12 @@ impl App {
             ps_committed: HashMap::new(),
             ps_uploaded: HashSet::new(),
             ps_settings_map: HashMap::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            erase_removed: HashMap::new(),
+            eraser_mode: false,
+            erasing: false,
+            item_cfg: HashMap::new(),
             ps_thumb_imgs: Vec::new(),
             ps_thumbs: Vec::new(),
             ps_packs: Vec::new(),
@@ -199,6 +256,11 @@ impl App {
 
     fn start_stroke(&mut self, initial_pressure: f32) {
         self.commit_text();
+        // Modo GOMA: borrar en vez de dibujar (con el tamano del pincel activo).
+        if self.eraser_mode {
+            self.start_erase();
+            return;
+        }
         // Pincel de Photoshop activo: dibujar con estampados texturizados.
         if self.ps_settings.is_some() {
             self.start_stroke_ps(initial_pressure);
@@ -251,6 +313,10 @@ impl App {
     }
 
     fn add_point(&mut self, raw_world: Vec2, pressure: f32) {
+        if self.erasing {
+            self.do_erase(raw_world);
+            return;
+        }
         if self.ps_drawing {
             self.add_point_ps(raw_world, pressure);
             return;
@@ -312,6 +378,10 @@ impl App {
     }
 
     fn finish_stroke(&mut self) {
+        if self.erasing {
+            self.finish_erase();
+            return;
+        }
         if self.ps_drawing {
             self.finish_stroke_ps();
             return;
@@ -324,6 +394,9 @@ impl App {
                     g.set_committed(self.doc.committed_vertices());
                     g.set_active(&[]);
                 }
+                // Registrar en el historial unificado de deshacer.
+                self.undo_stack.push(DrawOp::Procedural);
+                self.redo_stack.clear();
             }
         }
         self.active_mesh.clear();
@@ -333,6 +406,90 @@ impl App {
         if let Some(g) = self.gpu.as_mut() {
             g.set_committed(self.doc.committed_vertices());
         }
+    }
+
+    /// Deshace la ULTIMA operacion de dibujo (procedural o de pincel PS), en orden.
+    fn undo_op(&mut self) {
+        match self.undo_stack.pop() {
+            Some(DrawOp::Procedural) => {
+                self.doc.undo();
+                self.sync_committed();
+                self.redo_stack.push(RedoOp::Procedural);
+            }
+            Some(DrawOp::Ps { tip, count }) => {
+                if let Some(v) = self.ps_committed.get_mut(&tip) {
+                    let at = v.len().saturating_sub(count);
+                    let removed = v.split_off(at);
+                    let verts = v.clone();
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.set_committed_stamps(tip, &verts);
+                    }
+                    self.redo_stack.push(RedoOp::Ps { tip, verts: removed });
+                }
+            }
+            Some(DrawOp::Erase { removed }) => {
+                // Deshacer un borrado = restaurar los estampados eliminados.
+                for (tip, verts) in &removed {
+                    self.ps_committed.entry(*tip).or_default().extend_from_slice(verts);
+                }
+                for (tip, _) in &removed {
+                    if let Some(v) = self.ps_committed.get(tip).cloned() {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.set_committed_stamps(*tip, &v);
+                        }
+                    }
+                }
+                self.redo_stack.push(RedoOp::Erase { removed });
+            }
+            None => {}
+        }
+    }
+
+    /// Rehace la ultima operacion deshecha.
+    fn redo_op(&mut self) {
+        match self.redo_stack.pop() {
+            Some(RedoOp::Procedural) => {
+                self.doc.redo();
+                self.sync_committed();
+                self.undo_stack.push(DrawOp::Procedural);
+            }
+            Some(RedoOp::Ps { tip, verts }) => {
+                let count = verts.len();
+                let v = self.ps_committed.entry(tip).or_default();
+                v.extend(verts);
+                let vc = v.clone();
+                if let Some(g) = self.gpu.as_mut() {
+                    g.set_committed_stamps(tip, &vc);
+                }
+                self.undo_stack.push(DrawOp::Ps { tip, count });
+            }
+            Some(RedoOp::Erase { removed }) => {
+                // Rehacer un borrado = volver a quitar los estampados restaurados.
+                for (tip, verts) in &removed {
+                    if let Some(v) = self.ps_committed.get_mut(tip) {
+                        let at = v.len().saturating_sub(verts.len());
+                        v.truncate(at);
+                    }
+                }
+                for (tip, _) in &removed {
+                    if let Some(v) = self.ps_committed.get(tip).cloned() {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.set_committed_stamps(*tip, &v);
+                        }
+                    }
+                }
+                self.undo_stack.push(DrawOp::Erase { removed });
+            }
+            None => {}
+        }
+    }
+
+    /// ¿Hay algo que deshacer / rehacer? (historial unificado)
+    fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+    fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
     }
 
     // =====================================================================
@@ -535,6 +692,94 @@ impl App {
         }
     }
 
+    /// Color de los estampados del pincel PS activo (el color del pincel).
+    fn ps_brush_rgb(&self) -> [f32; 3] {
+        [self.brush.color[0], self.brush.color[1], self.brush.color[2]]
+    }
+
+    /// Goma: ELIMINA los estampados y trazos bajo un disco de radio `radius` (no pinta
+    /// encima). No toca la cuadricula (es geometria aparte) y deja el area redibujable.
+    /// Acumula lo eliminado en `erase_removed` para poder deshacer.
+    fn erase_at(&mut self, center: Vec2, radius: f32) {
+        // Trazos procedurales: borrado por ZONA (parte el trazo, no lo borra entero).
+        if self.doc.erase_region(center, radius) {
+            self.sync_committed();
+        }
+        // Estampados PS bajo la goma (de todas las puntas): se eliminan los quads tocados.
+        let r2 = radius * radius;
+        let mut changed: Vec<u32> = Vec::new();
+        for (tip, verts) in self.ps_committed.iter_mut() {
+            let mut keep: Vec<StampVertex> = Vec::with_capacity(verts.len());
+            let mut removed_any = false;
+            for chunk in verts.chunks(6) {
+                if chunk.len() < 6 {
+                    keep.extend_from_slice(chunk);
+                    continue;
+                }
+                let cx = chunk.iter().map(|v| v.pos[0]).sum::<f32>() / 6.0;
+                let cy = chunk.iter().map(|v| v.pos[1]).sum::<f32>() / 6.0;
+                let dx = cx - center.x;
+                let dy = cy - center.y;
+                if dx * dx + dy * dy <= r2 {
+                    removed_any = true;
+                    self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
+                } else {
+                    keep.extend_from_slice(chunk);
+                }
+            }
+            if removed_any {
+                *verts = keep;
+                changed.push(*tip);
+            }
+        }
+        for tip in changed {
+            let v = self.ps_committed[&tip].clone();
+            if let Some(g) = self.gpu.as_mut() {
+                g.set_committed_stamps(tip, &v);
+            }
+        }
+    }
+
+    /// Radio de borrado de la goma (medio diametro del pincel/tamano activo).
+    fn eraser_radius(&self) -> f32 {
+        (self.brush.width * 0.5).max(2.0)
+    }
+
+    /// Inicia un trazo de GOMA (modo borrador global).
+    fn start_erase(&mut self) {
+        self.erasing = true;
+        self.erase_removed.clear();
+        self.last_sample_pos = self.camera.screen_to_world(self.cursor);
+        let r = self.eraser_radius();
+        self.erase_at(self.last_sample_pos, r);
+    }
+
+    /// Continua el borrado en `world` (interpola para no dejar huecos al mover rapido).
+    fn do_erase(&mut self, world: Vec2) {
+        let r = self.eraser_radius();
+        // Interpolar entre el ultimo punto y el actual (pasos ~ medio radio).
+        let from = self.last_sample_pos;
+        let seg = world - from;
+        let len = seg.length();
+        let step = (r * 0.5).max(1.0);
+        let n = (len / step).ceil().max(1.0) as usize;
+        for i in 1..=n {
+            let p = from + seg * (i as f32 / n as f32);
+            self.erase_at(p, r);
+        }
+        self.last_sample_pos = world;
+    }
+
+    /// Finaliza el trazo de goma: registra lo borrado para poder deshacer.
+    fn finish_erase(&mut self) {
+        self.erasing = false;
+        if !self.erase_removed.is_empty() {
+            let removed: Vec<(u32, Vec<StampVertex>)> = self.erase_removed.drain().collect();
+            self.undo_stack.push(DrawOp::Erase { removed });
+            self.redo_stack.clear();
+        }
+    }
+
     fn add_point_ps(&mut self, raw_world: Vec2, pressure: f32) {
         // Guarda anti-salto (igual que el motor procedural).
         if !self.ps_samples.is_empty() {
@@ -568,7 +813,7 @@ impl App {
             _ => 0,
         };
         let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
-        let rgb = [self.brush.color[0], self.brush.color[1], self.brush.color[2]];
+        let rgb = self.ps_brush_rgb();
         let prev_len = self.ps_active_verts.len();
         for st in &out.stamps {
             push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
@@ -596,18 +841,22 @@ impl App {
         if self.ps_active_verts.is_empty() && self.ps_samples.len() == 1 {
             let out = stamp_path(&self.ps_samples, &s, 0, 0.0);
             let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
-            let rgb = [self.brush.color[0], self.brush.color[1], self.brush.color[2]];
+            let rgb = self.ps_brush_rgb();
             for st in &out.stamps {
                 push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
             }
         }
         if !self.ps_active_verts.is_empty() {
+            let count = self.ps_active_verts.len();
             let v = self.ps_committed.entry(tip).or_default();
             v.extend_from_slice(&self.ps_active_verts);
             let verts = v.clone();
             if let Some(g) = self.gpu.as_mut() {
                 g.set_committed_stamps(tip, &verts);
             }
+            // Registrar el trazo PS en el historial unificado de deshacer.
+            self.undo_stack.push(DrawOp::Ps { tip, count });
+            self.redo_stack.clear();
         }
         self.ps_active_verts.clear();
         self.ps_samples.clear();
@@ -807,6 +1056,15 @@ impl App {
         if let Some((aw, ah)) = self.settings.artboard_size() {
             let r = Rect::from_two_pos(to_pt(Vec2::new(-aw * 0.5, -ah * 0.5)), to_pt(Vec2::new(aw * 0.5, ah * 0.5)));
             p.rect_stroke(r, egui::CornerRadius::ZERO, Stroke::new(1.5, Color32::from_gray(160)), StrokeKind::Outside);
+        }
+
+        // Cursor de la GOMA: anillo del tamano real de borrado (estilo Photoshop).
+        if self.eraser_mode {
+            let c = Pos2::new(self.cursor.x / ppp, self.cursor.y / ppp);
+            let rr = (self.eraser_radius() * cam.zoom / ppp).max(3.0);
+            // Doble contorno (oscuro + claro) para que se vea sobre cualquier fondo.
+            p.circle_stroke(c, rr, Stroke::new(1.5, Color32::from_rgba_unmultiplied(20, 20, 20, 210)));
+            p.circle_stroke(c, rr + 1.5, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 170)));
         }
 
         // Longitud del trazo en curso (si "Mostrar la longitud del trazo" esta activo).
@@ -1027,7 +1285,7 @@ impl ApplicationHandler for App {
                 } else if self.gesture.is_some() {
                     self.cursor = cur;
                     self.tool_drag();
-                } else if self.drawing || self.ps_drawing {
+                } else if self.drawing || self.ps_drawing || self.erasing {
                     let world = self.camera.screen_to_world(cur);
                     let pressure = (1.0 - (speed / 2600.0).clamp(0.0, 0.7)).clamp(0.05, 1.0);
                     self.add_point(world, pressure);
@@ -1053,10 +1311,16 @@ impl ApplicationHandler for App {
                         } else if self.try_eyedropper() {
                             // Cuentagotas: tomo el color y no dibujo.
                         } else {
-                            // Tocar el lienzo cierra el selector de color (con animacion).
+                            // Tocar el lienzo cierra los paneles flotantes (color, "Mis
+                            // pinceles" y selector PS) para no estorbar al dibujar.
                             self.ui.show_colors = false;
+                            self.ui.brush_panel = false;
+                            self.ui.show_ps_panel = false;
                             if self.space_down {
                                 self.panning = true;
+                            } else if self.eraser_mode {
+                                // Goma activa: borra la zona tocada (prioridad maxima).
+                                self.start_stroke(0.5);
                             } else if self.ps_settings.is_some() {
                                 // Pincel PS activo: tiene prioridad sobre herramientas.
                                 self.start_stroke(0.5);
@@ -1131,8 +1395,12 @@ impl ApplicationHandler for App {
                             if self.try_eyedropper() {
                                 // Cuentagotas: solo toma color.
                             } else {
-                                self.ui.show_colors = false; // tocar el lienzo cierra el selector
-                                if self.ps_settings.is_some() {
+                                self.ui.show_colors = false; // tocar el lienzo cierra los selectores
+                                self.ui.brush_panel = false;
+                                self.ui.show_ps_panel = false;
+                                if self.eraser_mode {
+                                    self.start_stroke(pressure);
+                                } else if self.ps_settings.is_some() {
                                     self.start_stroke(pressure);
                                 } else if let Some(tool) = self.ui.active_tool() {
                                     self.tool_press(tool);
@@ -1205,16 +1473,19 @@ impl ApplicationHandler for App {
                             self.texts.clear();
                             self.selected.clear();
                             self.active_text = None;
+                            let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
+                            self.ps_committed.clear();
+                            if let Some(g) = self.gpu.as_mut() {
+                                for t in tips {
+                                    g.set_committed_stamps(t, &[]);
+                                }
+                            }
+                            self.undo_stack.clear();
+                            self.redo_stack.clear();
                             self.sync_committed();
                         }
-                        KeyCode::KeyZ => {
-                            self.doc.undo();
-                            self.sync_committed();
-                        }
-                        KeyCode::KeyY => {
-                            self.doc.redo();
-                            self.sync_committed();
-                        }
+                        KeyCode::KeyZ => self.undo_op(),
+                        KeyCode::KeyY => self.redo_op(),
                         KeyCode::KeyV => self.cycle_present_mode(),
                         KeyCode::BracketLeft => {
                             self.brush.width = (self.brush.width * 0.8).max(0.5);
@@ -1262,8 +1533,8 @@ impl ApplicationHandler for App {
                     strokes: self.doc.stroke_count(),
                     verts: self.doc.vertex_count(),
                     zoom: self.camera.zoom,
-                    can_undo: self.doc.can_undo(),
-                    can_redo: self.doc.can_redo(),
+                    can_undo: self.can_undo(),
+                    can_redo: self.can_redo(),
                 };
                 // Subir a egui las miniaturas de pincel que falten (carga diferida).
                 for i in 0..self.ps_thumbs.len() {
@@ -1297,8 +1568,8 @@ impl ApplicationHandler for App {
                     actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
                     self.draw_overlays(ctx);
 
-                    // --- Panel provisional de pinceles de Photoshop (selector) ---
-                    {
+                    // --- Selector de pinceles de Photoshop (desplegable, a la izquierda) ---
+                    if self.ui.show_ps_panel {
                         let brushes = &self.ps_brushes;
                         let thumbs = &self.ps_thumbs;
                         let packs = &self.ps_packs;
@@ -1309,7 +1580,7 @@ impl ApplicationHandler for App {
                             _ => None,
                         });
                         egui::Area::new(egui::Id::new("ps_brushes_panel"))
-                            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 56.0))
+                            .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 56.0))
                             .show(ctx, |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                                     ui.set_max_width(250.0);
@@ -1385,9 +1656,12 @@ impl ApplicationHandler for App {
                             });
                     }
 
-                    // Panel "Ajustes del pincel" del pincel PS activo (edita en vivo).
-                    if let Some(s) = self.ps_settings.as_mut() {
-                        brush_settings_panel(ctx, s, &self.settings);
+                    // Panel "Ajustes del pincel" del pincel PS activo (a la izquierda,
+                    // solo cuando el selector esta cerrado, para no solaparse).
+                    if !self.ui.show_ps_panel {
+                        if let Some(s) = self.ps_settings.as_mut() {
+                            brush_settings_panel(ctx, s, &self.settings);
+                        }
                     }
                 });
                 if let Some(s) = self.egui_state.as_mut() {
@@ -1411,7 +1685,9 @@ impl ApplicationHandler for App {
                     self.create_round_brush(h);
                 }
                 if let Some(i) = ps_select {
+                    // Catalogo PS: elegir una forma activa ese pincel para PINTAR.
                     self.select_ps_brush(i);
+                    self.ui.show_ps_panel = false; // cerrar el selector tras elegir
                 }
                 if ps_clear {
                     self.save_ps_settings();
@@ -1447,17 +1723,51 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // La GOMA es un slot de la rueda: el modo borrador esta activo si el slot
+                // seleccionado es la goma. Cambiar a cualquier otro slot la desactiva sola.
+                self.eraser_mode = matches!(self.ui.slots.get(self.ui.selected_seg), Some(ui::SlotItem::Eraser));
+
+                // Persistencia por item: al RESELECCIONAR un slot (pincel/herramienta/goma),
+                // restaurar su ultima configuracion guardada (tamano/opacidad/suavidad).
+                if let Some(seg) = actions.slot_selected {
+                    if let Some(slot) = self.ui.slots.get(seg).copied() {
+                        if let Some(key) = slot_key(slot) {
+                            if let Some(c) = self.item_cfg.get(&key).copied() {
+                                self.brush.width = c.width;
+                                self.brush.opacity = c.opacity;
+                                self.brush.smoothing = c.smoothing;
+                            }
+                        }
+                    }
+                }
+                // Guardar la configuracion del slot activo (captura los cambios de los popups).
+                if let Some(slot) = self.ui.slots.get(self.ui.selected_seg).copied() {
+                    if let Some(key) = slot_key(slot) {
+                        self.item_cfg.insert(
+                            key,
+                            ItemCfg { width: self.brush.width, opacity: self.brush.opacity, smoothing: self.brush.smoothing },
+                        );
+                    }
+                }
+
                 // Aplicar acciones del panel.
                 if actions.undo {
-                    self.doc.undo();
-                    self.sync_committed();
+                    self.undo_op();
                 }
                 if actions.redo {
-                    self.doc.redo();
-                    self.sync_committed();
+                    self.redo_op();
                 }
                 if actions.clear {
                     self.doc.clear();
+                    let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
+                    self.ps_committed.clear();
+                    if let Some(g) = self.gpu.as_mut() {
+                        for t in tips {
+                            g.set_committed_stamps(t, &[]);
+                        }
+                    }
+                    self.undo_stack.clear();
+                    self.redo_stack.clear();
                     self.sync_committed();
                 }
                 if actions.layers_dirty {

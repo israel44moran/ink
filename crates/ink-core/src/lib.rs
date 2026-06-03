@@ -199,4 +199,24 @@ mod tests {
         assert!(s.samples[0].pos.y > 1.0, "la muestra cercana se desplaza");
         assert!(s.samples[1].pos.y.abs() < 1e-3, "la muestra lejana no se mueve");
     }
+
+    #[test]
+    fn erase_region_splits_stroke_not_whole() {
+        let mut doc = Document::new();
+        let mut b = Brush::default();
+        b.width = 2.0; // punta fina: solo se borra justo bajo el disco
+        let mut s = Stroke::new(b);
+        for i in 0..5 {
+            s.push(InputSample { pos: vec2(i as f32 * 10.0, 0.0), pressure: 1.0 });
+        }
+        doc.add_stroke(s);
+        assert_eq!(doc.stroke_count(), 1);
+        // Borrar SOLO el centro (x=20). Debe PARTIR el trazo en dos (no borrarlo entero).
+        let changed = doc.erase_region(vec2(20.0, 0.0), 3.0);
+        assert!(changed);
+        assert_eq!(doc.stroke_count(), 2, "la goma parte el trazo, no lo borra completo");
+        // Tocar lejos de cualquier trazo no cambia nada.
+        let again = doc.erase_region(vec2(500.0, 500.0), 3.0);
+        assert!(!again);
+    }
 }

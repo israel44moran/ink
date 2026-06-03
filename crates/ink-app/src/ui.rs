@@ -79,6 +79,7 @@ pub struct UiState {
     pub settings_tab: SettingsTab,
     pub grid_editor: bool,       // sub-panel "Editar cuadricula" abierto
     pub show_layers: bool,       // panel de capas abierto
+    pub show_ps_panel: bool,     // selector de pinceles de Photoshop desplegado
     pub last_grid: ink_core::GridKind, // ultimo tipo de cuadricula (para alternar)
     pub collapsed: bool,         // rueda oculta (solo queda el circulo de color)
     pub spiral_rot: f32,         // rotacion de la espiral de colores COPIC (grados)
@@ -128,6 +129,7 @@ impl Default for UiState {
             settings_tab: SettingsTab::Workspace,
             grid_editor: false,
             show_layers: false,
+            show_ps_panel: false,
             last_grid: ink_core::GridKind::Squares,
             collapsed: false,
             spiral_rot: 0.0,
@@ -232,6 +234,9 @@ pub struct UiActions {
     pub exit_ps: bool,
     /// Se selecciono un slot de la rueda que contiene un pincel de Photoshop: activarlo.
     pub activate_ps: Option<u32>,
+    /// Slot recien seleccionado/asignado en la rueda. main.rs lo usa para restaurar la
+    /// ultima configuracion (tamano/opacidad/suavidad) guardada de ese item.
+    pub slot_selected: Option<usize>,
 }
 
 // --- Geometria de la rueda (mas pequena que antes) ---
@@ -249,6 +254,7 @@ pub enum SlotItem {
     Brush(usize), // indice en BRUSHES
     Tool(usize),  // indice en TOOLS
     PsBrush(u32), // indice en el catalogo de pinceles de Photoshop
+    Eraser,       // goma (borrador por zona); usa el tamano/opacidad de la rueda
 }
 
 fn c32(c: [f32; 4]) -> Color32 {
@@ -537,6 +543,7 @@ fn draw_preview(p: &egui::Painter, c: Pos2, name: &str) {
         "Texto" => {
             p.text(c, Align2::CENTER_CENTER, "Aa", FontId::proportional(26.0), ink);
         }
+        "Goma" => icon_eraser(p, c, 16.0, ink),
         _ => preview_wave(p, c, 28.0, 3.0, ink),
     }
 }
@@ -2182,6 +2189,7 @@ pub fn build_panel(
                     SlotItem::Empty => icon_x(&p, ipos, 10.0, fade(if sel { Color32::WHITE } else { Color32::from_gray(125) }, fi)),
                     SlotItem::Brush(bi) => draw_wheel_item(&p, ipos, BRUSHES[bi], col),
                     SlotItem::Tool(ti) => draw_wheel_item(&p, ipos, TOOLS[ti], col),
+                    SlotItem::Eraser => icon_eraser(&p, ipos, 17.0, col),
                     // Pincel de Photoshop: dibujar su FORMA real (miniatura) en el slot.
                     SlotItem::PsBrush(pi) => {
                         if let Some(Some(tid)) = state.ps_thumb_ids.get(pi as usize) {
@@ -2305,6 +2313,7 @@ pub fn build_panel(
                         let was_selected = seg == state.selected_seg;
                         state.selected_seg = seg;
                         state.popup = Popup::None;
+                        actions.slot_selected = Some(seg);
                         match state.slots[seg] {
                             // Slot vacio: abrir panel para asignar pincel/herramienta.
                             SlotItem::Empty => {
@@ -2322,6 +2331,15 @@ pub fn build_panel(
                                 }
                             }
                             SlotItem::Tool(_) => {
+                                actions.exit_ps = true;
+                                if was_selected {
+                                    state.editing_slot = seg;
+                                    state.brush_panel = true;
+                                }
+                            }
+                            // Goma: al seleccionarla se activa el modo borrador (derivado en
+                            // main.rs). Re-tocarla abre el panel para cambiar de herramienta.
+                            SlotItem::Eraser => {
                                 actions.exit_ps = true;
                                 if was_selected {
                                     state.editing_slot = seg;
@@ -2382,6 +2400,7 @@ pub fn build_panel(
                         SlotItem::Empty => icon_x(&p, c, 9.0, if sel { Color32::WHITE } else { Color32::from_gray(125) }),
                         SlotItem::Brush(bi) => draw_wheel_item(&p, c, BRUSHES[bi], col),
                         SlotItem::Tool(ti) => draw_wheel_item(&p, c, TOOLS[ti], col),
+                        SlotItem::Eraser => icon_eraser(&p, c, 15.0, col),
                         SlotItem::PsBrush(pi) => {
                             if let Some(Some(tid)) = state.ps_thumb_ids.get(pi as usize) {
                                 let rr = egui::Rect::from_center_size(c, egui::vec2(22.0, 22.0));
@@ -2424,6 +2443,7 @@ pub fn build_panel(
                                 let was = seg == state.selected_seg;
                                 state.selected_seg = seg;
                                 state.popup = Popup::None;
+                                actions.slot_selected = Some(seg);
                                 match state.slots[seg] {
                                     SlotItem::Empty => {
                                         state.editing_slot = seg;
@@ -2440,6 +2460,13 @@ pub fn build_panel(
                                         }
                                     }
                                     SlotItem::Tool(_) => {
+                                        actions.exit_ps = true;
+                                        if was {
+                                            state.editing_slot = seg;
+                                            state.brush_panel = true;
+                                        }
+                                    }
+                                    SlotItem::Eraser => {
                                         actions.exit_ps = true;
                                         if was {
                                             state.editing_slot = seg;
@@ -2529,6 +2556,7 @@ pub fn build_panel(
                                 brush.kind = brush_kind_for(name);
                                 state.brush_panel = false;
                                 actions.exit_ps = true;
+                                actions.slot_selected = Some(state.editing_slot);
                             }
                         }
                     });
@@ -2542,9 +2570,30 @@ pub fn build_panel(
                                 state.selected_seg = state.editing_slot;
                                 state.brush_panel = false;
                                 actions.exit_ps = true;
+                                actions.slot_selected = Some(state.editing_slot);
                             }
                         }
                     });
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("BORRADOR").size(12.0).strong().color(Color32::from_gray(135)));
+                    ui.add_space(3.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if item_cell(ui, "Goma") {
+                            // La goma es una herramienta de la rueda: ocupa este slot con su
+                            // icono. Al seleccionarla se activa el borrado (derivado en main.rs).
+                            state.slots[state.editing_slot] = SlotItem::Eraser;
+                            state.selected_seg = state.editing_slot;
+                            state.brush_panel = false;
+                            actions.exit_ps = true;
+                            actions.slot_selected = Some(state.editing_slot);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("La goma borra solo la zona tocada. Su tamaño y opacidad se ajustan en la rueda (igual que un pincel). Cambia a otro slot para volver a dibujar.")
+                            .size(11.0)
+                            .color(Color32::from_gray(140)),
+                    );
                 });
             });
     }
@@ -2810,6 +2859,11 @@ pub fn build_panel(
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(230.0);
+                if icon_text_row(ui, state.show_ps_panel, "Pinceles", |p, c| {
+                    preview_wave(p, c, 9.0, 2.4, Color32::from_gray(70));
+                }) {
+                    state.show_ps_panel = !state.show_ps_panel;
+                }
                 if icon_text_row(ui, state.show_layers, "Capas", icon_layers) {
                     state.show_layers = !state.show_layers;
                 }
