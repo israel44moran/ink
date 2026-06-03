@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use ink_core::{
     point_in_polygon, push_stamp_quad, stamp_path, vec2, Aabb, Brush, BrushSettings, Camera,
-    Document, InputSample, OneEuroFilter, StampVertex, Stroke, TextItem, TipKind, Tool, Vec2,
+    Document, InputSample, StampVertex, Stroke, TextItem, TipKind, Tool, Vec2,
     Vertex,
 };
 use renderer::{present_mode_name, GpuState};
@@ -141,7 +141,12 @@ struct App {
     last_touch: Option<Instant>,
 
     // Trazo activo
-    filter: OneEuroFilter,
+    /// Suavizado "cuerda elastica" (como el Suavizado de Photoshop): posicion (en mundo) del
+    /// punto que se dibuja, que persigue al cursor manteniendose a `string_radius` de el.
+    string_pos: Vec2,
+    /// Radio de la "cuerda" en MUNDO (px de pantalla / zoom), fijado al empezar el trazo
+    /// segun la suavidad. 0 = sin suavizado (crudo).
+    string_radius: f32,
     active: Option<Stroke>,
     active_mesh: Vec<Vertex>,
     last_sample_pos: Vec2,
@@ -275,7 +280,8 @@ impl App {
             space_down: false,
             last_move_time: now,
             last_touch: None,
-            filter: OneEuroFilter::default(),
+            string_pos: Vec2::ZERO,
+            string_radius: 0.0,
             active: None,
             active_mesh: Vec::new(),
             last_sample_pos: Vec2::ZERO,
@@ -358,13 +364,13 @@ impl App {
         if !self.ui.drawing_enabled() {
             return;
         }
-        // Suavidad (0%=crudo/preciso, 100%=muy estabilizado), calibrada como el Suavizado de
-        // Photoshop. Misma curva para todos los pinceles.
-        let (min_cutoff, beta) = smoothing_filter_params(self.brush.smoothing);
-        self.filter = OneEuroFilter::new(min_cutoff, beta, 1.0);
+        // Suavizado "cuerda elastica" (como el Suavizado de Photoshop), comun a todos los
+        // pinceles. El radio (en mundo) se fija al empezar el trazo segun la suavidad.
         self.last_sample_time = Instant::now();
         let world = self.camera.screen_to_world(self.cursor);
-        let filtered = self.filter.filter(world, 1.0 / 120.0);
+        self.string_pos = world;
+        self.string_radius = smoothing_string_radius_px(self.brush.smoothing) / self.camera.zoom.max(1e-4);
+        let filtered = world;
         // Opacidad -> alfa del color del trazo.
         let mut b = self.brush;
         b.color[3] = self.brush.opacity.clamp(0.0, 1.0);
@@ -426,8 +432,14 @@ impl App {
         }
 
         let now = Instant::now();
-        let dt = (now - self.last_sample_time).as_secs_f32().max(1e-4);
-        let filtered = self.filter.filter(raw_world, dt);
+        // Suavizado "cuerda" (Photoshop): el punto dibujado persigue al cursor manteniendose
+        // a `string_radius`. Lag fijo (no crece con la velocidad).
+        let d = raw_world - self.string_pos;
+        let dist = d.length();
+        if dist > self.string_radius {
+            self.string_pos = raw_world - d / dist * self.string_radius;
+        }
+        let filtered = self.string_pos;
 
         let mut changed = false;
         if let Some(stroke) = self.active.as_mut() {
@@ -1056,12 +1068,11 @@ impl App {
         self.ps_residual = 0.0;
         self.ps_active_verts.clear();
         let world = self.camera.screen_to_world(self.cursor);
-        // La suavidad (brush.smoothing) controla el trazo PS con la MISMA calibracion que los
-        // pinceles basicos (0%=crudo, 100%=muy estabilizado).
-        let (min_cutoff, beta) = smoothing_filter_params(self.brush.smoothing);
-        self.filter = OneEuroFilter::new(min_cutoff, beta, 1.0);
+        // Suavizado "cuerda" (Photoshop), igual que los pinceles basicos.
         self.last_sample_time = Instant::now();
-        let f = self.filter.filter(world, 1.0 / 120.0);
+        self.string_pos = world;
+        self.string_radius = smoothing_string_radius_px(self.brush.smoothing) / self.camera.zoom.max(1e-4);
+        let f = world;
         self.last_sample_pos = f;
         self.ps_samples.push(InputSample { pos: f, pressure: pressure.clamp(0.05, 1.0), erosion: 0.0 });
         if let Some(g) = self.gpu.as_mut() {
@@ -1251,8 +1262,13 @@ impl App {
             }
         }
         let now = Instant::now();
-        let dt = (now - self.last_sample_time).as_secs_f32().max(1e-4);
-        let f = self.filter.filter(raw_world, dt);
+        // Suavizado "cuerda" (Photoshop): el punto dibujado persigue al cursor a `string_radius`.
+        let d = raw_world - self.string_pos;
+        let dist = d.length();
+        if dist > self.string_radius {
+            self.string_pos = raw_world - d / dist * self.string_radius;
+        }
+        let f = self.string_pos;
         let min_d = (1.0 / self.camera.zoom).max(1e-4);
         if self.ps_samples.len() > 1 && (f - self.last_sample_pos).length() < min_d {
             return;
@@ -2717,18 +2733,12 @@ fn dyn_combo(ui: &mut egui::Ui, id: &str, ctrl: &mut ink_core::DynControl) {
 }
 
 /// Una fila "etiqueta + slider 0..100%" para un factor 0..1.
-/// Mapea la SUAVIDAD del pincel (0..1, estilo Photoshop) a los parametros del filtro
-/// One-Euro `(min_cutoff, beta)`. Calibrado como el "Suavizado" de Photoshop y comun a TODOS
-/// los pinceles (basicos y de Photoshop):
-///  - 0%   = trazo crudo, sin estabilizar (sigue exactamente la punta).
-///  - 100% = muy estabilizado (linea muy suave, con la "cuerda" elastica tipo PS).
-/// La curva del corte es exponencial para que el efecto se note en todo el rango; `beta`
-/// hace el filtro responsivo a baja suavidad y un paso-bajo puro a suavidad alta.
-fn smoothing_filter_params(smoothing: f32) -> (f32, f32) {
-    let s = smoothing.clamp(0.0, 1.0);
-    let min_cutoff = 64.0 * (0.5f32 / 64.0).powf(s); // ~64 Hz (crudo) -> ~0.5 Hz (muy suave)
-    let beta = 0.15 * (1.0 - s);
-    (min_cutoff, beta)
+/// Radio de la "cuerda" (en PIXELES de pantalla) del Suavizado estilo Photoshop, segun la
+/// suavidad (0..1). 0% = 0 px (trazo crudo, pegado a la punta); 100% = cuerda larga (linea
+/// muy suave). El punto dibujado persigue al cursor a esta distancia -> lag FIJO y pequeno
+/// (no crece con la velocidad como un filtro paso-bajo), igual que el Suavizado de Photoshop.
+fn smoothing_string_radius_px(smoothing: f32) -> f32 {
+    smoothing.clamp(0.0, 1.0) * 48.0
 }
 
 fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
