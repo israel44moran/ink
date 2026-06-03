@@ -74,6 +74,44 @@ pub fn point_in_polygon(p: Vec2, poly: &[Vec2]) -> bool {
     inside
 }
 
+/// Parametro `t` en [0,1] del cruce del segmento `a`->`b` con el segmento `c`->`d`, o
+/// `None` si no se cruzan dentro de ambos.
+fn segment_segment_t(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<f32> {
+    let r = b - a;
+    let s = d - c;
+    let denom = r.x * s.y - r.y * s.x;
+    if denom.abs() < 1e-9 {
+        return None; // paralelos
+    }
+    let ca = c - a;
+    let t = (ca.x * s.y - ca.y * s.x) / denom;
+    let u = (ca.x * r.y - ca.y * r.x) / denom;
+    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// Parametro `t` en [0,1] del PRIMER cruce del segmento `a`->`b` con el CONTORNO del
+/// poligono `poly` (cualquiera de sus aristas). Sirve para recortar un trazo exactamente
+/// en el borde de un lazo. `None` si el segmento no cruza el contorno.
+pub fn segment_polygon_cross(a: Vec2, b: Vec2, poly: &[Vec2]) -> Option<f32> {
+    let n = poly.len();
+    if n < 2 {
+        return None;
+    }
+    let mut best: Option<f32> = None;
+    for j in 0..n {
+        let c = poly[j];
+        let d = poly[(j + 1) % n];
+        if let Some(t) = segment_segment_t(a, b, c, d) {
+            best = Some(best.map_or(t, |bt| bt.min(t)));
+        }
+    }
+    best
+}
+
 /// Distancia minima de un punto al segmento `a`-`b` (para borrado/empujar).
 pub fn dist_point_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     let ab = b - a;

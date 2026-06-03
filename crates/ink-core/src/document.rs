@@ -5,8 +5,8 @@
 //! (fondo -> frente) aplicando la opacidad de cada capa. Las herramientas
 //! (seleccion, borrar, mover, empujar) operan sobre la capa ACTIVA.
 
-use crate::stroke::{Stroke, Vertex};
-use crate::tools::{dist_point_segment, point_in_polygon, Aabb};
+use crate::stroke::{InputSample, Stroke, Vertex};
+use crate::tools::{dist_point_segment, point_in_polygon, segment_polygon_cross, Aabb};
 use glam::Vec2;
 
 /// Una capa del documento.
@@ -337,28 +337,40 @@ impl Document {
                     out.push(s); // nada dentro: el trazo queda intacto
                     continue;
                 }
-                // Partir en grupos consecutivos dentro/fuera. Se comparte el punto de
-                // transicion entre grupos para no dejar hueco mientras no se mueva.
-                let mut start = 0usize;
+                // Recorrer el trazo partiendo en sub-trazos dentro/fuera. Al cruzar el
+                // contorno se inserta el punto de INTERSECCION EXACTO (interpolando posicion
+                // y presion) en ambos lados, asi el corte cae justo en el borde del lazo.
+                let mut cur: Vec<InputSample> = vec![s.samples[0]];
                 let mut cur_in = point_in_polygon(s.samples[0].pos, poly);
-                let mut i = 1usize;
-                while i <= n {
-                    let inside = if i < n { point_in_polygon(s.samples[i].pos, poly) } else { !cur_in };
-                    if i == n || inside != cur_in {
-                        let end = if i < n { i + 1 } else { n }; // incluir el punto de transicion
-                        if end - start >= 2 {
-                            let mut ns = Stroke::new(s.brush);
-                            ns.time = s.time;
-                            ns.samples = s.samples[start..end].to_vec();
-                            if cur_in {
-                                selected.push(out.len());
-                            }
-                            out.push(ns);
+                for i in 1..n {
+                    let a = s.samples[i - 1];
+                    let b = s.samples[i];
+                    let inside_b = point_in_polygon(b.pos, poly);
+                    if inside_b != cur_in {
+                        let t = segment_polygon_cross(a.pos, b.pos, poly).unwrap_or(0.5);
+                        let cross = lerp_sample(&a, &b, t);
+                        cur.push(cross); // cerrar el grupo justo en el borde
+                        let mut ns = Stroke::new(s.brush);
+                        ns.time = s.time;
+                        ns.samples = std::mem::take(&mut cur);
+                        if cur_in {
+                            selected.push(out.len());
                         }
-                        start = i;
-                        cur_in = inside;
+                        out.push(ns);
+                        cur = vec![cross, b]; // el nuevo grupo arranca en el mismo borde
+                        cur_in = inside_b;
+                    } else {
+                        cur.push(b);
                     }
-                    i += 1;
+                }
+                if cur.len() >= 2 {
+                    let mut ns = Stroke::new(s.brush);
+                    ns.time = s.time;
+                    ns.samples = cur;
+                    if cur_in {
+                        selected.push(out.len());
+                    }
+                    out.push(ns);
                 }
             }
             layer.strokes = out;
@@ -546,5 +558,15 @@ impl Document {
             }
             self.rebuild();
         }
+    }
+}
+
+/// Interpola una muestra entre `a` y `b` (posicion, presion y borrado) en el parametro
+/// `t` en [0,1]. Se usa para el corte exacto del lazo en el borde del contorno.
+fn lerp_sample(a: &InputSample, b: &InputSample, t: f32) -> InputSample {
+    InputSample {
+        pos: a.pos + (b.pos - a.pos) * t,
+        pressure: a.pressure + (b.pressure - a.pressure) * t,
+        erosion: a.erosion + (b.erosion - a.erosion) * t,
     }
 }
