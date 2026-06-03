@@ -315,6 +315,59 @@ impl Document {
             .collect()
     }
 
+    /// Lazo que RECORTA: parte cada trazo por el contorno `poly` en sub-trazos consecutivos
+    /// dentro/fuera del area. Reemplaza cada trazo por sus partes y devuelve los INDICES de
+    /// las partes que quedaron DENTRO (para seleccionarlas y moverlas). Asi, si un trazo
+    /// queda mitad dentro y mitad fuera, solo la parte de dentro se selecciona/mueve.
+    pub fn lasso_split(&mut self, poly: &[Vec2]) -> Vec<usize> {
+        if poly.len() < 3 {
+            return Vec::new();
+        }
+        let mut selected: Vec<usize> = Vec::new();
+        {
+            let layer = self.active_layer_mut();
+            let strokes = std::mem::take(&mut layer.strokes);
+            let mut out: Vec<Stroke> = Vec::with_capacity(strokes.len());
+            for s in strokes {
+                let n = s.samples.len();
+                if n == 0 {
+                    continue;
+                }
+                if !s.samples.iter().any(|sm| point_in_polygon(sm.pos, poly)) {
+                    out.push(s); // nada dentro: el trazo queda intacto
+                    continue;
+                }
+                // Partir en grupos consecutivos dentro/fuera. Se comparte el punto de
+                // transicion entre grupos para no dejar hueco mientras no se mueva.
+                let mut start = 0usize;
+                let mut cur_in = point_in_polygon(s.samples[0].pos, poly);
+                let mut i = 1usize;
+                while i <= n {
+                    let inside = if i < n { point_in_polygon(s.samples[i].pos, poly) } else { !cur_in };
+                    if i == n || inside != cur_in {
+                        let end = if i < n { i + 1 } else { n }; // incluir el punto de transicion
+                        if end - start >= 2 {
+                            let mut ns = Stroke::new(s.brush);
+                            ns.time = s.time;
+                            ns.samples = s.samples[start..end].to_vec();
+                            if cur_in {
+                                selected.push(out.len());
+                            }
+                            out.push(ns);
+                        }
+                        start = i;
+                        cur_in = inside;
+                    }
+                    i += 1;
+                }
+            }
+            layer.strokes = out;
+        }
+        self.undone.clear();
+        self.rebuild();
+        selected
+    }
+
     pub fn translate_strokes(&mut self, ids: &[usize], delta: Vec2) {
         if delta == Vec2::ZERO {
             return;

@@ -44,8 +44,11 @@ enum Gesture {
     Marquee { start: Vec2, end: Vec2 },
     /// Moviendo los trazos seleccionados.
     Move { last: Vec2 },
-    /// Lazo a mano alzada (Sector).
+    /// Lazo a mano alzada (Sector): selecciona trazos completos.
     Lasso { pts: Vec<Vec2> },
+    /// Lazo que RECORTA (Lazo): parte los trazos por el contorno y selecciona solo lo de
+    /// dentro.
+    LassoCut { pts: Vec<Vec2> },
     /// Borrado duro a lo largo del arrastre.
     EraseHard { last: Vec2 },
     /// Borrado suave (atenuar) a lo largo del arrastre.
@@ -922,7 +925,7 @@ impl App {
             self.commit_text();
         }
         match tool {
-            Tool::Select | Tool::Sector => {
+            Tool::Select | Tool::Sector | Tool::Lasso => {
                 // Si presiono dentro de la seleccion existente, la muevo.
                 if !self.selected.is_empty() {
                     if let Some(bb) = self.doc.bounds_of(&self.selected) {
@@ -933,10 +936,10 @@ impl App {
                     }
                 }
                 self.selected.clear();
-                self.gesture = Some(if tool == Tool::Select {
-                    Gesture::Marquee { start: w, end: w }
-                } else {
-                    Gesture::Lasso { pts: vec![w] }
+                self.gesture = Some(match tool {
+                    Tool::Select => Gesture::Marquee { start: w, end: w },
+                    Tool::Sector => Gesture::Lasso { pts: vec![w] },
+                    _ => Gesture::LassoCut { pts: vec![w] }, // Lazo (recorta)
                 });
             }
             Tool::Push => {
@@ -988,7 +991,7 @@ impl App {
                 *end = w;
                 Act::None
             }
-            Some(Gesture::Lasso { pts }) => {
+            Some(Gesture::Lasso { pts }) | Some(Gesture::LassoCut { pts }) => {
                 let far = pts.last().map_or(true, |l| (w - *l).length() > 3.0 / zoom);
                 if far {
                     pts.push(w);
@@ -1051,6 +1054,11 @@ impl App {
             }
             Some(Gesture::Lasso { pts }) => {
                 self.selected = self.doc.strokes_in_polygon(&pts);
+            }
+            Some(Gesture::LassoCut { pts }) => {
+                // Recortar los trazos por el contorno y seleccionar solo lo de dentro.
+                self.selected = self.doc.lasso_split(&pts);
+                self.sync_committed();
             }
             _ => {}
         }
@@ -1138,10 +1146,15 @@ impl App {
                 p.rect_filled(r, egui::CornerRadius::same(2), Color32::from_rgba_unmultiplied(70, 140, 230, 24));
                 p.rect_stroke(r, egui::CornerRadius::same(2), Stroke::new(1.0, accent), StrokeKind::Outside);
             }
-            Some(Gesture::Lasso { pts }) => {
+            Some(Gesture::Lasso { pts }) | Some(Gesture::LassoCut { pts }) => {
                 if pts.len() >= 2 {
-                    let sp: Vec<Pos2> = pts.iter().map(|w| to_pt(*w)).collect();
-                    p.add(Shape::line(sp, Stroke::new(1.5, accent)));
+                    let mut sp: Vec<Pos2> = pts.iter().map(|w| to_pt(*w)).collect();
+                    p.add(Shape::line(sp.clone(), Stroke::new(1.5, accent)));
+                    // Cerrar el contorno con una linea punteada hacia el inicio.
+                    if let (Some(&first), Some(&last)) = (sp.first(), sp.last()) {
+                        sp.clear();
+                        p.add(Shape::dashed_line(&[last, first], Stroke::new(1.0, accent), 5.0, 4.0));
+                    }
                 }
             }
             _ => {}

@@ -186,6 +186,7 @@ fn tool_kind_for(name: &str) -> ink_core::Tool {
     match name {
         "Empujar" => Push,
         "Sector" => Sector,
+        "Lazo" => Lasso,
         "Máscara dura" => MaskHard,
         "Máscara suave" => MaskSoft,
         "Texto" => Text,
@@ -198,7 +199,7 @@ const BRUSHES: [&str; 12] = [
     "Pluma", "Fuente", "Pluma dinámica", "Ancho fijo", "Cable", "Lápiz suave",
     "Lápiz duro", "Rotulador", "Acuarela", "Aerógrafo", "Rellenar", "Punteado",
 ];
-const TOOLS: [&str; 6] = ["Selección", "Empujar", "Sector", "Máscara dura", "Máscara suave", "Texto"];
+const TOOLS: [&str; 7] = ["Selección", "Empujar", "Sector", "Lazo", "Máscara dura", "Máscara suave", "Texto"];
 
 fn brush_width_for(name: &str) -> f32 {
     match name {
@@ -512,6 +513,24 @@ fn icon_sector(p: &egui::Painter, c: Pos2, s: f32, col: Color32) {
     ));
 }
 
+fn icon_lasso(p: &egui::Painter, c: Pos2, s: f32, col: Color32) {
+    // Contorno a mano alzada (ovalo irregular) PUNTEADO + colita (la cuerda del lazo).
+    use std::f32::consts::TAU;
+    let n = 18;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let a = TAU * (i as f32 / n as f32);
+            let r = s * (0.85 + 0.12 * (a * 3.0).sin());
+            c + egui::vec2(a.cos() * r, a.sin() * r * 0.78)
+        })
+        .collect();
+    p.add(Shape::dashed_line(&pts, Stroke::new(1.6, col), 3.0, 2.5));
+    p.add(Shape::line(
+        vec![c + egui::vec2(s * 0.55, s * 0.5), c + egui::vec2(s * 1.05, s * 1.05)],
+        Stroke::new(1.6, col),
+    ));
+}
+
 fn icon_mask(p: &egui::Painter, c: Pos2, s: f32, col: Color32, soft: bool) {
     let r = egui::Rect::from_center_size(c, egui::vec2(2.2 * s, 1.4 * s));
     let rr = if soft {
@@ -542,6 +561,7 @@ fn draw_preview(p: &egui::Painter, c: Pos2, name: &str) {
         "Selección" => icon_select_cursor(p, c, 13.0, ink),
         "Empujar" => preview_wave(p, c, 24.0, 2.6, ink),
         "Sector" => icon_sector(p, c, 14.0, ink),
+        "Lazo" => icon_lasso(p, c, 13.0, ink),
         "Máscara dura" => icon_mask(p, c, 13.0, ink, false),
         "Máscara suave" => icon_mask(p, c, 13.0, ink, true),
         "Texto" => {
@@ -579,6 +599,7 @@ fn draw_wheel_item(p: &egui::Painter, pos: Pos2, name: &str, col: Color32) {
         "Selección" => icon_select_cursor(p, pos, 9.0, col),
         "Empujar" => icon_wave(p, pos, 9.0, col),
         "Sector" => icon_sector(p, pos, 9.0, col),
+        "Lazo" => icon_lasso(p, pos, 9.0, col),
         "Máscara dura" => icon_mask(p, pos, 8.0, col, false),
         "Máscara suave" => icon_mask(p, pos, 8.0, col, true),
         "Texto" => {

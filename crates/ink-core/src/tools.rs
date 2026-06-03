@@ -14,8 +14,11 @@ pub enum Tool {
     Select,
     /// Empujar: desplaza ("smudge") las muestras cercanas al arrastrar.
     Push,
-    /// Sector: seleccion a mano alzada (lazo poligonal).
+    /// Sector: seleccion a mano alzada (lazo poligonal) de trazos COMPLETOS.
     Sector,
+    /// Lazo: selecciona a mano alzada RECORTANDO los trazos por el contorno; solo la parte
+    /// DENTRO del area se selecciona (y se puede mover), no el trazo entero.
+    Lasso,
     /// Mascara dura: borra por completo los trazos que toca el trazo de borrado.
     MaskHard,
     /// Mascara suave: atenua (baja el alfa) de los trazos cercanos.
