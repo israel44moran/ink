@@ -128,6 +128,9 @@ pub struct GpuState {
     committed: DynBuffer,
     active: DynBuffer,
     bg: wgpu::Color,
+    /// Recorte (scissor) del CONTENIDO en pixeles fisicos: cuando el cuaderno es de hojas,
+    /// limita el dibujo/rejilla a la hoja. `None` = sin recorte (lienzo infinito).
+    content_clip: Option<(u32, u32, u32, u32)>,
     pub supported_present_modes: Vec<wgpu::PresentMode>,
     egui_renderer: egui_wgpu::Renderer,
 
@@ -571,6 +574,7 @@ impl GpuState {
             committed: DynBuffer::new(),
             active: DynBuffer::new(),
             bg: BG,
+            content_clip: None,
             supported_present_modes,
             egui_renderer,
             stamp_pipeline,
@@ -645,6 +649,12 @@ impl GpuState {
     /// Cambia el color de fondo (papel). RGBA en 0..=1, lineal (sin sRGB).
     pub fn set_bg(&mut self, c: [f32; 4]) {
         self.bg = wgpu::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: c[3] as f64 };
+    }
+
+    /// Recorta el dibujo y la rejilla a un rectangulo en pixeles fisicos (la hoja de un
+    /// cuaderno). `None` quita el recorte (lienzo infinito).
+    pub fn set_content_clip(&mut self, rect: Option<(u32, u32, u32, u32)>) {
+        self.content_clip = rect;
     }
 
     pub fn set_active(&mut self, verts: &[Vertex]) {
@@ -868,6 +878,14 @@ impl GpuState {
                 })
                 .forget_lifetime();
 
+            // Recorte del contenido a la hoja (cuadernos de hojas). El fondo (clear) ya
+            // cubrio todo; lo que sigue (rejilla + dibujo) queda dentro de la hoja.
+            if let Some((x, y, w, h)) = self.content_clip {
+                if w > 0 && h > 0 {
+                    rpass.set_scissor_rect(x, y, w, h);
+                }
+            }
+
             // --- Lienzo: rejilla (detras), luego nuestros trazos ---
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, &self.camera_bg, &[]);
@@ -920,6 +938,11 @@ impl GpuState {
                         rpass.draw(0..self.active_stamps.len, 0..1);
                     }
                 }
+            }
+
+            // Quitar el recorte antes de la UI (egui usa su propio scissor por elemento).
+            if self.content_clip.is_some() {
+                rpass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
 
             // --- UI de egui encima ---

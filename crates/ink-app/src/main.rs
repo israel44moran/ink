@@ -224,6 +224,10 @@ struct App {
     pages: Vec<notebook::PageData>,
     /// Indice de la pagina activa.
     current_page: usize,
+    /// Hoja FIJADA: bloquea pan/zoom para que la pagina quede encajada (cuadernos de hojas).
+    lock_page: bool,
+    /// Acumulador del scroll para pasar de pagina con la rueda.
+    wheel_accum: f32,
     /// Nombre que se escribe al crear un cuaderno nuevo.
     new_nb_name: String,
     /// Tipo del cuaderno nuevo: infinito (true) o con hojas (false).
@@ -295,6 +299,8 @@ impl App {
             current_path: None,
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
+            lock_page: false,
+            wheel_accum: 0.0,
             new_nb_name: String::new(),
             new_nb_infinite: true,
         }
@@ -523,6 +529,11 @@ impl App {
             pg.erase_strokes = erase;
             pg.tick = tick;
         }
+    }
+
+    /// ¿La hoja esta fijada? (bloquea pan/zoom; solo en cuadernos de hojas).
+    fn page_locked(&self) -> bool {
+        self.lock_page && !matches!(self.settings.artboard, settings::Artboard::Infinite)
     }
 
     /// Centra la camara en la hoja (encajandola en el viewport) para cuadernos de hojas.
@@ -1506,8 +1517,11 @@ impl ApplicationHandler for App {
                 self.last_move_time = now;
 
                 if self.panning {
-                    let delta = cur - self.last_cursor;
-                    self.camera.pan_pixels(delta);
+                    // Si la hoja esta fijada, no se mueve la camara.
+                    if !self.page_locked() {
+                        let delta = cur - self.last_cursor;
+                        self.camera.pan_pixels(delta);
+                    }
                 } else if self.gesture.is_some() {
                     self.cursor = cur;
                     self.tool_drag();
@@ -1600,8 +1614,26 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                     };
                     if amount != 0.0 {
-                        let factor = 1.12_f32.powf(amount);
-                        self.camera.zoom_at(self.cursor, factor);
+                        if matches!(self.settings.artboard, settings::Artboard::Infinite) {
+                            // Lienzo infinito: la rueda hace zoom.
+                            let factor = 1.12_f32.powf(amount);
+                            self.camera.zoom_at(self.cursor, factor);
+                        } else {
+                            // Cuaderno de hojas: la rueda pasa de pagina (abajo = siguiente).
+                            self.wheel_accum += amount;
+                            while self.wheel_accum <= -1.0 {
+                                if self.current_page + 1 < self.pages.len() {
+                                    self.switch_page(self.current_page + 1);
+                                }
+                                self.wheel_accum += 1.0;
+                            }
+                            while self.wheel_accum >= 1.0 {
+                                if self.current_page > 0 {
+                                    self.switch_page(self.current_page - 1);
+                                }
+                                self.wheel_accum -= 1.0;
+                            }
+                        }
                     }
                 }
             }
@@ -1839,6 +1871,7 @@ impl ApplicationHandler for App {
                 let mut page_prev = false;
                 let mut page_next = false;
                 let mut page_add = false;
+                let mut page_lock_toggle = false;
                 let in_library = self.app_mode == AppMode::Library;
                 let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
                     self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
@@ -1878,6 +1911,10 @@ impl ApplicationHandler for App {
                                         ui.separator();
                                         if ui.button("➕ Hoja").clicked() {
                                             page_add = true;
+                                        }
+                                        let lock_lbl = if self.lock_page { "🔒 Fijada" } else { "🔓 Fijar" };
+                                        if ui.selectable_label(self.lock_page, lock_lbl).clicked() {
+                                            page_lock_toggle = true;
                                         }
                                     });
                                 });
@@ -2068,6 +2105,12 @@ impl ApplicationHandler for App {
                 if page_add {
                     self.add_page();
                 }
+                if page_lock_toggle {
+                    self.lock_page = !self.lock_page;
+                    if self.lock_page {
+                        self.center_on_page();
+                    }
+                }
                 if let Some(p) = ps_load_pack {
                     self.load_ps_pack(&p);
                 }
@@ -2222,6 +2265,24 @@ impl ApplicationHandler for App {
                     [0.20, 0.21, 0.24, 1.0]
                 };
 
+                // Recorte del contenido a la HOJA (cuadernos de hojas): el dibujo y la
+                // rejilla no se salen del rectangulo de la pagina.
+                let content_clip = if infinite_canvas {
+                    None
+                } else if let Some((w, h)) = self.settings.artboard_size() {
+                    let (hw, hh) = (w * 0.5, h * 0.5);
+                    let a = self.camera.world_to_screen(vec2(-hw, -hh));
+                    let b = self.camera.world_to_screen(vec2(hw, hh));
+                    let vp = self.camera.viewport;
+                    let x0 = a.x.min(b.x).max(0.0);
+                    let y0 = a.y.min(b.y).max(0.0);
+                    let x1 = a.x.max(b.x).min(vp.x);
+                    let y1 = a.y.max(b.y).min(vp.y);
+                    Some((x0 as u32, y0 as u32, (x1 - x0).max(0.0) as u32, (y1 - y0).max(0.0) as u32))
+                } else {
+                    None
+                };
+
                 // --- Render (lienzo + UI encima) ---
                 if let Some(g) = self.gpu.as_mut() {
                     let screen = egui_wgpu::ScreenDescriptor {
@@ -2229,6 +2290,7 @@ impl ApplicationHandler for App {
                         pixels_per_point: ppp,
                     };
                     g.set_bg(bg);
+                    g.set_content_clip(content_clip);
                     g.set_grid(&self.grid_mesh);
                     g.update_camera(self.camera.view_proj());
                     g.render(&primitives, &full_output.textures_delta, &screen);
