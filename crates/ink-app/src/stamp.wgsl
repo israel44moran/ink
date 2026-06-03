@@ -52,8 +52,10 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let coverage = textureSample(tip_tex, tip_samp, in.uv).r;
     let muv = (in.world - mask.min) * mask.inv_size;
-    let erase_t = textureSampleLevel(mask_tex, mask_samp, muv, 0.0).r;
-    let visible = select(0.0, 1.0, in.time > erase_t);
-    let a = coverage * in.color.a * visible;
+    let m = textureSampleLevel(mask_tex, mask_samp, muv, 0.0);
+    let erase_t = m.r;
+    let strength = m.g;
+    let visible = select(1.0 - strength, 1.0, in.time > erase_t);
+    let a = coverage * in.color.a * clamp(visible, 0.0, 1.0);
     return vec4<f32>(in.color.rgb, a);
 }

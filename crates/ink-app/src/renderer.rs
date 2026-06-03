@@ -163,6 +163,11 @@ pub struct GpuState {
     erase_inst: DynBuffer,
     /// Pipeline que escribe el tiempo de borrado de cada disco de la goma en M.
     mask_erase_pipeline: wgpu::RenderPipeline,
+    /// Pipeline que ESTAMPA la forma de un pincel en M (goma con textura suave): dibuja
+    /// quads con la textura de la punta y escribe (tiempo, cobertura).
+    mask_erase_stamp_pipeline: wgpu::RenderPipeline,
+    /// Buffer de vertices del estampado de goma con forma (se reusa entre llamadas).
+    erase_stamp_buf: DynBuffer,
 }
 
 impl GpuState {
@@ -267,8 +272,9 @@ impl GpuState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // R32Float: guarda el TIEMPO del ultimo borrado en cada pixel (0 = nunca).
-            format: wgpu::TextureFormat::R32Float,
+            // Rg32Float: R = TIEMPO del ultimo borrado (0 = nunca), G = FUERZA (0..1) para la
+            // goma con textura suave (borrado parcial).
+            format: wgpu::TextureFormat::Rg32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
@@ -294,15 +300,15 @@ impl GpuState {
             });
             queue.submit(std::iter::once(enc.finish()));
         }
-        // Textura 1x1 con tiempo -1 para grid/trazo en curso: cualquier `time >= 0` es
-        // mayor que -1, asi que SIEMPRE se ven (no se borran nunca).
+        // Textura 1x1 con tiempo -1 (y fuerza 0) para grid/trazo en curso: cualquier
+        // `time >= 0` es mayor que -1, asi que SIEMPRE se ven (no se borran nunca).
         let white_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("never-erased mask"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
+            format: wgpu::TextureFormat::Rg32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -313,8 +319,8 @@ impl GpuState {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&[-1.0f32]),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            bytemuck::cast_slice(&[-1.0f32, 0.0f32]),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -410,7 +416,7 @@ impl GpuState {
                 module: &mask_shader,
                 entry_point: Some("fs_erase"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
+                    format: wgpu::TextureFormat::Rg32Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -548,6 +554,30 @@ impl GpuState {
             cache: None,
         });
 
+        // Pipeline de la GOMA CON FORMA: estampa la textura de la punta (group 1) en M
+        // escribiendo (tiempo, cobertura). Usa el modulo de mask.wgsl y el layout de StampVertex.
+        let mask_erase_stamp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mask erase stamp layout"),
+            bind_group_layouts: &[Some(&mask_render_bgl), Some(&tip_bgl)],
+            immediate_size: 0,
+        });
+        let mask_erase_stamp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mask erase stamp pipeline"),
+            layout: Some(&mask_erase_stamp_layout),
+            vertex: wgpu::VertexState { module: &mask_shader, entry_point: Some("vs_erase_stamp"), buffers: &[stamp_vertex_layout()], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &mask_shader,
+                entry_point: Some("fs_erase_stamp"),
+                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rg32Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Renderizador de egui (UI). Debe usar el MISMO numero de muestras MSAA
         // que nuestro render pass, porque dibuja en el mismo attachment.
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -591,6 +621,8 @@ impl GpuState {
             mask_params_buf,
             erase_inst: DynBuffer::new(),
             mask_erase_pipeline,
+            mask_erase_stamp_pipeline,
+            erase_stamp_buf: DynBuffer::new(),
         }
     }
 
@@ -785,6 +817,43 @@ impl GpuState {
             rp.set_bind_group(0, &self.mask_render_bg, &[]);
             rp.set_vertex_buffer(0, inst_buf.slice(..));
             rp.draw(0..6, 0..discs.len() as u32);
+        }
+        self.queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// ESTAMPA la forma de un pincel (textura de la punta `tip`) en M: cada vertice lleva su
+    /// UV y `time`; el fragment escribe (tiempo, cobertura de la punta). Goma con textura
+    /// suave (borrado parcial). Si la punta no esta subida, no hace nada.
+    pub fn erase_mask_stamps(&mut self, tip: u32, verts: &[StampVertex]) {
+        if verts.is_empty() {
+            return;
+        }
+        let Some(t) = self.tips.get(&tip) else { return };
+        let tip_bg = &t.bind_group;
+        self.erase_stamp_buf.upload(&self.device, &self.queue, verts);
+        let Some(vbuf) = self.erase_stamp_buf.buf.as_ref() else { return };
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("erase stamp enc") });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("erase stamp pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.mask_erase_stamp_pipeline);
+            rp.set_bind_group(0, &self.mask_render_bg, &[]);
+            rp.set_bind_group(1, tip_bg, &[]);
+            rp.set_vertex_buffer(0, vbuf.slice(..));
+            rp.draw(0..verts.len() as u32, 0..1);
         }
         self.queue.submit(std::iter::once(enc.finish()));
     }

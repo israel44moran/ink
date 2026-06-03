@@ -102,6 +102,11 @@ pub struct UiState {
     pub ps_cat_members: Vec<Vec<u32>>,
     pub ps_brush_names: Vec<String>,
     pub ps_pack_labels: Vec<(String, bool)>, // (nombre, ya cargado) para el combo de packs
+    /// Modo "elegir forma de la goma": el siguiente pincel que se toque define la FORMA de
+    /// la goma (en vez de asignarse al slot como pincel).
+    pub eraser_pick: bool,
+    /// Forma actual de la goma para mostrarla en el panel (None = redonda).
+    pub eraser_shape: Option<String>,
 }
 
 impl Default for UiState {
@@ -155,6 +160,8 @@ impl Default for UiState {
             ps_cat_members: Vec::new(),
             ps_brush_names: Vec::new(),
             ps_pack_labels: Vec::new(),
+            eraser_pick: false,
+            eraser_shape: None,
         }
     }
 }
@@ -260,6 +267,10 @@ pub struct UiActions {
     pub ps_load_pack: Option<usize>, // indice en `ps_packs`
     pub ps_load_all: bool,
     pub ps_new_round: Option<f32>,   // dureza del pincel redondo nuevo (1.0=duro, 0.0=suave)
+    /// Forma de la goma elegida (indice de pincel): la goma borrara con esa forma/textura.
+    pub pick_eraser_tip: Option<u32>,
+    /// Volver la goma a su forma REDONDA (disco).
+    pub eraser_round: bool,
 }
 
 // --- Geometria de la rueda (mas pequena que antes) ---
@@ -2715,10 +2726,19 @@ pub fn build_panel(
                                             clicked = true;
                                         }
                                         if clicked {
-                                            state.slots[state.editing_slot] = SlotItem::PsBrush(gi);
-                                            state.selected_seg = state.editing_slot;
-                                            state.brush_panel = false;
-                                            actions.pick_ps = Some(gi);
+                                            if state.eraser_pick {
+                                                // Elegir la FORMA de la goma (no asignar pincel al slot).
+                                                state.slots[state.editing_slot] = SlotItem::Eraser;
+                                                state.selected_seg = state.editing_slot;
+                                                state.eraser_pick = false;
+                                                state.brush_panel = false;
+                                                actions.pick_eraser_tip = Some(gi);
+                                            } else {
+                                                state.slots[state.editing_slot] = SlotItem::PsBrush(gi);
+                                                state.selected_seg = state.editing_slot;
+                                                state.brush_panel = false;
+                                                actions.pick_ps = Some(gi);
+                                            }
                                         }
                                     }
                                 });
@@ -2754,6 +2774,31 @@ pub fn build_panel(
                                 state.brush_panel = false;
                                 actions.exit_ps = true;
                                 actions.slot_selected = Some(state.editing_slot);
+                            }
+                        });
+                        // Forma de la goma: redonda o la forma/textura de cualquier pincel.
+                        ui.add_space(4.0);
+                        let shape = state.eraser_shape.clone().unwrap_or_else(|| "Redonda".to_string());
+                        ui.label(
+                            egui::RichText::new(format!("Forma de la goma: {shape}"))
+                                .size(12.0)
+                                .color(Color32::from_gray(110)),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(state.eraser_shape.is_none(), "● Redonda").clicked() {
+                                state.slots[state.editing_slot] = SlotItem::Eraser;
+                                state.selected_seg = state.editing_slot;
+                                state.eraser_pick = false;
+                                actions.eraser_round = true;
+                                actions.slot_selected = Some(state.editing_slot);
+                            }
+                            let pick_lbl = if state.eraser_pick {
+                                "Elige un pincel arriba ↑"
+                            } else {
+                                "Con forma de pincel…"
+                            };
+                            if ui.selectable_label(state.eraser_pick, pick_lbl).clicked() {
+                                state.eraser_pick = !state.eraser_pick;
                             }
                         });
                     });

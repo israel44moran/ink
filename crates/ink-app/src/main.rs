@@ -76,6 +76,16 @@ enum RedoOp {
     EraseMask,
 }
 
+/// Un trazo de GOMA guardado (para deshacer y para reconstruir la mascara). Puede ser una
+/// goma REDONDA (discos) o una goma con la FORMA de un pincel (estampados con textura suave).
+#[derive(Clone)]
+enum EraseStroke {
+    /// Discos `[cx, cy, radio, tiempo]` (goma redonda; borrado duro).
+    Discs(Vec<[f32; 4]>),
+    /// Estampados de la forma de un pincel: punta `tip` + vertices (cada uno con su `time`).
+    Stamps { tip: u32, verts: Vec<StampVertex> },
+}
+
 /// En que pantalla esta la app: la BIBLIOTECA de cuadernos o el LIENZO (editor).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppMode {
@@ -182,14 +192,19 @@ struct App {
     /// Historial unificado de deshacer/rehacer (trazos procedurales + de pincel PS).
     undo_stack: Vec<DrawOp>,
     redo_stack: Vec<RedoOp>,
-    /// Trazos de GOMA (cada uno = lista de discos [cx, cy, radio, TIEMPO]). El tiempo
-    /// marca en la mascara que pixeles se borraron y cuando; un trazo se ve solo si su
-    /// tiempo de creacion es mayor. Permite reconstruir la mascara y deshacer borrados.
-    erase_strokes: Vec<Vec<[f32; 4]>>,
+    /// Trazos de GOMA (discos de la goma redonda, o estampados con la forma de un pincel).
+    /// El tiempo marca en la mascara que pixeles se borraron y cuando; un trazo se ve solo
+    /// si su tiempo de creacion es mayor. Permite reconstruir la mascara y deshacer borrados.
+    erase_strokes: Vec<EraseStroke>,
     /// Trazos de goma deshechos (para rehacer).
-    erase_redo: Vec<Vec<[f32; 4]>>,
-    /// Discos del trazo de goma EN CURSO (se mueve a `erase_strokes` al terminar).
+    erase_redo: Vec<EraseStroke>,
+    /// Discos del trazo de goma REDONDA en curso (se mueve a `erase_strokes` al terminar).
     cur_erase: Vec<[f32; 4]>,
+    /// Estampados del trazo de goma CON FORMA en curso (si `eraser_tip` es Some).
+    cur_erase_stamps: Vec<StampVertex>,
+    /// Forma de la goma: `None` = redonda (discos); `Some(tip)` = forma de ese pincel
+    /// (estampados con textura suave). Lo elige el usuario en el panel "Mis pinceles".
+    eraser_tip: Option<u32>,
     /// Reloj logico: cada trazo (de dibujo o de goma) toma un tiempo creciente. Los trazos
     /// guardan su tiempo; los borrados marcan ese tiempo en la mascara.
     tick: f32,
@@ -293,6 +308,8 @@ impl App {
             erase_strokes: Vec::new(),
             erase_redo: Vec::new(),
             cur_erase: Vec::new(),
+            cur_erase_stamps: Vec::new(),
+            eraser_tip: None,
             tick: 1.0,
             mask_origin: Vec2::ZERO,
             eraser_mode: false,
@@ -646,11 +663,14 @@ impl App {
         self.doc = doc;
         self.doc.refresh(); // reconstruye la malla horneada
         self.texts = texts;
-        self.erase_strokes = erase;
+        // En disco solo se guardan los discos de la goma redonda (los estampados de la goma
+        // con forma, como los pinceles PS, no persisten por pagina en esta fase).
+        self.erase_strokes = erase.into_iter().map(EraseStroke::Discs).collect();
         self.tick = tick;
         self.active_text = None;
         self.erase_redo.clear();
         self.cur_erase.clear();
+        self.cur_erase_stamps.clear();
         self.clear_selection();
         self.cancel_poly_lasso();
         self.gesture = None;
@@ -672,7 +692,12 @@ impl App {
     fn stash_current_page(&mut self) {
         let doc = self.doc.clone();
         let texts = self.texts.clone();
-        let erase = self.erase_strokes.clone();
+        // Solo se guardan los discos (la goma con forma no persiste en disco aun).
+        let erase: Vec<Vec<[f32; 4]>> = self
+            .erase_strokes
+            .iter()
+            .filter_map(|e| if let EraseStroke::Discs(d) = e { Some(d.clone()) } else { None })
+            .collect();
         let tick = self.tick;
         if let Some(pg) = self.pages.get_mut(self.current_page) {
             pg.doc = doc;
@@ -1075,17 +1100,66 @@ impl App {
         }
     }
 
-    /// Inicia un trazo de GOMA (borrado raster por timestamps).
+    /// BrushSettings para la goma CON FORMA: la forma/dinamicas del pincel `tip`, pero con el
+    /// tamano de la goma (el de la rueda).
+    fn eraser_brush_settings(&self, tip: u32) -> BrushSettings {
+        let mut s = self.ps_settings_map.get(&tip).cloned().unwrap_or_default();
+        s.tip = TipKind::Sampled(tip);
+        s.size = self.brush.width.max(2.0);
+        s
+    }
+
+    /// Estampa un tramo del trazo de goma con forma (entre las dos ultimas muestras de
+    /// `ps_samples`, reutilizado durante el borrado) en la mascara y en `cur_erase_stamps`.
+    fn do_erase_stamp(&mut self, tip: u32) {
+        let n = self.ps_samples.len();
+        if n == 0 {
+            return;
+        }
+        let settings = self.eraser_brush_settings(tip);
+        let slice = if n == 1 { &self.ps_samples[0..1] } else { &self.ps_samples[n - 2..n] };
+        let out = stamp_path(slice, &settings, self.ps_index, self.ps_residual);
+        self.ps_index = out.next_index;
+        self.ps_residual = out.residual;
+        if out.stamps.is_empty() {
+            return;
+        }
+        let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
+        let mut verts: Vec<StampVertex> = Vec::new();
+        for st in &out.stamps {
+            push_stamp_quad(&mut verts, st, aspect, [1.0, 1.0, 1.0]); // color irrelevante: solo cuenta la cobertura
+        }
+        for v in &mut verts {
+            v.time = self.tick;
+        }
+        self.cur_erase_stamps.extend_from_slice(&verts);
+        if let Some(g) = self.gpu.as_mut() {
+            g.erase_mask_stamps(tip, &verts);
+        }
+    }
+
+    /// Inicia un trazo de GOMA (borrado raster por timestamps): discos (redonda) o estampados
+    /// con la forma de un pincel (`eraser_tip`).
     fn start_erase(&mut self) {
         self.erasing = true;
         self.cur_erase.clear();
+        self.cur_erase_stamps.clear();
         let w = self.camera.screen_to_world(self.cursor);
         self.last_sample_pos = w;
         self.ensure_mask_covers(w);
-        let disc = [w.x, w.y, self.eraser_radius(), self.tick];
-        self.cur_erase.push(disc);
-        if let Some(g) = self.gpu.as_mut() {
-            g.erase_mask(&[disc]);
+        if let Some(tip) = self.eraser_tip {
+            self.ensure_tip(tip);
+            self.ps_index = 0;
+            self.ps_residual = 0.0;
+            self.ps_samples.clear();
+            self.ps_samples.push(InputSample { pos: w, pressure: 1.0, erosion: 0.0 });
+            self.do_erase_stamp(tip); // estampa el punto inicial (un toque)
+        } else {
+            let disc = [w.x, w.y, self.eraser_radius(), self.tick];
+            self.cur_erase.push(disc);
+            if let Some(g) = self.gpu.as_mut() {
+                g.erase_mask(&[disc]);
+            }
         }
     }
 
@@ -1093,6 +1167,13 @@ impl App {
     /// Todos los discos del movimiento se borran en UN solo draw (instanciado), con el
     /// MISMO tiempo (el del trazo de goma en curso).
     fn do_erase(&mut self, world: Vec2) {
+        if let Some(tip) = self.eraser_tip {
+            // Goma con forma: anadir muestra y estampar el tramo nuevo.
+            self.ps_samples.push(InputSample { pos: world, pressure: 1.0, erosion: 0.0 });
+            self.do_erase_stamp(tip);
+            self.last_sample_pos = world;
+            return;
+        }
         let r = self.eraser_radius();
         let t = self.tick;
         let from = self.last_sample_pos;
@@ -1117,9 +1198,19 @@ impl App {
     /// Finaliza el trazo de goma: lo guarda (para deshacer/reconstruir) y avanza el reloj.
     fn finish_erase(&mut self) {
         self.erasing = false;
-        if !self.cur_erase.is_empty() {
-            let discs = std::mem::take(&mut self.cur_erase);
-            self.erase_strokes.push(discs);
+        let stroke = if !self.cur_erase_stamps.is_empty() {
+            let verts = std::mem::take(&mut self.cur_erase_stamps);
+            self.eraser_tip.map(|tip| EraseStroke::Stamps { tip, verts })
+        } else if !self.cur_erase.is_empty() {
+            Some(EraseStroke::Discs(std::mem::take(&mut self.cur_erase)))
+        } else {
+            None
+        };
+        self.cur_erase.clear();
+        self.cur_erase_stamps.clear();
+        self.ps_samples.clear(); // se reutilizo como buffer del trazo de goma con forma
+        if let Some(es) = stroke {
+            self.erase_strokes.push(es);
             self.erase_redo.clear();
             self.undo_stack.push(DrawOp::EraseMask);
             self.redo_stack.clear();
@@ -1127,13 +1218,27 @@ impl App {
         }
     }
 
-    /// Reconstruye la mascara desde cero: limpia y re-aplica todos los discos de goma con
-    /// sus tiempos (en orden de creacion; donde se solapan, el de mayor tiempo gana).
+    /// Reconstruye la mascara desde cero: limpia y re-aplica todos los trazos de goma (discos
+    /// y estampados) en orden de creacion; donde se solapan, el de mayor tiempo gana.
     fn rebuild_mask(&mut self) {
-        let all: Vec<[f32; 4]> = self.erase_strokes.iter().flatten().copied().collect();
+        let strokes = self.erase_strokes.clone();
         if let Some(g) = self.gpu.as_mut() {
             g.clear_mask();
-            g.erase_mask(&all);
+        }
+        for es in &strokes {
+            match es {
+                EraseStroke::Discs(discs) => {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.erase_mask(discs);
+                    }
+                }
+                EraseStroke::Stamps { tip, verts } => {
+                    self.ensure_tip(*tip);
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.erase_mask_stamps(*tip, verts);
+                    }
+                }
+            }
         }
     }
 
@@ -2131,6 +2236,10 @@ impl ApplicationHandler for App {
                     self.ui.ps_cat_members = self.ps_cat_members.clone();
                 }
                 self.ui.ps_pack_labels = self.ps_packs.iter().map(|(n, _p, l)| (n.clone(), *l)).collect();
+                // Nombre de la forma actual de la goma (None = redonda), para el panel.
+                self.ui.eraser_shape = self.eraser_tip.map(|t| {
+                    self.ui.ps_brush_names.get(t as usize).cloned().unwrap_or_else(|| format!("Pincel {}", t + 1))
+                });
 
                 // Sincronizacion rueda <-> "Ajustes del pincel": el pincel PS comparte el
                 // tamano y la opacidad con la rueda. Al inicio del frame la rueda parte del
@@ -2380,6 +2489,14 @@ impl ApplicationHandler for App {
                     // Pincel de Photoshop elegido en "Mis pinceles": se asigna al slot en
                     // edicion (ya hecho en ui.rs) y se activa para PINTAR.
                     self.select_ps_brush(i);
+                }
+                // Forma de la goma (elegida en "Mis pinceles").
+                if let Some(tip) = actions.pick_eraser_tip {
+                    self.eraser_tip = Some(tip);
+                    self.ensure_tip(tip);
+                }
+                if actions.eraser_round {
+                    self.eraser_tip = None;
                 }
                 // Tocar un slot de la rueda: activar su pincel PS, o salir del modo PS.
                 if let Some(i) = actions.activate_ps {

@@ -46,8 +46,10 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = (in.world - mask.min) * mask.inv_size;
-    let erase_t = textureSampleLevel(mask_tex, mask_samp, uv, 0.0).r;
-    // Visible si se dibujo despues del ultimo borrado en este pixel.
-    let visible = select(0.0, 1.0, in.time > erase_t);
-    return vec4<f32>(in.color.rgb, in.color.a * visible);
+    let m = textureSampleLevel(mask_tex, mask_samp, uv, 0.0);
+    let erase_t = m.r;       // tiempo del ultimo borrado en este pixel
+    let strength = m.g;      // fuerza de borrado (0..1, goma con textura suave)
+    // Si el trazo se dibujo DESPUES del borrado, intacto; si no, se atenua por la fuerza.
+    let visible = select(1.0 - strength, 1.0, in.time > erase_t);
+    return vec4<f32>(in.color.rgb, in.color.a * clamp(visible, 0.0, 1.0));
 }
