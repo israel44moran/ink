@@ -2116,6 +2116,21 @@ impl ApplicationHandler for App {
                 }
                 // Pasar a la rueda las miniaturas de los pinceles PS (para los slots PsBrush).
                 self.ui.ps_thumb_ids = self.ps_thumbs.iter().map(|t| t.as_ref().map(|h| h.id())).collect();
+                // Espejos del catalogo PS para el panel "Mis pinceles" (solo si cambio el nº de
+                // pinceles o categorias, p.ej. al cargar un pack; evita clonar cada frame).
+                if self.ui.ps_brush_names.len() != self.ps_brushes.len()
+                    || self.ui.ps_cat_names.len() != self.ps_cat_names.len()
+                {
+                    self.ui.ps_brush_names = self
+                        .ps_brushes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| b.name.clone().unwrap_or_else(|| format!("Pincel {}", i + 1)))
+                        .collect();
+                    self.ui.ps_cat_names = self.ps_cat_names.clone();
+                    self.ui.ps_cat_members = self.ps_cat_members.clone();
+                }
+                self.ui.ps_pack_labels = self.ps_packs.iter().map(|(n, _p, l)| (n.clone(), *l)).collect();
 
                 // Sincronizacion rueda <-> "Ajustes del pincel": el pincel PS comparte el
                 // tamano y la opacidad con la rueda. Al inicio del frame la rueda parte del
@@ -2128,7 +2143,6 @@ impl ApplicationHandler for App {
 
                 let mut actions = UiActions::default();
                 let mut ps_select: Option<u32> = None;
-                let mut ps_clear = false;
                 let mut ps_load_pack: Option<String> = None;
                 let mut ps_load_all = false;
                 let mut ps_new_round: Option<f32> = None;
@@ -2152,6 +2166,20 @@ impl ApplicationHandler for App {
                 let full_output = ctx.run(raw_input, |ctx| {
                   if self.app_mode == AppMode::Canvas {
                     actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
+                    // Conectar las acciones del panel "Mis pinceles" (pincel PS elegido y
+                    // gestor de packs) a las variables que se procesan tras construir la UI.
+                    if let Some(gi) = actions.pick_ps {
+                        ps_select = Some(gi);
+                    }
+                    if actions.ps_load_all {
+                        ps_load_all = true;
+                    }
+                    if let Some(h) = actions.ps_new_round {
+                        ps_new_round = Some(h);
+                    }
+                    if let Some(idx) = actions.ps_load_pack {
+                        ps_load_pack = self.ps_packs.get(idx).map(|(_, p, _)| p.clone());
+                    }
                     self.draw_overlays(ctx);
                     // Boton para volver a la biblioteca de cuadernos.
                     egui::Area::new(egui::Id::new("lib_button"))
@@ -2190,93 +2218,8 @@ impl ApplicationHandler for App {
                             });
                     }
 
-                    // --- Selector de pinceles de Photoshop (desplegable, a la izquierda) ---
-                    if self.ui.show_ps_panel {
-                        let brushes = &self.ps_brushes;
-                        let thumbs = &self.ps_thumbs;
-                        let packs = &self.ps_packs;
-                        let cat_names = &self.ps_cat_names;
-                        let members = &self.ps_cat_members;
-                        let active_tip = self.ps_settings.as_ref().and_then(|s| match s.tip {
-                            ink_core::TipKind::Sampled(id) => Some(id),
-                            _ => None,
-                        });
-                        egui::Area::new(egui::Id::new("ps_brushes_panel"))
-                            .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 96.0))
-                            .show(ctx, |ui| {
-                                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.set_max_width(250.0);
-                                    ui.label(egui::RichText::new(format!("Pinceles Photoshop ({})", brushes.len())).strong());
-                                    // Gestor de packs.
-                                    ui.horizontal(|ui| {
-                                        egui::ComboBox::from_id_salt("pack_combo")
-                                            .selected_text(format!("+ Cargar pack ({})", packs.len()))
-                                            .width(160.0)
-                                            .show_ui(ui, |ui| {
-                                                for (name, path, loaded) in packs {
-                                                    let lbl = if *loaded { format!("✓ {name}") } else { name.clone() };
-                                                    if ui.selectable_label(false, lbl).clicked() {
-                                                        ps_load_pack = Some(path.clone());
-                                                    }
-                                                }
-                                            });
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Cargar todos").clicked() {
-                                            ps_load_all = true;
-                                        }
-                                        if ui.button("+ Redondo").clicked() {
-                                            ps_new_round = Some(1.0);
-                                        }
-                                        if ui.button("+ Suave").clicked() {
-                                            ps_new_round = Some(0.0);
-                                        }
-                                    });
-                                    if active_tip.is_some() {
-                                        if ui.button("Volver al pincel normal").clicked() {
-                                            ps_clear = true;
-                                        }
-                                    }
-                                    ui.separator();
-                                    egui::ScrollArea::vertical().max_height(500.0).auto_shrink([false, false]).show(ui, |ui| {
-                                        // Agrupado por CATEGORIAS (basicos PS, heredados, packs...).
-                                        for (ci, cname) in cat_names.iter().enumerate() {
-                                            let mem = &members[ci];
-                                            egui::CollapsingHeader::new(egui::RichText::new(format!("{cname}  ({})", mem.len())).strong())
-                                                .id_salt(format!("pscat{ci}"))
-                                                .default_open(ci <= 3)
-                                                .show(ui, |ui| {
-                                                    for &gi in mem {
-                                                        let i = gi as usize;
-                                                        let Some(b) = brushes.get(i) else { continue };
-                                                        let selected = active_tip == Some(gi);
-                                                        let clicked = ui
-                                                            .horizontal(|ui| {
-                                                                let mut c = false;
-                                                                if let Some(Some(tex)) = thumbs.get(i) {
-                                                                    let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), egui::vec2(40.0, 40.0)))
-                                                                        .tint(egui::Color32::from_gray(45));
-                                                                    if ui.add(egui::ImageButton::new(img).selected(selected)).clicked() {
-                                                                        c = true;
-                                                                    }
-                                                                }
-                                                                let name = b.name.clone().unwrap_or_else(|| format!("Pincel {}", i + 1));
-                                                                if ui.selectable_label(selected, egui::RichText::new(name).size(12.0)).clicked() {
-                                                                    c = true;
-                                                                }
-                                                                c
-                                                            })
-                                                            .inner;
-                                                        if clicked {
-                                                            ps_select = Some(gi);
-                                                        }
-                                                    }
-                                                });
-                                        }
-                                    });
-                                });
-                            });
-                    }
+                    // (El selector de pinceles de Photoshop se fusiono con el panel "Mis
+                    // pinceles": las categorias se eligen ahi al editar un slot de la rueda.)
 
                     // Panel "Ajustes del pincel": se abre con el boton del lapiz JUSTO en el
                     // puntero, y funciona para CUALQUIER pincel (Photoshop o de la rueda).
@@ -2434,13 +2377,9 @@ impl ApplicationHandler for App {
                     self.create_round_brush(h);
                 }
                 if let Some(i) = ps_select {
-                    // Catalogo PS: elegir una forma activa ese pincel para PINTAR.
+                    // Pincel de Photoshop elegido en "Mis pinceles": se asigna al slot en
+                    // edicion (ya hecho en ui.rs) y se activa para PINTAR.
                     self.select_ps_brush(i);
-                    self.ui.show_ps_panel = false; // cerrar el selector tras elegir
-                }
-                if ps_clear {
-                    self.save_ps_settings();
-                    self.ps_settings = None;
                 }
                 // Tocar un slot de la rueda: activar su pincel PS, o salir del modo PS.
                 if let Some(i) = actions.activate_ps {

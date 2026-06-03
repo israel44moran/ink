@@ -96,6 +96,12 @@ pub struct UiState {
     /// `ps_brushes`), para dibujar los slots que contengan un `PsBrush`. `None` = aun
     /// no se ha subido a egui.
     pub ps_thumb_ids: Vec<Option<egui::TextureId>>,
+    // --- Espejos ligeros del catalogo de Photoshop (los rellena main.rs cada frame) para
+    // que el panel "Mis pinceles" pueda listar las categorias sin acceder a `ps_brushes`. ---
+    pub ps_cat_names: Vec<String>,
+    pub ps_cat_members: Vec<Vec<u32>>,
+    pub ps_brush_names: Vec<String>,
+    pub ps_pack_labels: Vec<(String, bool)>, // (nombre, ya cargado) para el combo de packs
 }
 
 impl Default for UiState {
@@ -145,6 +151,10 @@ impl Default for UiState {
             show_brush_settings: false,
             brush_settings_pos: egui::Pos2::ZERO,
             ps_thumb_ids: Vec::new(),
+            ps_cat_names: Vec::new(),
+            ps_cat_members: Vec::new(),
+            ps_brush_names: Vec::new(),
+            ps_pack_labels: Vec::new(),
         }
     }
 }
@@ -243,6 +253,13 @@ pub struct UiActions {
     /// Slot recien seleccionado/asignado en la rueda. main.rs lo usa para restaurar la
     /// ultima configuracion (tamano/opacidad/suavidad) guardada de ese item.
     pub slot_selected: Option<usize>,
+    /// Pincel de Photoshop elegido en el panel "Mis pinceles" (indice en el catalogo):
+    /// main.rs lo asigna al slot en edicion y lo activa.
+    pub pick_ps: Option<u32>,
+    /// Controles del gestor de pinceles de Photoshop (movidos al panel "Mis pinceles").
+    pub ps_load_pack: Option<usize>, // indice en `ps_packs`
+    pub ps_load_all: bool,
+    pub ps_new_round: Option<f32>,   // dureza del pincel redondo nuevo (1.0=duro, 0.0=suave)
 }
 
 // --- Geometria de la rueda (mas pequena que antes) ---
@@ -2620,48 +2637,125 @@ pub fn build_panel(
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("BÁSICO").size(12.0).strong().color(Color32::from_gray(135)));
-                    ui.add_space(3.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for (bi, name) in BRUSHES.iter().enumerate() {
-                            if item_cell(ui, name) {
-                                state.slots[state.editing_slot] = SlotItem::Brush(bi);
+                    // Copias de los datos de Photoshop (evitan conflictos de prestamo con
+                    // `state.slots` dentro de los closures; el panel no es ruta critica).
+                    let cat_names = state.ps_cat_names.clone();
+                    let cat_members = state.ps_cat_members.clone();
+                    let brush_names = state.ps_brush_names.clone();
+                    let thumb_ids = state.ps_thumb_ids.clone();
+                    let pack_labels = state.ps_pack_labels.clone();
+                    egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, false]).show(ui, |ui| {
+                        // --- BÁSICO ---
+                        ui.label(egui::RichText::new("BÁSICO").size(12.0).strong().color(Color32::from_gray(135)));
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for (bi, name) in BRUSHES.iter().enumerate() {
+                                if item_cell(ui, name) {
+                                    state.slots[state.editing_slot] = SlotItem::Brush(bi);
+                                    state.selected_seg = state.editing_slot;
+                                    brush.width = brush_width_for(name);
+                                    brush.kind = brush_kind_for(name);
+                                    state.brush_panel = false;
+                                    actions.exit_ps = true;
+                                    actions.slot_selected = Some(state.editing_slot);
+                                }
+                            }
+                        });
+
+                        // --- PHOTOSHOP (categorias colapsables, cerradas por defecto) ---
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("PHOTOSHOP").size(12.0).strong().color(Color32::from_gray(135)));
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            egui::ComboBox::from_id_salt("mp_pack_combo")
+                                .selected_text(format!("+ Cargar pack ({})", pack_labels.len()))
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for (idx, (name, loaded)) in pack_labels.iter().enumerate() {
+                                        let lbl = if *loaded { format!("✓ {name}") } else { name.clone() };
+                                        if ui.selectable_label(false, lbl).clicked() {
+                                            actions.ps_load_pack = Some(idx);
+                                        }
+                                    }
+                                });
+                            if ui.button("Cargar todos").clicked() {
+                                actions.ps_load_all = true;
+                            }
+                            if ui.button("+ Redondo").clicked() {
+                                actions.ps_new_round = Some(1.0);
+                            }
+                            if ui.button("+ Suave").clicked() {
+                                actions.ps_new_round = Some(0.0);
+                            }
+                        });
+                        ui.add_space(4.0);
+                        for ci in 0..cat_names.len() {
+                            let mem = &cat_members[ci];
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!("{}  ({})", cat_names[ci], mem.len())).strong(),
+                            )
+                            .id_salt(format!("mpcat{ci}"))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for &gi in mem {
+                                        let i = gi as usize;
+                                        let name = brush_names
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or_else(|| format!("Pincel {}", i + 1));
+                                        let mut clicked = false;
+                                        if let Some(Some(tid)) = thumb_ids.get(i) {
+                                            let img = egui::Image::new(egui::load::SizedTexture::new(*tid, egui::vec2(42.0, 42.0)))
+                                                .tint(Color32::from_gray(45));
+                                            if ui.add(egui::ImageButton::new(img)).on_hover_text(&name).clicked() {
+                                                clicked = true;
+                                            }
+                                        } else if ui.button(&name).clicked() {
+                                            clicked = true;
+                                        }
+                                        if clicked {
+                                            state.slots[state.editing_slot] = SlotItem::PsBrush(gi);
+                                            state.selected_seg = state.editing_slot;
+                                            state.brush_panel = false;
+                                            actions.pick_ps = Some(gi);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+
+                        // --- HERRAMIENTAS ---
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("HERRAMIENTAS").size(12.0).strong().color(Color32::from_gray(135)));
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for (ti, name) in TOOLS.iter().enumerate() {
+                                if item_cell(ui, name) {
+                                    state.slots[state.editing_slot] = SlotItem::Tool(ti);
+                                    state.selected_seg = state.editing_slot;
+                                    state.brush_panel = false;
+                                    actions.exit_ps = true;
+                                    actions.slot_selected = Some(state.editing_slot);
+                                }
+                            }
+                        });
+
+                        // --- BORRADOR ---
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("BORRADOR").size(12.0).strong().color(Color32::from_gray(135)));
+                        ui.add_space(3.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if item_cell(ui, "Goma") {
+                                // La goma es una herramienta de la rueda: ocupa este slot con su
+                                // icono. Al seleccionarla se activa el borrado (derivado en main.rs).
+                                state.slots[state.editing_slot] = SlotItem::Eraser;
                                 state.selected_seg = state.editing_slot;
-                                brush.width = brush_width_for(name);
-                                brush.kind = brush_kind_for(name);
                                 state.brush_panel = false;
                                 actions.exit_ps = true;
                                 actions.slot_selected = Some(state.editing_slot);
                             }
-                        }
-                    });
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("HERRAMIENTAS").size(12.0).strong().color(Color32::from_gray(135)));
-                    ui.add_space(3.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for (ti, name) in TOOLS.iter().enumerate() {
-                            if item_cell(ui, name) {
-                                state.slots[state.editing_slot] = SlotItem::Tool(ti);
-                                state.selected_seg = state.editing_slot;
-                                state.brush_panel = false;
-                                actions.exit_ps = true;
-                                actions.slot_selected = Some(state.editing_slot);
-                            }
-                        }
-                    });
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("BORRADOR").size(12.0).strong().color(Color32::from_gray(135)));
-                    ui.add_space(3.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if item_cell(ui, "Goma") {
-                            // La goma es una herramienta de la rueda: ocupa este slot con su
-                            // icono. Al seleccionarla se activa el borrado (derivado en main.rs).
-                            state.slots[state.editing_slot] = SlotItem::Eraser;
-                            state.selected_seg = state.editing_slot;
-                            state.brush_panel = false;
-                            actions.exit_ps = true;
-                            actions.slot_selected = Some(state.editing_slot);
-                        }
+                        });
                     });
                 });
             });
@@ -2928,11 +3022,8 @@ pub fn build_panel(
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(230.0);
-                if icon_text_row(ui, state.show_ps_panel, "Pinceles", |p, c| {
-                    preview_wave(p, c, 9.0, 2.4, Color32::from_gray(70));
-                }) {
-                    state.show_ps_panel = !state.show_ps_panel;
-                }
+                // (Los pinceles de Photoshop ahora viven dentro del panel "Mis pinceles",
+                // que se abre tocando un slot de la rueda; ya no hay fila "Pinceles" aqui.)
                 if icon_text_row(ui, state.show_layers, "Capas", icon_layers) {
                     state.show_layers = !state.show_layers;
                 }
