@@ -15,6 +15,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
 use crate::stroke::InputSample;
+use crate::tools::point_in_polygon;
 
 /// Vertice de un estampado texturizado que consume la GPU: posicion de mundo, UV en
 /// la textura de la punta, y color RGBA (alfa = opacidad/flujo de ese estampado).
@@ -67,6 +68,83 @@ pub fn push_stamp_quad(out: &mut Vec<StampVertex>, st: &Stamp, tip_aspect: f32, 
     let vbl = StampVertex { pos: [bl.x, bl.y], uv: [u0, v1], color: col, time: 0.0 };
     let vbr = StampVertex { pos: [br.x, br.y], uv: [u1, v1], color: col, time: 0.0 };
     out.extend_from_slice(&[vtl, vtr, vbl, vtr, vbr, vbl]);
+}
+
+/// Interpolacion bilineal sobre el quad: `a`=esquina(0,0), `b`=(1,0), `c`=(0,1), `d`=(1,1).
+fn bilerp(a: Vec2, b: Vec2, c: Vec2, d: Vec2, s: f32, t: f32) -> Vec2 {
+    let top = a + (b - a) * s;
+    let bot = c + (d - c) * s;
+    top + (bot - top) * t
+}
+
+/// Recorta UN estampado (los 6 vertices de un quad, tal como los crea [`push_stamp_quad`])
+/// por el contorno `poly`, anexando a `out` sub-estampados (6 vertices cada uno) etiquetados
+/// con `true` si quedan DENTRO del contorno.
+///
+/// Los estampados totalmente dentro o totalmente fuera se devuelven enteros (sin dividir).
+/// Los que el contorno CRUZA se subdividen en una rejilla fina (mas fina cuanto mas grande
+/// es el estampado, para que el corte sea exacto a cualquier tamano de pincel) y cada celda
+/// se clasifica por su centro. Asi el corte sigue la curva del lazo "tal cual", en vez de
+/// incluir o excluir el estampado entero. Los UV se interpolan, asi la textura no se deforma.
+pub fn clip_stamp_by_polygon(v: &[StampVertex], poly: &[Vec2], out: &mut Vec<(bool, [StampVertex; 6])>) {
+    if v.len() < 6 || poly.len() < 3 {
+        return;
+    }
+    // Esquinas del quad (indices 0=TL, 1=TR, 2=BL, 4=BR, ver push_stamp_quad).
+    let p_tl = Vec2::new(v[0].pos[0], v[0].pos[1]);
+    let p_tr = Vec2::new(v[1].pos[0], v[1].pos[1]);
+    let p_bl = Vec2::new(v[2].pos[0], v[2].pos[1]);
+    let p_br = Vec2::new(v[4].pos[0], v[4].pos[1]);
+    let u_tl = Vec2::new(v[0].uv[0], v[0].uv[1]);
+    let u_tr = Vec2::new(v[1].uv[0], v[1].uv[1]);
+    let u_bl = Vec2::new(v[2].uv[0], v[2].uv[1]);
+    let u_br = Vec2::new(v[4].uv[0], v[4].uv[1]);
+    let color = v[0].color;
+    let time = v[0].time;
+
+    let pos = |s: f32, t: f32| bilerp(p_tl, p_tr, p_bl, p_br, s, t);
+    let uvf = |s: f32, t: f32| bilerp(u_tl, u_tr, u_bl, u_br, s, t);
+    // Construye los 6 vertices de un sub-quad [s0,s1]x[t0,t1] (mismo orden que push_stamp_quad).
+    let quad = |s0: f32, t0: f32, s1: f32, t1: f32| -> [StampVertex; 6] {
+        let mk = |s: f32, t: f32| {
+            let p = pos(s, t);
+            let u = uvf(s, t);
+            StampVertex { pos: [p.x, p.y], uv: [u.x, u.y], color, time }
+        };
+        let (vtl, vtr, vbl, vbr) = (mk(s0, t0), mk(s1, t0), mk(s0, t1), mk(s1, t1));
+        [vtl, vtr, vbl, vtr, vbr, vbl]
+    };
+
+    let in_tl = point_in_polygon(p_tl, poly);
+    let in_tr = point_in_polygon(p_tr, poly);
+    let in_bl = point_in_polygon(p_bl, poly);
+    let in_br = point_in_polygon(p_br, poly);
+    let all_in = in_tl && in_tr && in_bl && in_br;
+    let all_out = !in_tl && !in_tr && !in_bl && !in_br;
+    let center_in = point_in_polygon(pos(0.5, 0.5), poly);
+
+    if all_in {
+        out.push((true, quad(0.0, 0.0, 1.0, 1.0)));
+        return;
+    }
+    if all_out && !center_in {
+        out.push((false, quad(0.0, 0.0, 1.0, 1.0)));
+        return;
+    }
+
+    // El contorno cruza este estampado: subdividir y clasificar cada celda por su centro.
+    // N proporcional al tamano del estampado (celda ~2 unidades de mundo), acotado a [4,20].
+    let side = (p_tr - p_tl).length().max((p_bl - p_tl).length());
+    let n = ((side * 0.5).round() as i32).clamp(4, 20) as usize;
+    let inv = 1.0 / n as f32;
+    for j in 0..n {
+        for i in 0..n {
+            let s0 = i as f32 * inv;
+            let t0 = j as f32 * inv;
+            let cin = point_in_polygon(pos(s0 + inv * 0.5, t0 + inv * 0.5), poly);
+            out.push((cin, quad(s0, t0, s0 + inv, t0 + inv)));
+        }
+    }
 }
 
 /// Que controla la variacion de un parametro (columna "Control:" de PS).

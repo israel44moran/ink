@@ -516,6 +516,45 @@ impl App {
         out
     }
 
+    /// Lazo que RECORTA los estampados Ps por el contorno (corte EXACTO, no estampados
+    /// enteros): reconstruye el buffer de cada tip subdividiendo los estampados que el
+    /// contorno cruza, y marca como seleccionados los sub-estampados que quedan DENTRO.
+    /// Los buffers afectados se re-suben a la GPU. Define `self.selected_stamps`.
+    fn lasso_cut_stamps(&mut self, poly: &[Vec2]) {
+        let mut sel: HashMap<u32, Vec<usize>> = HashMap::new();
+        let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
+        let mut frags: Vec<(bool, [StampVertex; 6])> = Vec::new();
+        for tip in tips {
+            let src = match self.ps_committed.get(&tip) {
+                Some(v) if v.len() >= 6 => v.clone(),
+                _ => continue,
+            };
+            let count = src.len() / 6;
+            let mut newbuf: Vec<StampVertex> = Vec::with_capacity(src.len());
+            let mut idxs: Vec<usize> = Vec::new();
+            for i in 0..count {
+                frags.clear();
+                ink_core::clip_stamp_by_polygon(&src[i * 6..i * 6 + 6], poly, &mut frags);
+                for (inside, q) in frags.drain(..) {
+                    if inside {
+                        idxs.push(newbuf.len() / 6);
+                    }
+                    newbuf.extend_from_slice(&q);
+                }
+            }
+            if idxs.is_empty() {
+                continue; // nada dentro de este tip: dejar el buffer original intacto
+            }
+            self.ps_committed.insert(tip, newbuf);
+            let snapshot = self.ps_committed.get(&tip).cloned();
+            if let (Some(snapshot), Some(g)) = (snapshot, self.gpu.as_mut()) {
+                g.set_committed_stamps(tip, &snapshot);
+            }
+            sel.insert(tip, idxs);
+        }
+        self.selected_stamps = sel;
+    }
+
     /// Caja (AABB) que engloba TODA la seleccion: trazos procedurales + estampados Ps.
     fn selection_bounds(&self) -> Option<Aabb> {
         let mut acc = self.doc.bounds_of(&self.selected);
@@ -1354,9 +1393,9 @@ impl App {
             Some(Gesture::LassoCut { pts }) => {
                 // Recortar los trazos por el contorno y seleccionar solo lo de dentro.
                 self.selected = self.doc.lasso_split(&pts);
-                // Los estampados Ps no se pueden "partir": se seleccionan los que caen
-                // dentro del contorno (por su centro), que al ser densos siguen la forma.
-                self.selected_stamps = self.select_stamps_in_polygon(&pts);
+                // Estampados Ps: recorte EXACTO por la curva (subdividiendo los del borde),
+                // no estampados enteros. Define self.selected_stamps.
+                self.lasso_cut_stamps(&pts);
                 self.sync_committed();
             }
             _ => {}
