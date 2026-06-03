@@ -8,9 +8,10 @@
 use crate::stroke::{InputSample, Stroke, Vertex};
 use crate::tools::{dist_point_segment, point_in_polygon, segment_polygon_cross, Aabb};
 use glam::Vec2;
+use serde::{Deserialize, Serialize};
 
 /// Una capa del documento.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Layer {
     pub name: String,
     pub visible: bool,
@@ -25,14 +26,19 @@ impl Layer {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Document {
     pub layers: Vec<Layer>,
     pub active: usize,
+    // La malla horneada y el historial NO se guardan: se reconstruyen al cargar.
+    #[serde(skip)]
     committed: Vec<Vertex>,
     /// Pila de rehacer: (indice de capa, trazo deshecho).
+    #[serde(skip)]
     undone: Vec<(usize, Stroke)>,
     /// `true` si el ultimo `add_stroke` solo ANEXO el trazo nuevo al final de `committed`
     /// (sin reconstruir). Permite al renderer subir solo ese trazo a la GPU (incremental).
+    #[serde(skip)]
     last_incremental: bool,
 }
 
@@ -187,6 +193,12 @@ impl Document {
     /// renderer lo usa para subir solo ese trazo a la GPU.
     pub fn last_add_was_incremental(&self) -> bool {
         self.last_incremental
+    }
+
+    /// Reconstruye la malla horneada. Llamar tras cargar un documento deserializado
+    /// (sus campos `committed`/`undone` vienen vacios).
+    pub fn refresh(&mut self) {
+        self.rebuild();
     }
 
     fn rebuild(&mut self) {

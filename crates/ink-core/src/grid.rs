@@ -10,7 +10,7 @@ use crate::stroke::Vertex;
 use glam::Vec2;
 
 /// Tipo de cuadricula (igual que las opciones del panel "Area de trabajo").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GridKind {
     None,     // sin cuadricula
     Dots,     // cuadricula de puntos

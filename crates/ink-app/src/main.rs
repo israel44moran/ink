@@ -14,6 +14,7 @@
 //!   - El panel de la derecha se puede ocultar/mostrar con su boton.
 
 mod copic;
+mod notebook;
 #[cfg(windows)]
 mod pen_win;
 mod renderer;
@@ -74,6 +75,13 @@ enum RedoOp {
     EraseMask,
 }
 
+/// En que pantalla esta la app: la BIBLIOTECA de cuadernos o el LIENZO (editor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Library,
+    Canvas,
+}
+
 /// Configuracion persistente de un item de la rueda (lo que el usuario ajusta con los
 /// popups: tamano, opacidad y suavidad). Se guarda por item para restaurarla al volver.
 #[derive(Clone, Copy)]
@@ -93,6 +101,7 @@ fn slot_key(slot: ui::SlotItem) -> Option<(u8, u32)> {
         _ => None,
     }
 }
+use std::path::PathBuf;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Force, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -203,6 +212,18 @@ struct App {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     ui: UiState,
+
+    // --- Cuadernos ---
+    /// Pantalla actual: biblioteca de cuadernos o lienzo (editor).
+    app_mode: AppMode,
+    /// Lista de cuadernos para la biblioteca.
+    notebooks: Vec<notebook::NotebookEntry>,
+    /// Ruta del cuaderno abierto (donde se guarda).
+    current_path: Option<std::path::PathBuf>,
+    /// Nombre que se escribe al crear un cuaderno nuevo.
+    new_nb_name: String,
+    /// Tipo del cuaderno nuevo: infinito (true) o con hojas (false).
+    new_nb_infinite: bool,
 }
 
 impl App {
@@ -265,6 +286,11 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             ui: UiState::default(),
+            app_mode: AppMode::Library,
+            notebooks: Vec::new(),
+            current_path: None,
+            new_nb_name: String::new(),
+            new_nb_infinite: true,
         }
     }
 
@@ -436,6 +462,97 @@ impl App {
         if let Some(g) = self.gpu.as_mut() {
             g.set_committed(self.doc.committed_vertices());
         }
+    }
+
+    // ===================== Cuadernos (biblioteca + guardado) =====================
+
+    /// Carga el contenido de un cuaderno en el estado actual y reconstruye la GPU.
+    fn apply_notebook(&mut self, nb: notebook::NotebookData) {
+        self.commit_text();
+        // Limpiar estampados de Photoshop previos (no se guardan en esta version).
+        let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
+        self.ps_committed.clear();
+        self.ps_active_verts.clear();
+        self.ps_settings = None;
+
+        self.doc = nb.doc;
+        self.doc.refresh(); // reconstruye la malla horneada
+        self.texts = nb.texts;
+        self.active_text = None;
+        self.erase_strokes = nb.erase_strokes;
+        self.erase_redo.clear();
+        self.cur_erase.clear();
+        self.tick = nb.tick.max(1.0);
+        self.selected.clear();
+        self.gesture = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
+
+        if let Some(g) = self.gpu.as_mut() {
+            for t in tips {
+                g.set_committed_stamps(t, &[]);
+            }
+            g.clear_active_stamps();
+            g.set_active(&[]);
+            g.set_committed(self.doc.committed_vertices());
+        }
+        // Re-aplicar los borrados de la goma a la mascara.
+        self.rebuild_mask();
+    }
+
+    /// Construye el contenido serializable del cuaderno actual.
+    fn current_notebook_data(&self, name: String, infinite: bool) -> notebook::NotebookData {
+        notebook::NotebookData {
+            version: 1,
+            name,
+            infinite,
+            doc: self.doc.clone(),
+            texts: self.texts.clone(),
+            erase_strokes: self.erase_strokes.clone(),
+            tick: self.tick,
+        }
+    }
+
+    /// Guarda el cuaderno abierto (si lo hay) en su archivo.
+    fn save_current(&mut self) {
+        let Some(path) = self.current_path.clone() else { return };
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cuaderno")
+            .to_string();
+        let infinite = matches!(self.settings.artboard, settings::Artboard::Infinite);
+        let nb = self.current_notebook_data(name, infinite);
+        let _ = notebook::save(&nb, &path);
+    }
+
+    /// Abre un cuaderno desde disco y entra al lienzo.
+    fn open_notebook(&mut self, path: PathBuf) {
+        if let Some(nb) = notebook::load(&path) {
+            self.apply_notebook(nb);
+            self.current_path = Some(path);
+            self.app_mode = AppMode::Canvas;
+        }
+    }
+
+    /// Crea un cuaderno nuevo, lo guarda y lo abre.
+    fn new_notebook(&mut self, name: &str, infinite: bool) {
+        let name = if name.trim().is_empty() { "Cuaderno" } else { name.trim() };
+        let nb = notebook::NotebookData::new(name, infinite);
+        let path = notebook::path_for(name);
+        let _ = notebook::save(&nb, &path);
+        self.apply_notebook(nb);
+        self.current_path = Some(path);
+        self.app_mode = AppMode::Canvas;
+    }
+
+    /// Guarda el cuaderno actual y vuelve a la biblioteca (refrescando la lista).
+    fn go_to_library(&mut self) {
+        self.save_current();
+        self.current_path = None;
+        self.app_mode = AppMode::Library;
+        self.notebooks = notebook::list();
     }
 
     /// Deshace la ULTIMA operacion de dibujo (procedural, de pincel PS o de goma), en orden.
@@ -1278,6 +1395,10 @@ impl ApplicationHandler for App {
         let base = format!(r"{home}\Downloads\Photoshop Brushes");
         self.ps_packs = scan_packs(&base);
 
+        // Cargar la lista de cuadernos guardados y empezar en la biblioteca.
+        self.notebooks = notebook::list();
+        self.app_mode = AppMode::Library;
+
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1413,7 +1534,7 @@ impl ApplicationHandler for App {
             },
 
             WindowEvent::MouseWheel { delta, .. } => {
-                if !egui_consumed {
+                if !egui_consumed && self.app_mode == AppMode::Canvas {
                     let amount = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
@@ -1488,7 +1609,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::KeyboardInput { event, .. } if !egui_consumed => {
+            WindowEvent::KeyboardInput { event, .. } if !egui_consumed && self.app_mode == AppMode::Canvas => {
                 let pressed = event.state == ElementState::Pressed;
 
                 // Edicion de texto: mientras hay un texto activo, el teclado escribe en el.
@@ -1650,11 +1771,31 @@ impl ApplicationHandler for App {
                 let mut ps_load_pack: Option<String> = None;
                 let mut ps_load_all = false;
                 let mut ps_new_round: Option<f32> = None;
+                // Acciones de la BIBLIOTECA de cuadernos (se procesan tras construir la UI).
+                let mut lib_open: Option<PathBuf> = None;
+                let mut lib_delete: Option<PathBuf> = None;
+                let mut lib_create = false;
+                let mut lib_go = false;
+                let in_library = self.app_mode == AppMode::Library;
+                let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
+                    self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
+                } else {
+                    Vec::new()
+                };
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
+                  if self.app_mode == AppMode::Canvas {
                     actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
                     self.draw_overlays(ctx);
+                    // Boton para volver a la biblioteca de cuadernos.
+                    egui::Area::new(egui::Id::new("lib_button"))
+                        .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+                        .show(ctx, |ui| {
+                            if ui.button(egui::RichText::new("☰ Cuadernos").size(14.0)).clicked() {
+                                lib_go = true;
+                            }
+                        });
 
                     // --- Selector de pinceles de Photoshop (desplegable, a la izquierda) ---
                     if self.ui.show_ps_panel {
@@ -1754,9 +1895,81 @@ impl ApplicationHandler for App {
                             brush_settings_panel_proc(ctx, &mut self.brush, &self.settings, pos);
                         }
                     }
+                  } else {
+                    // ---------------- BIBLIOTECA de cuadernos ----------------
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.add_space(18.0);
+                        ui.heading("Mis cuadernos");
+                        ui.label(
+                            egui::RichText::new("Crea cuadernos infinitos o con hojas. Se guardan solos al volver aquí.")
+                                .color(egui::Color32::from_gray(130)),
+                        );
+                        ui.add_space(12.0);
+                        // --- Crear nuevo ---
+                        ui.horizontal(|ui| {
+                            ui.label("Nombre:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_nb_name)
+                                    .hint_text("Mi cuaderno")
+                                    .desired_width(220.0),
+                            );
+                            ui.selectable_value(&mut self.new_nb_infinite, true, "♾ Infinito");
+                            ui.selectable_value(&mut self.new_nb_infinite, false, "▭ Hojas");
+                            if ui.button(egui::RichText::new("➕ Crear").strong()).clicked() {
+                                lib_create = true;
+                            }
+                        });
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        if nb_list.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Aún no tienes cuadernos. Escribe un nombre y pulsa Crear.")
+                                    .italics()
+                                    .color(egui::Color32::from_gray(140)),
+                            );
+                        }
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            for (name, infinite, path) in &nb_list {
+                                ui.horizontal(|ui| {
+                                    let tag = if *infinite { "♾" } else { "▭" };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(egui::RichText::new(format!("{tag}   {name}")).size(16.0))
+                                                .min_size(egui::vec2(340.0, 36.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        lib_open = Some(path.clone());
+                                    }
+                                    if ui.button("🗑").on_hover_text("Borrar cuaderno").clicked() {
+                                        lib_delete = Some(path.clone());
+                                    }
+                                });
+                                ui.add_space(5.0);
+                            }
+                        });
+                    });
+                  }
                 });
                 if let Some(s) = self.egui_state.as_mut() {
                     s.handle_platform_output(window.as_ref(), full_output.platform_output);
+                }
+                // --- Acciones de la biblioteca de cuadernos ---
+                if lib_go {
+                    self.go_to_library();
+                }
+                if let Some(p) = lib_open {
+                    self.open_notebook(p);
+                }
+                if lib_create {
+                    let name = self.new_nb_name.clone();
+                    self.new_notebook(&name, self.new_nb_infinite);
+                    self.new_nb_name.clear();
+                }
+                if let Some(p) = lib_delete {
+                    notebook::delete(&p);
+                    self.notebooks = notebook::list();
                 }
                 if let Some(p) = ps_load_pack {
                     self.load_ps_pack(&p);

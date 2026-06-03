@@ -124,7 +124,7 @@ pub fn dist_point_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
 }
 
 /// Una etiqueta de texto colocada en el lienzo (coordenadas de mundo).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TextItem {
     pub pos: Vec2,
     pub content: String,

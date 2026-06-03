@@ -8,6 +8,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
+use serde::{Deserialize, Serialize};
 
 /// Vertice que consume la GPU: posicion en coordenadas de mundo + color RGBA.
 ///
@@ -31,7 +32,7 @@ impl Vertex {
 }
 
 /// Una muestra de entrada del lapiz/raton.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct InputSample {
     /// Posicion en coordenadas de mundo (no de pantalla).
     pub pos: Vec2,
@@ -52,7 +53,7 @@ impl InputSample {
 }
 
 /// Tipo de pincel: define COMO se dibuja el trazo (su "motor").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrushKind {
     Pen,        // ancho variable por presion (pluma)
     FixedWidth, // ancho constante
@@ -70,7 +71,7 @@ impl Default for BrushKind {
 }
 
 /// Parametros del pincel actual.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Brush {
     pub color: [f32; 4],
     /// Ancho maximo (a presion plena), en unidades de mundo.
@@ -96,7 +97,7 @@ impl Default for Brush {
 }
 
 /// Un trazo completo.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stroke {
     pub samples: Vec<InputSample>,
     pub brush: Brush,

@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
-glam = "0.33.0"
+glam = { version = "0.33.0", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
