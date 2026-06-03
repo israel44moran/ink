@@ -1370,6 +1370,17 @@ impl ApplicationHandler for App {
                         self.panning = false;
                     }
                 }
+                // Boton inferior del lapiz (los drivers de tableta lo mapean a clic
+                // derecho): abre/cierra "Ajustes del pincel" JUSTO en el puntero.
+                MouseButton::Right => {
+                    if state == ElementState::Pressed {
+                        self.ui.show_brush_settings = !self.ui.show_brush_settings;
+                        if self.ui.show_brush_settings {
+                            let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+                            self.ui.brush_settings_pos = egui::pos2(self.cursor.x / ppp, self.cursor.y / ppp);
+                        }
+                    }
+                }
                 _ => {}
             },
 
@@ -1680,11 +1691,14 @@ impl ApplicationHandler for App {
                             });
                     }
 
-                    // Panel "Ajustes del pincel" del pincel PS activo (a la izquierda,
-                    // solo cuando el selector esta cerrado, para no solaparse).
-                    if !self.ui.show_ps_panel {
+                    // Panel "Ajustes del pincel": se abre con el boton del lapiz JUSTO en el
+                    // puntero, y funciona para CUALQUIER pincel (Photoshop o de la rueda).
+                    if self.ui.show_brush_settings {
+                        let pos = self.ui.brush_settings_pos;
                         if let Some(s) = self.ps_settings.as_mut() {
-                            brush_settings_panel(ctx, s, &self.settings);
+                            brush_settings_panel(ctx, s, &self.settings, pos);
+                        } else {
+                            brush_settings_panel_proc(ctx, &mut self.brush, &self.settings, pos);
                         }
                     }
                 });
@@ -1905,15 +1919,18 @@ fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
 /// Panel "Ajustes del pincel" estilo Photoshop: edita `s` en vivo (el motor de
 /// estampado lo aplica al siguiente trazo). `cfg` da la unidad de medida (misma que
 /// la rueda). Devuelve nada; muta `s`.
-fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings, cfg: &Settings) {
+/// Panel completo de ajustes para un pincel de Photoshop (estampado). Se abre en `pos`
+/// (el puntero) y se mantiene dentro de la pantalla.
+fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings, cfg: &Settings, pos: egui::Pos2) {
     use egui::{CollapsingHeader, RichText, Slider};
     egui::Window::new(RichText::new("Ajustes del pincel").strong())
         .id(egui::Id::new("ps_settings_window"))
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 64.0))
+        .fixed_pos(pos)
+        .constrain(true)
         .default_width(280.0)
         .resizable(false)
         .collapsible(true)
-        .default_open(false)
+        .default_open(true)
         .show(ctx, |ui| {
             ui.label(RichText::new(&s.name).italics().color(egui::Color32::from_rgb(40, 120, 220)));
             egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, false]).show(ui, |ui| {
@@ -2017,6 +2034,32 @@ fn brush_settings_panel(ctx: &egui::Context, s: &mut ink_core::BrushSettings, cf
                 pct_row(ui, "Opacidad", &mut s.opacity);
                 pct_row(ui, "Flujo", &mut s.flow);
             });
+        });
+}
+
+/// Panel de ajustes para un pincel PROCEDURAL de la rueda (Pluma, Rotulador, Lapiz...).
+/// Muestra los controles que ESE motor usa: tamano, opacidad y suavidad (las mismas
+/// magnitudes que la rueda). Se abre en `pos` (el puntero).
+fn brush_settings_panel_proc(ctx: &egui::Context, brush: &mut ink_core::Brush, cfg: &Settings, pos: egui::Pos2) {
+    use egui::{RichText, Slider};
+    egui::Window::new(RichText::new("Ajustes del pincel").strong())
+        .id(egui::Id::new("proc_settings_window"))
+        .fixed_pos(pos)
+        .constrain(true)
+        .default_width(260.0)
+        .resizable(false)
+        .collapsible(true)
+        .default_open(true)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("Pincel de la rueda").italics().color(egui::Color32::from_rgb(40, 120, 220)));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // Misma unidad de medida que la rueda (px/pts/mm... segun ajustes).
+                ui.add(Slider::new(&mut brush.width, 1.0..=400.0).custom_formatter(|v, _| cfg.format_measure(v as f32)));
+                ui.label("Tamaño");
+            });
+            pct_row(ui, "Opacidad", &mut brush.opacity);
+            pct_row(ui, "Suavidad", &mut brush.smoothing);
         });
 }
 

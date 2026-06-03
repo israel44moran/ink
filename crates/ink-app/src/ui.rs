@@ -90,6 +90,8 @@ pub struct UiState {
     pub undo_press: f64,         // tiempo (s) del ultimo clic en deshacer (animacion de pulsacion)
     pub redo_press: f64,         // tiempo (s) del ultimo clic en rehacer
     pub dot_drag: bool,          // arrastrando el punto colapsado (solo si el gesto empezo dentro)
+    pub show_brush_settings: bool,       // panel "Ajustes del pincel" visible (boton del lapiz)
+    pub brush_settings_pos: egui::Pos2,  // donde abrirlo (en el puntero), en puntos de egui
     /// TextureId de la miniatura de cada pincel de Photoshop (paralelo al catalogo
     /// `ps_brushes`), para dibujar los slots que contengan un `PsBrush`. `None` = aun
     /// no se ha subido a egui.
@@ -140,6 +142,8 @@ impl Default for UiState {
             undo_press: -1.0,
             redo_press: -1.0,
             dot_drag: false,
+            show_brush_settings: false,
+            brush_settings_pos: egui::Pos2::ZERO,
             ps_thumb_ids: Vec::new(),
         }
     }
