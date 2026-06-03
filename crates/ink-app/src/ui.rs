@@ -1369,6 +1369,21 @@ fn fade(c: Color32, f: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * f).round() as u8)
 }
 
+/// Dibuja texto en NEGRITA. egui no trae una fuente bold por defecto, asi que simulamos el
+/// peso re-pintando el texto con micro-desplazamientos (engrosa los trazos ~1px).
+fn text_bold(p: &egui::Painter, pos: Pos2, align: Align2, text: String, size: f32, color: Color32) {
+    let f = FontId::proportional(size);
+    for off in [
+        egui::vec2(-0.7, 0.0),
+        egui::vec2(0.7, 0.0),
+        egui::vec2(0.0, -0.7),
+        egui::vec2(0.0, 0.7),
+    ] {
+        p.text(pos + off, align, text.clone(), f.clone(), color);
+    }
+    p.text(pos, align, text, f, color);
+}
+
 /// Factor de aparicion [0,1] de una pieza al RECONSTRUIR la rueda. `build` 0..1 es
 /// el progreso global; `r_norm` 0(centro)..1(borde): las piezas exteriores
 /// aparecen primero; `phase` 0..1 desfasa un poco cada pieza (no todas a la vez).
@@ -2256,25 +2271,31 @@ pub fn build_panel(
                 }
             }
 
-            // --- Donut interior: grosor (arriba), suavidad (izq), opacidad (der) ---
-            let rside = (R_HOLE + R_MID) / 2.0;
-            icon_grip(&p, c + egui::vec2(-26.0, -(R_HOLE + 14.0)), 7.0, fade(Color32::from_gray(120), f_donut));
-            icon_brush_sample(&p, c + egui::vec2(-rside, -1.0), 8.0, fade(Color32::from_gray(110), f_donut));
-            icon_opacity(&p, c + egui::vec2(rside, -1.0), 7.0, fade(Color32::from_gray(110), f_donut));
+            // --- Donut interior: grosor (arriba), suavidad (abajo-izq), opacidad (abajo-der) ---
+            // Todo se ubica DENTRO de la banda del donut (entre R_HOLE y R_MID) con margen, asi
+            // los simbolos y numeros no se salen al borde. `rband` = centro radial de la banda.
+            let rband = (R_HOLE + R_MID) * 0.5;
+            let icol = fade(Color32::from_gray(110), f_donut);
+            // Iconos (simbolos) de cada control.
+            icon_grip(&p, c + egui::vec2(-22.0, -rband), 7.0, fade(Color32::from_gray(120), f_donut));
+            icon_brush_sample(&p, c + egui::vec2(-rband, -1.0), 8.0, icol);
+            icon_opacity(&p, c + egui::vec2(rband, -1.0), 7.0, icol);
             // Boton de colapsar (abajo): oculta la rueda dejando solo el punto de color.
-            icon_collapse(&p, c + egui::vec2(0.0, rside), 6.5, fade(Color32::from_gray(120), f_donut));
+            icon_collapse(&p, c + egui::vec2(0.0, rband), 6.5, fade(Color32::from_gray(120), f_donut));
 
             // Circulo de color central.
             p.circle_filled(c, R_HOLE, fade(c32(brush.color), f_center));
             p.circle_stroke(c, R_HOLE, Stroke::new(2.0, fade(Color32::from_gray(245), f_center)));
 
-            // Valores: "X pts" arriba (junto al grip); suavidad y opacidad abajo a los lados.
-            p.text(c + egui::vec2(12.0, -(R_HOLE + 14.0)), Align2::CENTER_CENTER,
-                cfg.format_measure(brush.width), FontId::proportional(11.0), fade(Color32::from_gray(55), f_donut));
-            p.text(c + egui::vec2(-(R_HOLE + 18.0), R_HOLE + 8.0), Align2::CENTER_CENTER,
-                format!("{:.0}%", brush.smoothing * 100.0), FontId::proportional(11.0), fade(Color32::from_gray(85), f_donut));
-            p.text(c + egui::vec2(R_HOLE + 18.0, R_HOLE + 8.0), Align2::CENTER_CENTER,
-                format!("{:.0}%", brush.opacity * 100.0), FontId::proportional(11.0), fade(Color32::from_gray(85), f_donut));
+            // Valores en NEGRITA, centrados dentro de la banda: grosor arriba (junto al grip),
+            // suavidad abajo-izquierda, opacidad abajo-derecha.
+            let vcol = fade(Color32::from_gray(45), f_donut);
+            text_bold(&p, c + egui::vec2(11.0, -rband), Align2::CENTER_CENTER,
+                cfg.format_measure(brush.width), 12.0, vcol);
+            text_bold(&p, c + egui::vec2(-32.0, 32.0), Align2::CENTER_CENTER,
+                format!("{:.0}%", brush.smoothing * 100.0), 12.0, vcol);
+            text_bold(&p, c + egui::vec2(32.0, 32.0), Align2::CENTER_CENTER,
+                format!("{:.0}%", brush.opacity * 100.0), 12.0, vcol);
 
             // Deshacer / Rehacer (lo mas externo) con animacion de pulsacion al clicar.
             let undo_p = c + egui::vec2(-(R_OUT + 26.0), -28.0);
