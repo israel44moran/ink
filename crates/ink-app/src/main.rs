@@ -1570,6 +1570,17 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::KeyZ => self.undo_op(),
                         KeyCode::KeyY => self.redo_op(),
+                        // Abrir/cerrar "Ajustes del pincel" en el puntero. Pensado para
+                        // mapear un BOTON DEL LAPIZ a esta tecla en el driver de la tableta
+                        // (los botones del stylus llegan como clic, no distinguibles; una
+                        // tecla si es inequivoca).
+                        KeyCode::KeyB => {
+                            self.ui.show_brush_settings = !self.ui.show_brush_settings;
+                            if self.ui.show_brush_settings {
+                                let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+                                self.ui.brush_settings_pos = egui::pos2(self.cursor.x / ppp, self.cursor.y / ppp);
+                            }
+                        }
                         KeyCode::KeyV => self.cycle_present_mode(),
                         KeyCode::BracketLeft => {
                             self.brush.width = (self.brush.width * 0.8).max(0.5);
