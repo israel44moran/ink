@@ -5,7 +5,7 @@
 //! (fondo -> frente) aplicando la opacidad de cada capa. Las herramientas
 //! (seleccion, borrar, mover, empujar) operan sobre la capa ACTIVA.
 
-use crate::stroke::{tessellate_stroke, InputSample, Stroke, Vertex};
+use crate::stroke::{tessellate_stroke, Stroke, Vertex};
 use crate::tools::{dist_point_segment, point_in_polygon, Aabb};
 use glam::Vec2;
 
@@ -332,69 +332,46 @@ impl Document {
         removed
     }
 
-    /// Borrado por ZONA (como una goma real): afecta solo a las muestras bajo el disco
-    /// `(center, radius)`. `strength` (0..1) = opacidad/fuerza de la goma.
+    /// Borrado por ZONA de ALTA PRECISION (como una goma raster). Atenua el `erosion`
+    /// por-muestra (alfa por-muestra) con un PERFIL SUAVE segun la distancia al centro
+    /// del disco -> el borde del borrado tiene antialiasing (no escalonado).
     ///
-    /// - `strength >= 1` (goma dura): ELIMINA las muestras dentro del disco y PARTE el
-    ///   trazo en sub-trazos con lo que queda fuera. Las muestras solo disminuyen.
-    /// - `strength < 1` (goma suave): incrementa el `erosion` de las muestras dentro del
-    ///   disco (alfa por-muestra), sin fragmentar. Varias pasadas las desvanecen. La malla
-    ///   nunca crece (mismo numero de muestras), por lo que es estable.
-    ///
-    /// En ambos casos los trazos que quedan totalmente borrados se eliminan.
+    /// `strength` (0..1) = opacidad/fuerza de la goma. `1.0` borra del todo en el centro;
+    /// menos deja un borrado parcial que varias pasadas desvanecen. El falloff usa el
+    /// medio-ancho del trazo: trazos finos se borran con borde nitido, los gruesos con un
+    /// degradado proporcional a su grosor. No fragmenta ni anade geometria (la malla nunca
+    /// crece), por lo que es estable. Los trazos totalmente borrados se eliminan.
     pub fn erase_region(&mut self, center: Vec2, radius: f32, strength: f32) -> bool {
-        let hard = strength >= 0.999;
         let mut changed = false;
         {
             let layer = self.active_layer_mut();
-            if hard {
-                let strokes = std::mem::take(&mut layer.strokes);
-                let mut out: Vec<Stroke> = Vec::with_capacity(strokes.len());
-                for s in strokes {
-                    let thr = radius + (s.brush.width * 0.5).max(1.0);
-                    let touched = s.samples.iter().any(|sm| (sm.pos - center).length() <= thr);
-                    if !touched {
-                        out.push(s);
+            for s in layer.strokes.iter_mut() {
+                // Banda de transicion = medio-ancho del trazo (min 0.5 px para dar AA).
+                let soft = (s.brush.width * 0.5).max(0.5);
+                let outer = radius + soft; // a esta distancia el trazo deja de tocar el disco
+                let inner = (radius - soft).max(0.0); // dentro de aqui, cubierto del todo
+                let denom = (outer - inner).max(1e-3);
+                for sm in s.samples.iter_mut() {
+                    if sm.erosion >= 1.0 {
                         continue;
                     }
-                    changed = true;
-                    // Descartar las muestras dentro del disco, conservando como sub-trazos
-                    // los tramos consecutivos que quedan FUERA.
-                    let mut cur: Vec<InputSample> = Vec::new();
-                    for sm in &s.samples {
-                        if (sm.pos - center).length() <= thr {
-                            if cur.len() >= 2 {
-                                let mut ns = Stroke::new(s.brush);
-                                ns.samples = std::mem::take(&mut cur);
-                                out.push(ns);
-                            } else {
-                                cur.clear();
-                            }
-                        } else {
-                            cur.push(*sm);
-                        }
+                    let d = (sm.pos - center).length();
+                    if d >= outer {
+                        continue;
                     }
-                    if cur.len() >= 2 {
-                        let mut ns = Stroke::new(s.brush);
-                        ns.samples = cur;
-                        out.push(ns);
+                    // Perfil suave (smoothstep): 1 en el centro, 0 en el borde -> AA.
+                    let t = ((outer - d) / denom).clamp(0.0, 1.0);
+                    let f = t * t * (3.0 - 2.0 * t);
+                    let add = strength * f;
+                    if add > 1e-4 {
+                        sm.erosion = (sm.erosion + add).min(1.0);
+                        changed = true;
                     }
                 }
-                layer.strokes = out;
-            } else {
-                // Goma suave: atenuar el erosion por-muestra (sin fragmentar).
-                for s in layer.strokes.iter_mut() {
-                    let thr = radius + (s.brush.width * 0.5).max(1.0);
-                    for sm in s.samples.iter_mut() {
-                        if sm.erosion < 1.0 && (sm.pos - center).length() <= thr {
-                            sm.erosion = (sm.erosion + strength).min(1.0);
-                            changed = true;
-                        }
-                    }
-                }
-                if changed {
-                    layer.strokes.retain(|s| s.samples.iter().any(|sm| sm.erosion < 0.99));
-                }
+            }
+            if changed {
+                // Eliminar los trazos que quedaron completamente borrados.
+                layer.strokes.retain(|s| s.samples.iter().any(|sm| sm.erosion < 0.99));
             }
         }
         if changed {

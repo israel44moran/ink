@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn erase_region_splits_stroke_not_whole() {
+    fn erase_region_erodes_center_keeps_edges() {
         let mut doc = Document::new();
         let mut b = Brush::default();
         b.width = 2.0; // punta fina: solo se borra justo bajo el disco
@@ -211,10 +211,13 @@ mod tests {
         }
         doc.add_stroke(s);
         assert_eq!(doc.stroke_count(), 1);
-        // Goma DURA (fuerza 1) en el centro (x=20): debe PARTIR el trazo en dos.
+        // Goma a fuerza plena en el centro (x=20): erosiona esa muestra, deja las lejanas.
         let changed = doc.erase_region(vec2(20.0, 0.0), 3.0, 1.0);
         assert!(changed);
-        assert_eq!(doc.stroke_count(), 2, "la goma dura parte el trazo, no lo borra completo");
+        assert_eq!(doc.stroke_count(), 1, "la goma no fragmenta el trazo (alfa por-muestra)");
+        let s = &doc.strokes()[0];
+        assert!(s.samples[2].erosion > 0.9, "la muestra bajo la goma se borra");
+        assert!(s.samples[0].erosion < 0.1 && s.samples[4].erosion < 0.1, "las lejanas quedan intactas");
         // Tocar lejos de cualquier trazo no cambia nada.
         let again = doc.erase_region(vec2(500.0, 500.0), 3.0, 1.0);
         assert!(!again);

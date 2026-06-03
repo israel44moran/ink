@@ -702,14 +702,14 @@ impl App {
     /// encima). No toca la cuadricula (es geometria aparte) y deja el area redibujable.
     /// Acumula lo eliminado en `erase_removed` para poder deshacer.
     fn erase_at(&mut self, center: Vec2, radius: f32, strength: f32) {
-        let hard = strength >= 0.999;
-        // Trazos procedurales: borrado por ZONA (duro = parte el trazo; suave = atenua).
+        // Trazos procedurales: borrado por ZONA con perfil suave (alfa por-muestra).
         if self.doc.erase_region(center, radius, strength) {
             self.sync_committed();
         }
-        // Estampados PS bajo la goma (de todas las puntas). Duro = elimina el quad; suave
-        // = atenua su alfa (varias pasadas lo desvanecen). Estable: no fragmenta.
-        let r2 = radius * radius;
+        // Estampados PS bajo la goma: atenuar el alfa de cada quad con el MISMO perfil
+        // suave por distancia (AA); si queda casi invisible, se elimina. No fragmenta.
+        let inner = radius * 0.6;
+        let denom = (radius - inner).max(1e-3);
         let mut changed: Vec<u32> = Vec::new();
         for (tip, verts) in self.ps_committed.iter_mut() {
             let mut keep: Vec<StampVertex> = Vec::with_capacity(verts.len());
@@ -721,29 +721,26 @@ impl App {
                 }
                 let cx = chunk.iter().map(|v| v.pos[0]).sum::<f32>() / 6.0;
                 let cy = chunk.iter().map(|v| v.pos[1]).sum::<f32>() / 6.0;
-                let dx = cx - center.x;
-                let dy = cy - center.y;
-                if dx * dx + dy * dy <= r2 {
-                    if hard {
-                        removed_any = true;
-                        self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
-                    } else {
-                        let na = chunk[0].color[3] * (1.0 - strength);
-                        if na < 0.02 {
-                            removed_any = true;
-                            self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
-                        } else {
-                            let mut q: [StampVertex; 6] = [chunk[0]; 6];
-                            q.copy_from_slice(chunk);
-                            for v in q.iter_mut() {
-                                v.color[3] = na;
-                            }
-                            keep.extend_from_slice(&q);
-                            removed_any = true;
-                        }
-                    }
-                } else {
+                let d = ((cx - center.x).powi(2) + (cy - center.y).powi(2)).sqrt();
+                if d >= radius {
                     keep.extend_from_slice(chunk);
+                    continue;
+                }
+                let t = ((radius - d) / denom).clamp(0.0, 1.0);
+                let f = t * t * (3.0 - 2.0 * t);
+                let factor = (strength * f).min(1.0);
+                let na = chunk[0].color[3] * (1.0 - factor);
+                if na < 0.02 {
+                    removed_any = true;
+                    self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
+                } else {
+                    let mut q: [StampVertex; 6] = [chunk[0]; 6];
+                    q.copy_from_slice(chunk);
+                    for v in q.iter_mut() {
+                        v.color[3] = na;
+                    }
+                    keep.extend_from_slice(&q);
+                    removed_any = true;
                 }
             }
             if removed_any {
