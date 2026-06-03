@@ -79,5 +79,7 @@ fn vs_restore(in: RsIn) -> RsOut {
 
 @fragment
 fn fs_restore(in: RsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.a, 0.0, 0.0, 1.0);
+    // Restaurar la mascara a 1.0 (totalmente visible) bajo la huella del trazo nuevo:
+    // dibujar sobre una zona borrada hace reaparecer el contenido nuevo completo.
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
 }
