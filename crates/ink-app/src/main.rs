@@ -1474,9 +1474,12 @@ impl App {
         let p = ctx.layer_painter(LayerId::new(Order::Middle, egui::Id::new("tool_overlay")));
 
         // Marco de la mesa de trabajo (si su tamano no es infinito), centrado en el origen.
+        // Se dibuja en una capa de FONDO para que quede DEBAJO de la rueda y los paneles, asi
+        // el margen de la hoja (en los cuadernos) no cruza por encima de la rueda.
         if let Some((aw, ah)) = self.settings.artboard_size() {
             let r = Rect::from_two_pos(to_pt(Vec2::new(-aw * 0.5, -ah * 0.5)), to_pt(Vec2::new(aw * 0.5, ah * 0.5)));
-            p.rect_stroke(r, egui::CornerRadius::ZERO, Stroke::new(1.5, Color32::from_gray(160)), StrokeKind::Outside);
+            let bp = ctx.layer_painter(LayerId::new(Order::Background, egui::Id::new("artboard_frame")));
+            bp.rect_stroke(r, egui::CornerRadius::ZERO, Stroke::new(1.5, Color32::from_gray(160)), StrokeKind::Outside);
         }
 
         // Cursor de la GOMA: anillo del tamano real de borrado (estilo Photoshop).
@@ -2145,7 +2148,7 @@ impl ApplicationHandler for App {
                     egui::Area::new(egui::Id::new("lib_button"))
                         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
                         .show(ctx, |ui| {
-                            if ui.button(egui::RichText::new("☰ Cuadernos").size(14.0)).clicked() {
+                            if ui.button(egui::RichText::new("🏠 Inicio").size(14.0)).clicked() {
                                 lib_go = true;
                             }
                         });
@@ -2190,7 +2193,7 @@ impl ApplicationHandler for App {
                             _ => None,
                         });
                         egui::Area::new(egui::Id::new("ps_brushes_panel"))
-                            .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 56.0))
+                            .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 96.0))
                             .show(ctx, |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                                     ui.set_max_width(250.0);

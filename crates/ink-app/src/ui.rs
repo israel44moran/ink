@@ -2057,9 +2057,10 @@ pub fn build_panel(
         ctx.set_cursor_icon(egui::CursorIcon::None);
     }
 
-    // Barra superior: hamburguesa, cuadricula rapida y ajustes.
+    // Barra superior: hamburguesa, cuadricula rapida y ajustes. Va un poco mas abajo para
+    // no solaparse con el boton "Inicio" (que esta en la esquina superior izquierda).
     egui::Area::new(egui::Id::new("topbar"))
-        .anchor(Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+        .anchor(Align2::LEFT_TOP, egui::vec2(12.0, 52.0))
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
