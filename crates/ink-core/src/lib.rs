@@ -53,9 +53,9 @@ mod tests {
     fn tessellation_produces_triangles() {
         let brush = Brush::default();
         let samples = vec![
-            InputSample { pos: vec2(0.0, 0.0), pressure: 1.0 },
-            InputSample { pos: vec2(10.0, 0.0), pressure: 1.0 },
-            InputSample { pos: vec2(20.0, 5.0), pressure: 0.5 },
+            InputSample { pos: vec2(0.0, 0.0), pressure: 1.0, erosion: 0.0 },
+            InputSample { pos: vec2(10.0, 0.0), pressure: 1.0, erosion: 0.0 },
+            InputSample { pos: vec2(20.0, 5.0), pressure: 0.5, erosion: 0.0 },
         ];
         let mut out = Vec::new();
         tessellate_stroke(&samples, &brush, &mut out);
@@ -97,7 +97,7 @@ mod tests {
             // Completo.
             let mut s = Stroke::new(brush);
             for p in pts {
-                s.push(InputSample { pos: p, pressure: 0.8 });
+                s.push(InputSample { pos: p, pressure: 0.8, erosion: 0.0 });
             }
             let mut full = Vec::new();
             s.tessellate(&mut full);
@@ -105,7 +105,7 @@ mod tests {
             let mut samples = Vec::new();
             let mut inc = Vec::new();
             for p in pts {
-                samples.push(InputSample { pos: p, pressure: 0.8 });
+                samples.push(InputSample { pos: p, pressure: 0.8, erosion: 0.0 });
                 assert!(
                     tessellate_incremental(&samples, &brush, &mut inc),
                     "{:?} deberia soportar incremental",
@@ -125,8 +125,8 @@ mod tests {
     fn document_undo_rebuilds_mesh() {
         let mut doc = Document::new();
         let mut s = Stroke::new(Brush::default());
-        s.push(InputSample { pos: vec2(0.0, 0.0), pressure: 1.0 });
-        s.push(InputSample { pos: vec2(5.0, 0.0), pressure: 1.0 });
+        s.push(InputSample { pos: vec2(0.0, 0.0), pressure: 1.0, erosion: 0.0 });
+        s.push(InputSample { pos: vec2(5.0, 0.0), pressure: 1.0, erosion: 0.0 });
         doc.add_stroke(s);
         assert!(doc.vertex_count() > 0);
         doc.undo();
@@ -148,8 +148,8 @@ mod tests {
 
     fn line_stroke(a: Vec2, b: Vec2) -> Stroke {
         let mut s = Stroke::new(Brush::default());
-        s.push(InputSample { pos: a, pressure: 1.0 });
-        s.push(InputSample { pos: b, pressure: 1.0 });
+        s.push(InputSample { pos: a, pressure: 1.0, erosion: 0.0 });
+        s.push(InputSample { pos: b, pressure: 1.0, erosion: 0.0 });
         s
     }
 
@@ -207,16 +207,34 @@ mod tests {
         b.width = 2.0; // punta fina: solo se borra justo bajo el disco
         let mut s = Stroke::new(b);
         for i in 0..5 {
-            s.push(InputSample { pos: vec2(i as f32 * 10.0, 0.0), pressure: 1.0 });
+            s.push(InputSample { pos: vec2(i as f32 * 10.0, 0.0), pressure: 1.0, erosion: 0.0 });
         }
         doc.add_stroke(s);
         assert_eq!(doc.stroke_count(), 1);
-        // Borrar SOLO el centro (x=20). Debe PARTIR el trazo en dos (no borrarlo entero).
-        let changed = doc.erase_region(vec2(20.0, 0.0), 3.0);
+        // Goma DURA (fuerza 1) en el centro (x=20): debe PARTIR el trazo en dos.
+        let changed = doc.erase_region(vec2(20.0, 0.0), 3.0, 1.0);
         assert!(changed);
-        assert_eq!(doc.stroke_count(), 2, "la goma parte el trazo, no lo borra completo");
+        assert_eq!(doc.stroke_count(), 2, "la goma dura parte el trazo, no lo borra completo");
         // Tocar lejos de cualquier trazo no cambia nada.
-        let again = doc.erase_region(vec2(500.0, 500.0), 3.0);
+        let again = doc.erase_region(vec2(500.0, 500.0), 3.0, 1.0);
         assert!(!again);
+    }
+
+    #[test]
+    fn erase_region_soft_sets_erosion_without_split() {
+        let mut doc = Document::new();
+        let mut b = Brush::default();
+        b.width = 2.0;
+        let mut s = Stroke::new(b);
+        for i in 0..5 {
+            s.push(InputSample { pos: vec2(i as f32 * 10.0, 0.0), pressure: 1.0, erosion: 0.0 });
+        }
+        doc.add_stroke(s);
+        // Goma SUAVE (40%) en el centro: NO fragmenta; sube el erosion de la zona tocada.
+        let changed = doc.erase_region(vec2(20.0, 0.0), 3.0, 0.4);
+        assert!(changed);
+        assert_eq!(doc.stroke_count(), 1, "la goma suave no parte el trazo");
+        let eroded = doc.strokes()[0].samples.iter().any(|sm| sm.erosion > 0.0);
+        assert!(eroded, "la goma suave marca erosion en la zona tocada");
     }
 }

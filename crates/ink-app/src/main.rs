@@ -283,6 +283,7 @@ impl App {
         s.push(InputSample {
             pos: filtered,
             pressure: initial_pressure.clamp(0.05, 1.0),
+            erosion: 0.0,
         });
         self.last_sample_pos = filtered;
         self.active = Some(s);
@@ -344,7 +345,7 @@ impl App {
             // Espaciado minimo ~1.2 px en pantalla, convertido a unidades de mundo.
             let min_d = (1.2 / self.camera.zoom).max(1e-4);
             if stroke.samples.is_empty() || (filtered - self.last_sample_pos).length() >= min_d {
-                stroke.push(InputSample { pos: filtered, pressure });
+                stroke.push(InputSample { pos: filtered, pressure, erosion: 0.0 });
                 self.last_sample_pos = filtered;
                 self.last_sample_time = now;
                 changed = true;
@@ -686,7 +687,7 @@ impl App {
         self.last_sample_time = Instant::now();
         let f = self.filter.filter(world, 1.0 / 120.0);
         self.last_sample_pos = f;
-        self.ps_samples.push(InputSample { pos: f, pressure: pressure.clamp(0.05, 1.0) });
+        self.ps_samples.push(InputSample { pos: f, pressure: pressure.clamp(0.05, 1.0), erosion: 0.0 });
         if let Some(g) = self.gpu.as_mut() {
             g.clear_active_stamps();
         }
@@ -700,12 +701,14 @@ impl App {
     /// Goma: ELIMINA los estampados y trazos bajo un disco de radio `radius` (no pinta
     /// encima). No toca la cuadricula (es geometria aparte) y deja el area redibujable.
     /// Acumula lo eliminado en `erase_removed` para poder deshacer.
-    fn erase_at(&mut self, center: Vec2, radius: f32) {
-        // Trazos procedurales: borrado por ZONA (parte el trazo, no lo borra entero).
-        if self.doc.erase_region(center, radius) {
+    fn erase_at(&mut self, center: Vec2, radius: f32, strength: f32) {
+        let hard = strength >= 0.999;
+        // Trazos procedurales: borrado por ZONA (duro = parte el trazo; suave = atenua).
+        if self.doc.erase_region(center, radius, strength) {
             self.sync_committed();
         }
-        // Estampados PS bajo la goma (de todas las puntas): se eliminan los quads tocados.
+        // Estampados PS bajo la goma (de todas las puntas). Duro = elimina el quad; suave
+        // = atenua su alfa (varias pasadas lo desvanecen). Estable: no fragmenta.
         let r2 = radius * radius;
         let mut changed: Vec<u32> = Vec::new();
         for (tip, verts) in self.ps_committed.iter_mut() {
@@ -721,8 +724,24 @@ impl App {
                 let dx = cx - center.x;
                 let dy = cy - center.y;
                 if dx * dx + dy * dy <= r2 {
-                    removed_any = true;
-                    self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
+                    if hard {
+                        removed_any = true;
+                        self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
+                    } else {
+                        let na = chunk[0].color[3] * (1.0 - strength);
+                        if na < 0.02 {
+                            removed_any = true;
+                            self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
+                        } else {
+                            let mut q: [StampVertex; 6] = [chunk[0]; 6];
+                            q.copy_from_slice(chunk);
+                            for v in q.iter_mut() {
+                                v.color[3] = na;
+                            }
+                            keep.extend_from_slice(&q);
+                            removed_any = true;
+                        }
+                    }
                 } else {
                     keep.extend_from_slice(chunk);
                 }
@@ -745,18 +764,25 @@ impl App {
         (self.brush.width * 0.5).max(2.0)
     }
 
+    /// Fuerza/opacidad de la goma (= opacidad de la rueda). 1.0 = borra del todo.
+    fn eraser_strength(&self) -> f32 {
+        self.brush.opacity.clamp(0.05, 1.0)
+    }
+
     /// Inicia un trazo de GOMA (modo borrador global).
     fn start_erase(&mut self) {
         self.erasing = true;
         self.erase_removed.clear();
         self.last_sample_pos = self.camera.screen_to_world(self.cursor);
         let r = self.eraser_radius();
-        self.erase_at(self.last_sample_pos, r);
+        let st = self.eraser_strength();
+        self.erase_at(self.last_sample_pos, r, st);
     }
 
     /// Continua el borrado en `world` (interpola para no dejar huecos al mover rapido).
     fn do_erase(&mut self, world: Vec2) {
         let r = self.eraser_radius();
+        let st = self.eraser_strength();
         // Interpolar entre el ultimo punto y el actual (pasos ~ medio radio).
         let from = self.last_sample_pos;
         let seg = world - from;
@@ -765,7 +791,7 @@ impl App {
         let n = (len / step).ceil().max(1.0) as usize;
         for i in 1..=n {
             let p = from + seg * (i as f32 / n as f32);
-            self.erase_at(p, r);
+            self.erase_at(p, r, st);
         }
         self.last_sample_pos = world;
     }
@@ -798,7 +824,7 @@ impl App {
         }
         self.last_sample_pos = f;
         self.last_sample_time = now;
-        self.ps_samples.push(InputSample { pos: f, pressure });
+        self.ps_samples.push(InputSample { pos: f, pressure, erosion: 0.0 });
 
         let Some(s) = self.ps_settings.clone() else { return };
         let n = self.ps_samples.len();

@@ -542,7 +542,7 @@ mod tests {
         (0..=n)
             .map(|i| {
                 let t = i as f32 / n as f32;
-                InputSample { pos: a + (b - a) * t, pressure: 1.0 }
+                InputSample { pos: a + (b - a) * t, pressure: 1.0, erosion: 0.0 }
             })
             .collect()
     }
@@ -565,8 +565,8 @@ mod tests {
         s.shape_dyn = true;
         s.size_control = DynControl::PenPressure;
         s.min_diameter = 0.0;
-        let lo = vec![InputSample { pos: vec2(0.0, 0.0), pressure: 0.1 }];
-        let hi = vec![InputSample { pos: vec2(0.0, 0.0), pressure: 1.0 }];
+        let lo = vec![InputSample { pos: vec2(0.0, 0.0), pressure: 0.1, erosion: 0.0 }];
+        let hi = vec![InputSample { pos: vec2(0.0, 0.0), pressure: 1.0, erosion: 0.0 }];
         let slo = stamp_path(&lo, &s, 0, 0.0).stamps[0].size;
         let shi = stamp_path(&hi, &s, 0, 0.0).stamps[0].size;
         assert!(slo < shi, "presion baja debe achicar: {slo} vs {shi}");

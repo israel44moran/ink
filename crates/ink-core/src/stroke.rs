@@ -33,6 +33,18 @@ pub struct InputSample {
     pub pos: Vec2,
     /// Presion normalizada en `0.0..=1.0`.
     pub pressure: f32,
+    /// Cantidad borrada por la GOMA en esta muestra: 0 = intacta, 1 = borrada del todo.
+    /// El alfa efectivo del trazo en la muestra es `color.a * (1 - erosion)`. Permite
+    /// gomas con opacidad (borrado gradual) sin fragmentar la malla.
+    pub erosion: f32,
+}
+
+impl InputSample {
+    /// Muestra nueva sin borrar (erosion = 0).
+    #[inline]
+    pub fn new(pos: Vec2, pressure: f32) -> Self {
+        Self { pos, pressure, erosion: 0.0 }
+    }
 }
 
 /// Tipo de pincel: define COMO se dibuja el trazo (su "motor").
@@ -133,6 +145,12 @@ fn with_alpha(mut c: [f32; 4], factor: f32) -> [f32; 4] {
     c
 }
 
+/// Aplica el borrado por-muestra de la goma: atenua el alfa segun `erosion` (0 = intacto).
+#[inline]
+fn erode(color: [f32; 4], erosion: f32) -> [f32; 4] {
+    with_alpha(color, (1.0 - erosion).max(0.0))
+}
+
 /// Segmentos por circulo de union/punta. Mas = mas suave, mas triangulos.
 const CIRCLE_SEGMENTS: usize = 16;
 
@@ -224,19 +242,19 @@ pub fn tessellate_incremental(samples: &[InputSample], brush: &Brush, out: &mut 
         BrushKind::Pencil => {
             // Granos del ultimo segmento (mismo hash/indice que el teselado completo).
             if n >= 2 {
-                pencil_segment(samples[n - 2].pos, samples[n - 1].pos, n - 2, brush, out);
+                pencil_segment(samples[n - 2].pos, samples[n - 1].pos, samples[n - 2].erosion, samples[n - 1].erosion, n - 2, brush, out);
             }
             true
         }
         BrushKind::Watercolor => {
             if n >= 2 {
-                watercolor_segment(samples[n - 2].pos, samples[n - 1].pos, n - 2, brush, out);
+                watercolor_segment(samples[n - 2].pos, samples[n - 1].pos, samples[n - 2].erosion, samples[n - 1].erosion, n - 2, brush, out);
             }
             true
         }
         BrushKind::Airbrush => {
             // El aerografo rocia por MUESTRA (no por segmento): solo la nueva muestra.
-            airbrush_sample(samples[n - 1].pos, n - 1, brush, out);
+            airbrush_sample(samples[n - 1].pos, n - 1, samples[n - 1].erosion, brush, out);
             true
         }
         // El punteado acumula distancia entre segmentos: no es incremental trivial.
@@ -246,9 +264,9 @@ pub fn tessellate_incremental(samples: &[InputSample], brush: &Brush, out: &mut 
 
 /// Trazo de ancho (variable por presion o constante): pluma / ancho fijo / marcador.
 fn stroke_variable(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>, use_pressure: bool) {
-    let color = brush.color;
+    let base = brush.color;
     if samples.len() == 1 {
-        emit_circle(out, samples[0].pos, half_width(brush, samples[0].pressure, use_pressure), color);
+        emit_circle(out, samples[0].pos, half_width(brush, samples[0].pressure, use_pressure), erode(base, samples[0].erosion));
         return;
     }
     let n = samples.len();
@@ -263,20 +281,24 @@ fn stroke_variable(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>
         let r0 = p0 - nrm * hw0;
         let l1 = p1 + nrm * hw1;
         let r1 = p1 - nrm * hw1;
-        out.push(Vertex::new(l0, color));
-        out.push(Vertex::new(r0, color));
-        out.push(Vertex::new(l1, color));
-        out.push(Vertex::new(r0, color));
-        out.push(Vertex::new(r1, color));
-        out.push(Vertex::new(l1, color));
+        // Color por-muestra: cada extremo del segmento se atenua segun su borrado.
+        let c0 = erode(base, samples[i].erosion);
+        let c1 = erode(base, samples[i + 1].erosion);
+        out.push(Vertex::new(l0, c0));
+        out.push(Vertex::new(r0, c0));
+        out.push(Vertex::new(l1, c1));
+        out.push(Vertex::new(r0, c0));
+        out.push(Vertex::new(r1, c1));
+        out.push(Vertex::new(l1, c1));
     }
     for s in samples {
-        emit_circle(out, s.pos, half_width(brush, s.pressure, use_pressure), color);
+        emit_circle(out, s.pos, half_width(brush, s.pressure, use_pressure), erode(base, s.erosion));
     }
 }
 
 /// Granos de lapiz de UN segmento (`wi` = indice de ventana, para el hash estable).
-fn pencil_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Vec<Vertex>) {
+/// `e0`/`e1` = borrado de las muestras de los extremos (goma por-muestra).
+fn pencil_segment(p0: Vec2, p1: Vec2, e0: f32, e1: f32, wi: usize, brush: &Brush, out: &mut Vec<Vertex>) {
     let hw = brush.width * 0.5;
     let seg = p1 - p0;
     let len = seg.length();
@@ -289,11 +311,12 @@ fn pencil_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Vec<Ve
     for s in 0..steps {
         let t = s as f32 / steps as f32;
         let base = p0 + seg * t;
+        let ke = (1.0 - (e0 + (e1 - e0) * t)).max(0.0); // factor de borrado interpolado
         for k in 0..3 {
             let r1 = hash01(wi as i32 * 31 + s as i32, k, 7);
             let r2 = hash01(wi as i32 * 31 + s as i32, k, 13);
             let off = nrm * ((r1 - 0.5) * 2.0 * hw);
-            emit_circle(out, base + off, brush.width * 0.16 + 0.4, with_alpha(brush.color, 0.22 + 0.5 * r2));
+            emit_circle(out, base + off, brush.width * 0.16 + 0.4, with_alpha(brush.color, (0.22 + 0.5 * r2) * ke));
         }
     }
 }
@@ -301,19 +324,20 @@ fn pencil_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Vec<Ve
 /// Lapiz: granos pequenos con jitter y alfa variable -> textura granulada.
 fn stroke_pencil(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
     for (wi, w) in samples.windows(2).enumerate() {
-        pencil_segment(w[0].pos, w[1].pos, wi, brush, out);
+        pencil_segment(w[0].pos, w[1].pos, w[0].erosion, w[1].erosion, wi, brush, out);
     }
 }
 
-/// Manchas de acuarela de UN segmento.
-fn watercolor_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Vec<Vertex>) {
-    let col = with_alpha(brush.color, 0.16);
+/// Manchas de acuarela de UN segmento. `e0`/`e1` = borrado de los extremos.
+fn watercolor_segment(p0: Vec2, p1: Vec2, e0: f32, e1: f32, wi: usize, brush: &Brush, out: &mut Vec<Vertex>) {
     let seg = p1 - p0;
     let len = seg.length();
     let steps = ((len / (brush.width * 0.4).max(0.5)).ceil() as usize).max(1);
     for s in 0..=steps {
         let t = s as f32 / steps as f32;
         let r = hash01(wi as i32, s as i32, 3);
+        let ke = (1.0 - (e0 + (e1 - e0) * t)).max(0.0);
+        let col = with_alpha(brush.color, 0.16 * ke);
         emit_circle(out, p0 + seg * t, brush.width * (1.05 + 0.35 * r), col);
     }
 }
@@ -321,13 +345,14 @@ fn watercolor_segment(p0: Vec2, p1: Vec2, wi: usize, brush: &Brush, out: &mut Ve
 /// Acuarela: manchas grandes de baja opacidad que se acumulan al solaparse.
 fn stroke_watercolor(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
     for (wi, w) in samples.windows(2).enumerate() {
-        watercolor_segment(w[0].pos, w[1].pos, wi, brush, out);
+        watercolor_segment(w[0].pos, w[1].pos, w[0].erosion, w[1].erosion, wi, brush, out);
     }
 }
 
 /// Spray de aerografo de UNA muestra (`i` = indice de muestra, para el hash estable).
-fn airbrush_sample(pos: Vec2, i: usize, brush: &Brush, out: &mut Vec<Vertex>) {
-    let col = with_alpha(brush.color, 0.10);
+/// `erosion` = borrado de la muestra (goma por-muestra).
+fn airbrush_sample(pos: Vec2, i: usize, erosion: f32, brush: &Brush, out: &mut Vec<Vertex>) {
+    let col = with_alpha(brush.color, 0.10 * (1.0 - erosion).max(0.0));
     for k in 0..18 {
         let r1 = hash01(i as i32, k, 5);
         let r2 = hash01(i as i32, k, 9);
@@ -342,16 +367,16 @@ fn airbrush_sample(pos: Vec2, i: usize, brush: &Brush, out: &mut Vec<Vertex>) {
 /// Aerografo: spray de puntos pequenos alrededor del trazo.
 fn stroke_airbrush(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
     for (i, s) in samples.iter().enumerate() {
-        airbrush_sample(s.pos, i, brush, out);
+        airbrush_sample(s.pos, i, s.erosion, brush, out);
     }
 }
 
 /// Punteado: puntos a intervalos regulares a lo largo del trazo.
 fn stroke_dotted(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) {
-    let color = brush.color;
+    let base = brush.color;
     let r = brush.width * 0.5;
     let spacing = (brush.width * 1.7).max(3.0);
-    emit_circle(out, samples[0].pos, r, color);
+    emit_circle(out, samples[0].pos, r, erode(base, samples[0].erosion));
     let mut acc = 0.0_f32;
     for w in samples.windows(2) {
         let seg = w[1].pos - w[0].pos;
@@ -369,7 +394,10 @@ fn stroke_dotted(samples: &[InputSample], brush: &Brush, out: &mut Vec<Vertex>) 
             }
             d += need;
             acc = 0.0;
-            emit_circle(out, w[0].pos + dir * d, r, color);
+            // Borrado interpolado a lo largo del segmento.
+            let t = (d / len).clamp(0.0, 1.0);
+            let e = w[0].erosion + (w[1].erosion - w[0].erosion) * t;
+            emit_circle(out, w[0].pos + dir * d, r, erode(base, e));
         }
     }
 }
