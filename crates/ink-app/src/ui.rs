@@ -2078,6 +2078,51 @@ fn layers_panel(ctx: &egui::Context, state: &mut UiState, doc: &mut Document, ac
 }
 
 /// Construye toda la UI. Devuelve las acciones a aplicar.
+/// Lista las categorias de pinceles de Photoshop como secciones colapsables (cerradas por
+/// defecto, se abren con clic), cada una con sus pinceles (miniatura + nombre). Devuelve el
+/// indice del pincel que se haya tocado, o `None`. Se reutiliza para asignar un pincel a un
+/// slot y para elegir la FORMA de la goma.
+fn ps_category_picker(
+    ui: &mut egui::Ui,
+    cat_names: &[String],
+    cat_members: &[Vec<u32>],
+    brush_names: &[String],
+    thumb_ids: &[Option<egui::TextureId>],
+    id_prefix: &str,
+) -> Option<u32> {
+    let mut picked = None;
+    for ci in 0..cat_names.len() {
+        let mem = &cat_members[ci];
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("{}  ({})", cat_names[ci], mem.len())).strong(),
+        )
+        .id_salt(format!("{id_prefix}{ci}"))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for &gi in mem {
+                    let i = gi as usize;
+                    let name = brush_names.get(i).cloned().unwrap_or_else(|| format!("Pincel {}", i + 1));
+                    let mut clicked = false;
+                    if let Some(Some(tid)) = thumb_ids.get(i) {
+                        let img = egui::Image::new(egui::load::SizedTexture::new(*tid, egui::vec2(42.0, 42.0)))
+                            .tint(Color32::from_gray(45));
+                        if ui.add(egui::ImageButton::new(img)).on_hover_text(&name).clicked() {
+                            clicked = true;
+                        }
+                    } else if ui.button(&name).clicked() {
+                        clicked = true;
+                    }
+                    if clicked {
+                        picked = Some(gi);
+                    }
+                }
+            });
+        });
+    }
+    picked
+}
+
 pub fn build_panel(
     ctx: &egui::Context,
     state: &mut UiState,
@@ -2700,49 +2745,11 @@ pub fn build_panel(
                             }
                         });
                         ui.add_space(4.0);
-                        for ci in 0..cat_names.len() {
-                            let mem = &cat_members[ci];
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(format!("{}  ({})", cat_names[ci], mem.len())).strong(),
-                            )
-                            .id_salt(format!("mpcat{ci}"))
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    for &gi in mem {
-                                        let i = gi as usize;
-                                        let name = brush_names
-                                            .get(i)
-                                            .cloned()
-                                            .unwrap_or_else(|| format!("Pincel {}", i + 1));
-                                        let mut clicked = false;
-                                        if let Some(Some(tid)) = thumb_ids.get(i) {
-                                            let img = egui::Image::new(egui::load::SizedTexture::new(*tid, egui::vec2(42.0, 42.0)))
-                                                .tint(Color32::from_gray(45));
-                                            if ui.add(egui::ImageButton::new(img)).on_hover_text(&name).clicked() {
-                                                clicked = true;
-                                            }
-                                        } else if ui.button(&name).clicked() {
-                                            clicked = true;
-                                        }
-                                        if clicked {
-                                            if state.eraser_pick {
-                                                // Elegir la FORMA de la goma (no asignar pincel al slot).
-                                                state.slots[state.editing_slot] = SlotItem::Eraser;
-                                                state.selected_seg = state.editing_slot;
-                                                state.eraser_pick = false;
-                                                state.brush_panel = false;
-                                                actions.pick_eraser_tip = Some(gi);
-                                            } else {
-                                                state.slots[state.editing_slot] = SlotItem::PsBrush(gi);
-                                                state.selected_seg = state.editing_slot;
-                                                state.brush_panel = false;
-                                                actions.pick_ps = Some(gi);
-                                            }
-                                        }
-                                    }
-                                });
-                            });
+                        if let Some(gi) = ps_category_picker(ui, &cat_names, &cat_members, &brush_names, &thumb_ids, "mpcat") {
+                            state.slots[state.editing_slot] = SlotItem::PsBrush(gi);
+                            state.selected_seg = state.editing_slot;
+                            state.brush_panel = false;
+                            actions.pick_ps = Some(gi);
                         }
 
                         // --- HERRAMIENTAS ---
@@ -2785,22 +2792,35 @@ pub fn build_panel(
                                 .color(Color32::from_gray(110)),
                         );
                         ui.horizontal(|ui| {
-                            if ui.selectable_label(state.eraser_shape.is_none(), "● Redonda").clicked() {
+                            if ui.selectable_label(state.eraser_shape.is_none(), "Redonda").clicked() {
                                 state.slots[state.editing_slot] = SlotItem::Eraser;
                                 state.selected_seg = state.editing_slot;
                                 state.eraser_pick = false;
                                 actions.eraser_round = true;
                                 actions.slot_selected = Some(state.editing_slot);
                             }
-                            let pick_lbl = if state.eraser_pick {
-                                "Elige un pincel arriba ↑"
-                            } else {
-                                "Con forma de pincel…"
-                            };
-                            if ui.selectable_label(state.eraser_pick, pick_lbl).clicked() {
+                            if ui.selectable_label(state.eraser_pick, "Con forma de pincel").clicked() {
                                 state.eraser_pick = !state.eraser_pick;
                             }
                         });
+                        // Al activar "con forma", mostrar AQUI MISMO las categorias para elegir
+                        // la forma de la goma (sin tener que buscar arriba).
+                        if state.eraser_pick {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("Elige el pincel cuya forma usara la goma:")
+                                    .size(11.0)
+                                    .italics()
+                                    .color(Color32::from_gray(110)),
+                            );
+                            if let Some(gi) = ps_category_picker(ui, &cat_names, &cat_members, &brush_names, &thumb_ids, "erscat") {
+                                state.slots[state.editing_slot] = SlotItem::Eraser;
+                                state.selected_seg = state.editing_slot;
+                                state.eraser_pick = false;
+                                state.brush_panel = false;
+                                actions.pick_eraser_tip = Some(gi);
+                            }
+                        }
                     });
                 });
             });
