@@ -2610,11 +2610,12 @@ impl ApplicationHandler for App {
                 // Rejilla del lienzo (geometria que se dibuja detras de la tinta).
                 self.grid_mesh.clear();
                 let infinite_canvas = matches!(self.settings.artboard, settings::Artboard::Infinite);
-                // Cuaderno de HOJAS: dibujar la hoja blanca (la "pagina") detras de todo.
+                // Cuaderno de HOJAS: dibujar la PAGINA (con el color/papel elegido en Ajustes)
+                // detras de todo. Antes estaba fija a blanco; ahora respeta el fondo del lienzo.
                 if let Some((w, h)) = self.settings.artboard_size() {
                     let (hw, hh) = (w * 0.5, h * 0.5);
-                    let white = [1.0, 1.0, 1.0, 1.0];
-                    let v = |x: f32, y: f32| Vertex { pos: [x, y], color: white, time: 0.0 };
+                    let paper = self.settings.bg_color();
+                    let v = |x: f32, y: f32| Vertex { pos: [x, y], color: paper, time: 0.0 };
                     self.grid_mesh.extend_from_slice(&[
                         v(-hw, -hh), v(hw, -hh), v(hw, hh),
                         v(-hw, -hh), v(hw, hh), v(-hw, hh),
