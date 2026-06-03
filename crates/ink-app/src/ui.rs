@@ -246,9 +246,9 @@ pub struct UiActions {
 }
 
 // --- Geometria de la rueda (mas pequena que antes) ---
-const R_OUT: f32 = 112.0;
-const R_MID: f32 = 70.0;
-const R_HOLE: f32 = 28.0;
+const R_OUT: f32 = 100.0;
+const R_MID: f32 = 62.0;
+const R_HOLE: f32 = 25.0;
 const N_SEG: usize = 9;
 const SEG_DEG: f32 = 360.0 / N_SEG as f32;
 
@@ -2195,6 +2195,13 @@ pub fn build_panel(
             let ring_bg = Color32::from_gray(250);
             let ink = Color32::from_gray(70);
 
+            // Fondo OPACO solido bajo la rueda: impide que el contenido del lienzo (p.ej. el
+            // borde de la hoja en los cuadernos) se vea a traves de la rueda. Alpha con rampa
+            // rapida (ya opaco a 1/3 de la apertura) para tapar el fondo en todo estado abierto.
+            let back_a = (build * 3.0).clamp(0.0, 1.0);
+            if back_a > 0.001 {
+                ui.painter().circle_filled(c, R_OUT, fade(ring_bg, back_a));
+            }
             // Anillo exterior.
             p_circle(ui, c, R_OUT, fade(ring_bg, f_ring));
             // Segmento seleccionado (con el factor de su propio segmento).
