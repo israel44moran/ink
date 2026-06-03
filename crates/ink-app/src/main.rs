@@ -220,6 +220,10 @@ struct App {
     notebooks: Vec<notebook::NotebookEntry>,
     /// Ruta del cuaderno abierto (donde se guarda).
     current_path: Option<std::path::PathBuf>,
+    /// Paginas del cuaderno abierto (la pagina activa esta volcada en doc/texts/...).
+    pages: Vec<notebook::PageData>,
+    /// Indice de la pagina activa.
+    current_page: usize,
     /// Nombre que se escribe al crear un cuaderno nuevo.
     new_nb_name: String,
     /// Tipo del cuaderno nuevo: infinito (true) o con hojas (false).
@@ -289,6 +293,8 @@ impl App {
             app_mode: AppMode::Library,
             notebooks: Vec::new(),
             current_path: None,
+            pages: vec![notebook::PageData::empty()],
+            current_page: 0,
             new_nb_name: String::new(),
             new_nb_infinite: true,
         }
@@ -466,28 +472,33 @@ impl App {
 
     // ===================== Cuadernos (biblioteca + guardado) =====================
 
-    /// Carga el contenido de un cuaderno en el estado actual y reconstruye la GPU.
-    fn apply_notebook(&mut self, nb: notebook::NotebookData) {
-        self.commit_text();
-        // Limpiar estampados de Photoshop previos (no se guardan en esta version).
+    /// Aplica una PAGINA (su dibujo, texto y borrados) al estado vivo y la sube a la GPU.
+    fn load_page(&mut self, i: usize) {
+        let Some((doc, texts, erase, tick)) = self
+            .pages
+            .get(i)
+            .map(|pg| (pg.doc.clone(), pg.texts.clone(), pg.erase_strokes.clone(), pg.tick.max(1.0)))
+        else {
+            return;
+        };
+        // Limpiar estampados de Photoshop previos (no se guardan por pagina en esta fase).
         let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
         self.ps_committed.clear();
         self.ps_active_verts.clear();
         self.ps_settings = None;
 
-        self.doc = nb.doc;
+        self.doc = doc;
         self.doc.refresh(); // reconstruye la malla horneada
-        self.texts = nb.texts;
+        self.texts = texts;
+        self.erase_strokes = erase;
+        self.tick = tick;
         self.active_text = None;
-        self.erase_strokes = nb.erase_strokes;
         self.erase_redo.clear();
         self.cur_erase.clear();
-        self.tick = nb.tick.max(1.0);
         self.selected.clear();
         self.gesture = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
-        self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
 
         if let Some(g) = self.gpu.as_mut() {
             for t in tips {
@@ -497,33 +508,82 @@ impl App {
             g.set_active(&[]);
             g.set_committed(self.doc.committed_vertices());
         }
-        // Re-aplicar los borrados de la goma a la mascara.
         self.rebuild_mask();
     }
 
-    /// Construye el contenido serializable del cuaderno actual.
-    fn current_notebook_data(&self, name: String, infinite: bool) -> notebook::NotebookData {
-        notebook::NotebookData {
-            version: 1,
-            name,
-            infinite,
-            doc: self.doc.clone(),
-            texts: self.texts.clone(),
-            erase_strokes: self.erase_strokes.clone(),
-            tick: self.tick,
+    /// Vuelca el estado vivo a la pagina actual (antes de cambiar de pagina o guardar).
+    fn stash_current_page(&mut self) {
+        let doc = self.doc.clone();
+        let texts = self.texts.clone();
+        let erase = self.erase_strokes.clone();
+        let tick = self.tick;
+        if let Some(pg) = self.pages.get_mut(self.current_page) {
+            pg.doc = doc;
+            pg.texts = texts;
+            pg.erase_strokes = erase;
+            pg.tick = tick;
+        }
+    }
+
+    /// Centra la camara en la hoja (encajandola en el viewport) para cuadernos de hojas.
+    fn center_on_page(&mut self) {
+        if let Some((w, h)) = self.settings.artboard_size() {
+            let vp = self.camera.viewport;
+            let zoom = ((vp.x / w.max(1.0)).min(vp.y / h.max(1.0)) * 0.9).clamp(0.05, 50.0);
+            self.camera.zoom = zoom;
+            self.camera.center = Vec2::ZERO;
+        }
+    }
+
+    /// Cambia a la pagina `i` (guardando la actual) y centra la vista en la hoja.
+    fn switch_page(&mut self, i: usize) {
+        if i >= self.pages.len() || i == self.current_page {
+            return;
+        }
+        self.commit_text();
+        self.stash_current_page();
+        self.current_page = i;
+        self.load_page(i);
+        self.center_on_page();
+    }
+
+    /// Anade una hoja nueva al final del cuaderno y va a ella.
+    fn add_page(&mut self) {
+        self.commit_text();
+        self.stash_current_page();
+        self.pages.push(notebook::PageData::empty());
+        let i = self.pages.len() - 1;
+        self.current_page = i;
+        self.load_page(i);
+        self.center_on_page();
+    }
+
+    /// Carga un cuaderno (sus paginas) en el estado y reconstruye la GPU.
+    fn apply_notebook(&mut self, nb: notebook::NotebookData) {
+        self.commit_text();
+        self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
+        self.pages = nb.pages;
+        if self.pages.is_empty() {
+            self.pages.push(notebook::PageData::empty());
+        }
+        self.current_page = 0;
+        self.load_page(0);
+        if nb.infinite {
+            self.camera.center = Vec2::ZERO;
+        } else {
+            self.center_on_page();
         }
     }
 
     /// Guarda el cuaderno abierto (si lo hay) en su archivo.
     fn save_current(&mut self) {
         let Some(path) = self.current_path.clone() else { return };
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("cuaderno")
-            .to_string();
+        self.commit_text();
+        self.stash_current_page();
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cuaderno").to_string();
         let infinite = matches!(self.settings.artboard, settings::Artboard::Infinite);
-        let nb = self.current_notebook_data(name, infinite);
+        let mut nb = notebook::NotebookData::new(&name, infinite);
+        nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
 
@@ -1776,6 +1836,9 @@ impl ApplicationHandler for App {
                 let mut lib_delete: Option<PathBuf> = None;
                 let mut lib_create = false;
                 let mut lib_go = false;
+                let mut page_prev = false;
+                let mut page_next = false;
+                let mut page_add = false;
                 let in_library = self.app_mode == AppMode::Library;
                 let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
                     self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
@@ -1796,6 +1859,30 @@ impl ApplicationHandler for App {
                                 lib_go = true;
                             }
                         });
+                    // Navegacion de paginas (solo en cuadernos de hojas).
+                    if !matches!(self.settings.artboard, settings::Artboard::Infinite) {
+                        let cur = self.current_page + 1;
+                        let total = self.pages.len();
+                        egui::Area::new(egui::Id::new("page_nav"))
+                            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -14.0))
+                            .show(ctx, |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.add_enabled(self.current_page > 0, egui::Button::new("◀")).clicked() {
+                                            page_prev = true;
+                                        }
+                                        ui.label(egui::RichText::new(format!("Hoja {cur} / {total}")).size(14.0));
+                                        if ui.add_enabled(self.current_page + 1 < total, egui::Button::new("▶")).clicked() {
+                                            page_next = true;
+                                        }
+                                        ui.separator();
+                                        if ui.button("➕ Hoja").clicked() {
+                                            page_add = true;
+                                        }
+                                    });
+                                });
+                            });
+                    }
 
                     // --- Selector de pinceles de Photoshop (desplegable, a la izquierda) ---
                     if self.ui.show_ps_panel {
@@ -1971,6 +2058,16 @@ impl ApplicationHandler for App {
                     notebook::delete(&p);
                     self.notebooks = notebook::list();
                 }
+                // Navegacion de paginas.
+                if page_prev && self.current_page > 0 {
+                    self.switch_page(self.current_page - 1);
+                }
+                if page_next && self.current_page + 1 < self.pages.len() {
+                    self.switch_page(self.current_page + 1);
+                }
+                if page_add {
+                    self.add_page();
+                }
                 if let Some(p) = ps_load_pack {
                     self.load_ps_pack(&p);
                 }
@@ -2089,7 +2186,19 @@ impl ApplicationHandler for App {
 
                 // Rejilla del lienzo (geometria que se dibuja detras de la tinta).
                 self.grid_mesh.clear();
-                let grid_limit = if self.settings.grid_limit_artboard {
+                let infinite_canvas = matches!(self.settings.artboard, settings::Artboard::Infinite);
+                // Cuaderno de HOJAS: dibujar la hoja blanca (la "pagina") detras de todo.
+                if let Some((w, h)) = self.settings.artboard_size() {
+                    let (hw, hh) = (w * 0.5, h * 0.5);
+                    let white = [1.0, 1.0, 1.0, 1.0];
+                    let v = |x: f32, y: f32| Vertex { pos: [x, y], color: white, time: 0.0 };
+                    self.grid_mesh.extend_from_slice(&[
+                        v(-hw, -hh), v(hw, -hh), v(hw, hh),
+                        v(-hw, -hh), v(hw, hh), v(-hw, hh),
+                    ]);
+                }
+                let grid_limit = if self.settings.grid_limit_artboard || !infinite_canvas {
+                    // En hojas, la rejilla se limita a la pagina.
                     self.settings
                         .artboard_size()
                         .map(|(w, h)| (vec2(-w * 0.5, -h * 0.5), vec2(w * 0.5, h * 0.5)))
@@ -2106,7 +2215,12 @@ impl ApplicationHandler for App {
                     grid_limit,
                     self.settings.grid_color(),
                 );
-                let bg = self.settings.bg_color();
+                // En hojas, el fondo es una "mesa" gris para que la pagina resalte.
+                let bg = if infinite_canvas {
+                    self.settings.bg_color()
+                } else {
+                    [0.20, 0.21, 0.24, 1.0]
+                };
 
                 // --- Render (lienzo + UI encima) ---
                 if let Some(g) = self.gpu.as_mut() {

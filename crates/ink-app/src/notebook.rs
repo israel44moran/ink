@@ -11,15 +11,10 @@ fn default_tick() -> f32 {
     1.0
 }
 
-/// Contenido serializable de un cuaderno (lo que se guarda en disco).
-#[derive(Serialize, Deserialize)]
-pub struct NotebookData {
-    #[serde(default)]
-    pub version: u32,
-    pub name: String,
-    /// `true` = lienzo infinito; `false` = con hojas (mesa de trabajo finita).
-    pub infinite: bool,
-    /// Dibujo (trazos vectoriales por capa).
+/// Una pagina (hoja) del cuaderno: su propio dibujo, texto y borrados. Un cuaderno
+/// infinito tiene UNA pagina (el espacio infinito); uno de hojas tiene varias.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PageData {
     pub doc: ink_core::Document,
     #[serde(default)]
     pub texts: Vec<ink_core::TextItem>,
@@ -31,17 +26,68 @@ pub struct NotebookData {
     pub tick: f32,
 }
 
-impl NotebookData {
-    /// Cuaderno nuevo y vacio.
-    pub fn new(name: &str, infinite: bool) -> Self {
+impl PageData {
+    pub fn empty() -> Self {
         Self {
-            version: 1,
-            name: name.to_string(),
-            infinite,
             doc: ink_core::Document::new(),
             texts: Vec::new(),
             erase_strokes: Vec::new(),
             tick: 1.0,
+        }
+    }
+}
+
+/// Contenido serializable de un cuaderno (lo que se guarda en disco).
+#[derive(Serialize, Deserialize)]
+pub struct NotebookData {
+    #[serde(default)]
+    pub version: u32,
+    pub name: String,
+    /// `true` = lienzo infinito (1 pagina); `false` = con hojas (varias paginas A4).
+    pub infinite: bool,
+    /// Las paginas del cuaderno.
+    #[serde(default)]
+    pub pages: Vec<PageData>,
+
+    // --- Compatibilidad con el formato anterior (cuaderno de un solo lienzo) ---
+    #[serde(default, skip_serializing)]
+    doc: Option<ink_core::Document>,
+    #[serde(default, skip_serializing)]
+    texts: Vec<ink_core::TextItem>,
+    #[serde(default, skip_serializing)]
+    erase_strokes: Vec<Vec<[f32; 4]>>,
+    #[serde(default, skip_serializing)]
+    tick: Option<f32>,
+}
+
+impl NotebookData {
+    /// Cuaderno nuevo con una pagina vacia.
+    pub fn new(name: &str, infinite: bool) -> Self {
+        Self {
+            version: 2,
+            name: name.to_string(),
+            infinite,
+            pages: vec![PageData::empty()],
+            doc: None,
+            texts: Vec::new(),
+            erase_strokes: Vec::new(),
+            tick: None,
+        }
+    }
+
+    /// Garantiza que haya al menos una pagina, migrando el formato anterior si hace falta.
+    fn normalize(&mut self) {
+        if self.pages.is_empty() {
+            if let Some(doc) = self.doc.take() {
+                self.pages.push(PageData {
+                    doc,
+                    texts: std::mem::take(&mut self.texts),
+                    erase_strokes: std::mem::take(&mut self.erase_strokes),
+                    tick: self.tick.unwrap_or(1.0),
+                });
+            } else {
+                self.pages.push(PageData::empty());
+            }
         }
     }
 }
@@ -103,10 +149,12 @@ pub fn save(nb: &NotebookData, path: &Path) -> std::io::Result<()> {
     std::fs::write(path, s)
 }
 
-/// Carga un cuaderno desde `path` (None si falla).
+/// Carga un cuaderno desde `path` (None si falla). Migra el formato anterior.
 pub fn load(path: &Path) -> Option<NotebookData> {
     let s = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&s).ok()
+    let mut nb: NotebookData = serde_json::from_str(&s).ok()?;
+    nb.normalize();
+    Some(nb)
 }
 
 /// Borra el archivo del cuaderno.
