@@ -164,6 +164,9 @@ struct App {
     erase_strokes: Vec<Vec<[f32; 4]>>,
     /// Discos del trazo de goma EN CURSO (se mueve a `erase_strokes` al terminar).
     cur_erase: Vec<[f32; 4]>,
+    /// Esquina (en mundo) de la VENTANA de mascara de borrado. Se mueve para seguir al
+    /// contenido/camara (lienzo infinito); al moverla se reconstruye la mascara.
+    mask_origin: Vec2,
     /// Modo GOMA global: al dibujar se BORRA (con el tamano del pincel activo), sin
     /// importar que pincel/forma este seleccionado. Cambiar de pincel no lo desactiva.
     eraser_mode: bool,
@@ -237,6 +240,7 @@ impl App {
             redo_stack: Vec::new(),
             erase_strokes: Vec::new(),
             cur_erase: Vec::new(),
+            mask_origin: Vec2::ZERO,
             eraser_mode: false,
             erasing: false,
             item_cfg: HashMap::new(),
@@ -711,11 +715,34 @@ impl App {
         }
     }
 
+    /// Asegura que la ventana de mascara cubra el punto `p` (mundo). Si `p` se acerca al
+    /// borde de la ventana, la RE-CENTRA en `p` y reconstruye la mascara desde el historial
+    /// (los borrados no se pierden: viven en `erase_strokes`). Permite borrar en el lienzo
+    /// infinito sin tener una textura infinita.
+    fn ensure_mask_covers(&mut self, p: Vec2) {
+        let Some(w) = self.gpu.as_ref().map(|g| g.mask_world()) else { return };
+        let half = w * 0.5;
+        let center = self.mask_origin + Vec2::splat(half);
+        let safe = half * 0.5; // re-centrar si el punto sale del 50% central
+        if (p - center).abs().max_element() > safe {
+            self.mask_origin = p - Vec2::splat(half);
+            if let Some(g) = self.gpu.as_mut() {
+                g.set_mask_origin([self.mask_origin.x, self.mask_origin.y]);
+            }
+            // Sin borrados, la mascara es todo 1: basta mover el origen. Con borrados hay
+            // que reconstruir para que aparezcan en la nueva ventana (y no haya fantasmas).
+            if !self.erase_strokes.is_empty() {
+                self.rebuild_mask();
+            }
+        }
+    }
+
     /// Inicia un trazo de GOMA (borrado raster por pixeles).
     fn start_erase(&mut self) {
         self.erasing = true;
         self.cur_erase.clear();
         self.last_sample_pos = self.camera.screen_to_world(self.cursor);
+        self.ensure_mask_covers(self.last_sample_pos);
         self.erase_mask_at(self.last_sample_pos);
     }
 
@@ -1507,6 +1534,11 @@ impl ApplicationHandler for App {
                     self.fps_timer = 0.0;
                     self.fps_frames = 0;
                 }
+
+                // Mantener la ventana de mascara centrada en lo que se ve: al hacer pan a
+                // una zona donde se borro, se reconstruye y se ven los borrados (infinito).
+                let view_center = self.camera.screen_to_world(self.camera.viewport * 0.5);
+                self.ensure_mask_covers(view_center);
 
                 let window = match self.window.clone() {
                     Some(w) => w,

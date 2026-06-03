@@ -140,6 +140,9 @@ pub struct GpuState {
     white_sample_bg: wgpu::BindGroup,
     /// Bind group para ESCRIBIR en M (uniform de parametros + de borrado).
     mask_render_bg: wgpu::BindGroup,
+    /// Buffer de parametros de la mascara (origen.xy, inv_size.xy). El origen se MUEVE
+    /// para que la ventana de borrado siga al contenido (lienzo infinito).
+    mask_params_buf: wgpu::Buffer,
     /// Buffer de parametros de borrado (centro, radio, fuerza); se actualiza por trazo.
     erase_params_buf: wgpu::Buffer,
     /// Pipeline que resta un disco suave en M (goma).
@@ -609,6 +612,7 @@ impl GpuState {
             mask_sample_bg,
             white_sample_bg,
             mask_render_bg,
+            mask_params_buf,
             erase_params_buf,
             mask_erase_pipeline,
             mask_restore_pipeline,
@@ -749,10 +753,17 @@ impl GpuState {
 
     // ---------------- Mascara de borrado (goma raster) ----------------
 
-    /// Mitad del lado de la region (en unidades de mundo) que cubre la mascara: el
-    /// borrado solo funciona dentro de `[-half, half]` en X e Y.
-    pub fn mask_world_half(&self) -> f32 {
-        MASK_WORLD * 0.5
+    /// Lado de la ventana de mascara en unidades de mundo (region cubierta a la vez).
+    pub fn mask_world(&self) -> f32 {
+        MASK_WORLD
+    }
+
+    /// Mueve el ORIGEN (esquina inferior) de la ventana de mascara en espacio de mundo.
+    /// Permite que la ventana de borrado siga al contenido (lienzo infinito). Tras moverla
+    /// hay que reconstruir M (el llamador lo hace con los trazos de goma guardados).
+    pub fn set_mask_origin(&mut self, origin: [f32; 2]) {
+        let params: [f32; 4] = [origin[0], origin[1], 1.0 / MASK_WORLD, 1.0 / MASK_WORLD];
+        self.queue.write_buffer(&self.mask_params_buf, 0, bytemuck::cast_slice(&params));
     }
 
     /// Borra un DISCO suave en la mascara, en coordenadas de MUNDO. `strength` (0..1) es
