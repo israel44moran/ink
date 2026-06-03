@@ -5,7 +5,7 @@
 //! (fondo -> frente) aplicando la opacidad de cada capa. Las herramientas
 //! (seleccion, borrar, mover, empujar) operan sobre la capa ACTIVA.
 
-use crate::stroke::{tessellate_stroke, Stroke, Vertex};
+use crate::stroke::{Stroke, Vertex};
 use crate::tools::{dist_point_segment, point_in_polygon, Aabb};
 use glam::Vec2;
 
@@ -175,7 +175,7 @@ impl Document {
         self.layers[ai].strokes.push(stroke);
         if can_append {
             let s = self.layers[ai].strokes.last().unwrap();
-            tessellate_stroke(&s.samples, &s.brush, &mut self.committed);
+            s.tessellate(&mut self.committed); // copia el `time` del trazo a cada vertice
             self.last_incremental = true;
         } else {
             self.rebuild();
@@ -198,7 +198,7 @@ impl Document {
             }
             tmp.clear();
             for s in &layer.strokes {
-                tessellate_stroke(&s.samples, &s.brush, &mut tmp);
+                s.tessellate(&mut tmp); // copia el `time` del trazo a cada vertice
             }
             if layer.opacity < 0.999 {
                 for v in tmp.iter_mut() {

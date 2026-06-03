@@ -22,8 +22,8 @@ const SAMPLE_COUNT: u32 = 4;
 const MASK_RES: u32 = 8192;
 const MASK_WORLD: f32 = 8192.0;
 
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4, 2 => Float32];
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
@@ -33,8 +33,8 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-const STAMP_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+const STAMP_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32];
 
 fn stamp_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
@@ -158,10 +158,8 @@ pub struct GpuState {
     /// Buffer de INSTANCIAS de discos de borrado (se reusa entre llamadas). Permite borrar
     /// muchos discos en un solo draw (sin un submit por disco).
     erase_inst: DynBuffer,
-    /// Pipeline que resta un disco suave en M (goma).
+    /// Pipeline que escribe el tiempo de borrado de cada disco de la goma en M.
     mask_erase_pipeline: wgpu::RenderPipeline,
-    /// Pipeline que sube M bajo geometria de trazo nuevo (para no quedar borrado).
-    mask_restore_pipeline: wgpu::RenderPipeline,
 }
 
 impl GpuState {
@@ -266,12 +264,13 @@ impl GpuState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            // R32Float: guarda el TIEMPO del ultimo borrado en cada pixel (0 = nunca).
+            format: wgpu::TextureFormat::R32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        // Limpiar M a 1.0 (todo visible) con un render pass de clear.
+        // Limpiar M a 0 (ningun borrado todavia).
         {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clear mask") });
             enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -281,7 +280,7 @@ impl GpuState {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -292,14 +291,15 @@ impl GpuState {
             });
             queue.submit(std::iter::once(enc.finish()));
         }
-        // Textura 1x1 blanca (M=1) para grid/trazo en curso (no se borran).
+        // Textura 1x1 con tiempo -1 para grid/trazo en curso: cualquier `time >= 0` es
+        // mayor que -1, asi que SIEMPRE se ven (no se borran nunca).
         let white_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("white mask"),
+            label: Some("never-erased mask"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::R32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -310,18 +310,19 @@ impl GpuState {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &[255u8],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1), rows_per_image: Some(1) },
+            bytemuck::cast_slice(&[-1.0f32]),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // R32Float no es filtrable: muestreo NEAREST (la comparacion de tiempo es binaria).
         let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("mask sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -339,13 +340,13 @@ impl GpuState {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
             ],
@@ -386,7 +387,9 @@ impl GpuState {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: mask_params_buf.as_entire_binding() }],
         });
 
-        // Pipelines que escriben en M (sin MSAA, target R8).
+        // Pipeline que escribe el TIEMPO de borrado en M (R32Float). Los discos llegan
+        // como instancias [cx, cy, radio, tiempo]. Sin blend (replace): los borrados se
+        // aplican en orden de tiempo creciente, asi que el ultimo (mayor) gana donde solapan.
         let mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mask shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("mask.wgsl").into()),
@@ -404,36 +407,8 @@ impl GpuState {
                 module: &mask_shader,
                 entry_point: Some("fs_erase"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R8Unorm,
-                    // M_new = M_old * (1 - cov): resta cobertura del disco de la goma.
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add },
-                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview_mask: None,
-            cache: None,
-        });
-        let mask_restore_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mask restore pipeline"),
-            layout: Some(&mask_render_layout),
-            vertex: wgpu::VertexState { module: &mask_shader, entry_point: Some("vs_restore"), buffers: &[vertex_layout()], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState {
-                module: &mask_shader,
-                entry_point: Some("fs_restore"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R8Unorm,
-                    // M_new = max(M_old, alpha): sube la mascara bajo el trazo nuevo.
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max },
-                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max },
-                    }),
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -612,7 +587,6 @@ impl GpuState {
             mask_params_buf,
             erase_inst: DynBuffer::new(),
             mask_erase_pipeline,
-            mask_restore_pipeline,
         }
     }
 
@@ -770,10 +744,10 @@ impl GpuState {
         self.queue.write_buffer(&self.mask_params_buf, 0, bytemuck::cast_slice(&params));
     }
 
-    /// Borra una lista de DISCOS suaves en la mascara en coordenadas de MUNDO. Cada disco
-    /// es `[center.x, center.y, radio, fuerza]`. Todos se dibujan en UN solo draw (una
-    /// instancia por disco) -> sin un submit por disco (clave para que la goma y su
-    /// undo/redo vayan rapidos).
+    /// Escribe el TIEMPO de borrado de una lista de DISCOS en la mascara (coords de MUNDO).
+    /// Cada disco es `[center.x, center.y, radio, tiempo]`. Todos en UN solo draw (una
+    /// instancia por disco). Los pixeles bajo cada disco quedan marcados con ese tiempo;
+    /// un trazo se vera solo si su `time` es mayor (se dibujo despues del borrado).
     pub fn erase_mask(&mut self, discs: &[[f32; 4]]) {
         if discs.is_empty() {
             return;
@@ -805,46 +779,7 @@ impl GpuState {
         self.queue.submit(std::iter::once(enc.finish()));
     }
 
-    /// Sube M (a 1) bajo la geometria `verts` de un trazo nuevo, para que el contenido
-    /// recien dibujado no aparezca borrado por borrados anteriores en esa zona.
-    pub fn restore_mask(&mut self, verts: &[Vertex]) {
-        if verts.is_empty() {
-            return;
-        }
-        let bytes: &[u8] = bytemuck::cast_slice(verts);
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mask restore vbuf"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&buf, 0, bytes);
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("restore mask enc") });
-        {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("restore mask pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.mask_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rp.set_pipeline(&self.mask_restore_pipeline);
-            rp.set_bind_group(0, &self.mask_render_bg, &[]);
-            rp.set_vertex_buffer(0, buf.slice(..));
-            rp.draw(0..verts.len() as u32, 0..1);
-        }
-        self.queue.submit(std::iter::once(enc.finish()));
-    }
-
-    /// Restablece la mascara a 1.0 (todo visible): borra todos los borrados.
+    /// Restablece la mascara a 0 (ningun borrado): quita todos los borrados.
     pub fn clear_mask(&mut self) {
         let mut enc = self
             .device
@@ -856,7 +791,7 @@ impl GpuState {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
                     store: wgpu::StoreOp::Store,
                 },
             })],

@@ -1,12 +1,10 @@
 // Shader de ESTAMPADOS texturizados (pinceles estilo Photoshop).
 //
 // Cada estampado es un quad con coordenadas de mundo + UV en la textura de la punta
-// (mascara alfa en escala de grises) + color RGBA. El fragment multiplica el color
-// del pincel por la cobertura de la punta (canal rojo de la textura R8) y el alfa del
-// estampado (flujo/opacidad de ese punto).
-//
-// Tambien multiplica por la MASCARA DE BORRADO (group 2) para que la goma borre los
-// estampados a nivel de pixel igual que los trazos.
+// (mascara alfa) + color RGBA + tiempo de creacion. El fragment multiplica el color del
+// pincel por la cobertura de la punta y el alfa del estampado, y aplica la GOMA POR
+// TIMESTAMPS (group 2): visible solo si su `time` es mayor que el tiempo de borrado del
+// pixel (igual que los trazos).
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -28,6 +26,7 @@ struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) time: f32,
 };
 
 struct VsOut {
@@ -35,6 +34,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) world: vec2<f32>,
+    @location(3) time: f32,
 };
 
 @vertex
@@ -44,15 +44,16 @@ fn vs_main(in: VsIn) -> VsOut {
     out.uv = in.uv;
     out.color = in.color;
     out.world = in.pos;
+    out.time = in.time;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Cobertura de la punta (R8): 1.0 = opaco, 0.0 = transparente.
     let coverage = textureSample(tip_tex, tip_samp, in.uv).r;
     let muv = (in.world - mask.min) * mask.inv_size;
-    let m = textureSample(mask_tex, mask_samp, muv).r;
-    let a = coverage * in.color.a * m;
+    let erase_t = textureSampleLevel(mask_tex, mask_samp, muv, 0.0).r;
+    let visible = select(0.0, 1.0, in.time > erase_t);
+    let a = coverage * in.color.a * visible;
     return vec4<f32>(in.color.rgb, a);
 }

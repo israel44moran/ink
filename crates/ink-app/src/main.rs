@@ -71,16 +71,6 @@ enum RedoOp {
     EraseMask,
 }
 
-/// Operacion sobre la MASCARA de borrado, en orden CRONOLOGICO. Reconstruir la mascara
-/// = reproducir estas en orden (clear, luego cada una). Asi un borrado nunca afecta a lo
-/// dibujado DESPUES (se restaura su huella despues del borrado).
-enum MaskOp {
-    /// Restaura M (a 1) bajo la huella de un trazo (sus vertices en mundo).
-    Draw(Vec<Vertex>),
-    /// Resta los discos de un trazo de goma [cx, cy, radio, fuerza].
-    Erase(Vec<[f32; 4]>),
-}
-
 /// Configuracion persistente de un item de la rueda (lo que el usuario ajusta con los
 /// popups: tamano, opacidad y suavidad). Se guarda por item para restaurarla al volver.
 #[derive(Clone, Copy)]
@@ -170,14 +160,17 @@ struct App {
     /// Historial unificado de deshacer/rehacer (trazos procedurales + de pincel PS).
     undo_stack: Vec<DrawOp>,
     redo_stack: Vec<RedoOp>,
-    /// Log CRONOLOGICO de operaciones de mascara (dibujos y borrados, en orden). Permite
-    /// reconstruir la mascara respetando el orden: un borrado no afecta a lo dibujado
-    /// despues. Paralelo a `undo_stack` (una entrada por operacion).
-    mask_log: Vec<MaskOp>,
-    /// Operaciones de mascara deshechas (para rehacer).
-    mask_redo: Vec<MaskOp>,
-    /// Discos del trazo de goma EN CURSO (se mueve a `mask_log` al terminar).
+    /// Trazos de GOMA (cada uno = lista de discos [cx, cy, radio, TIEMPO]). El tiempo
+    /// marca en la mascara que pixeles se borraron y cuando; un trazo se ve solo si su
+    /// tiempo de creacion es mayor. Permite reconstruir la mascara y deshacer borrados.
+    erase_strokes: Vec<Vec<[f32; 4]>>,
+    /// Trazos de goma deshechos (para rehacer).
+    erase_redo: Vec<Vec<[f32; 4]>>,
+    /// Discos del trazo de goma EN CURSO (se mueve a `erase_strokes` al terminar).
     cur_erase: Vec<[f32; 4]>,
+    /// Reloj logico: cada trazo (de dibujo o de goma) toma un tiempo creciente. Los trazos
+    /// guardan su tiempo; los borrados marcan ese tiempo en la mascara.
+    tick: f32,
     /// Esquina (en mundo) de la VENTANA de mascara de borrado. Se mueve para seguir al
     /// contenido/camara (lienzo infinito); al moverla se reconstruye la mascara.
     mask_origin: Vec2,
@@ -252,9 +245,10 @@ impl App {
             ps_settings_map: HashMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            mask_log: Vec::new(),
-            mask_redo: Vec::new(),
+            erase_strokes: Vec::new(),
+            erase_redo: Vec::new(),
             cur_erase: Vec::new(),
+            tick: 1.0,
             mask_origin: Vec2::ZERO,
             eraser_mode: false,
             erasing: false,
@@ -411,27 +405,25 @@ impl App {
             return;
         }
         self.drawing = false;
-        if let Some(stroke) = self.active.take() {
+        if let Some(mut stroke) = self.active.take() {
             if !stroke.samples.is_empty() {
-                // Teselar el trazo nuevo una vez: sirve para la mascara de borrado y para
-                // subir SOLO este trazo a la GPU (incremental, sin re-subir toda la malla).
+                // Marcar el tiempo de creacion: por la goma por timestamps, este trazo se
+                // vera aunque pase por una zona borrada antes (su tiempo es mayor).
+                stroke.time = self.tick;
                 let mut mesh: Vec<Vertex> = Vec::new();
-                stroke.tessellate(&mut mesh);
+                stroke.tessellate(&mut mesh); // mesh con el time en cada vertice
                 self.doc.add_stroke(stroke);
                 let incremental = self.doc.last_add_was_incremental();
                 if let Some(g) = self.gpu.as_mut() {
-                    g.restore_mask(&mesh);
                     // Anexar solo el trazo nuevo; si no cupo o el doc reconstruyo, re-subir todo.
                     if !incremental || !g.append_committed(&mesh) {
                         g.set_committed(self.doc.committed_vertices());
                     }
                     g.set_active(&[]);
                 }
-                // Registrar en el historial unificado de deshacer + log de mascara.
                 self.undo_stack.push(DrawOp::Procedural);
                 self.redo_stack.clear();
-                self.mask_log.push(MaskOp::Draw(mesh));
-                self.mask_redo.clear();
+                self.tick += 1.0;
             }
         }
         self.active_mesh.clear();
@@ -443,20 +435,7 @@ impl App {
         }
     }
 
-    /// Mueve la ultima op de mascara de `mask_log` a `mask_redo` (al deshacer).
-    fn mask_log_undo(&mut self) {
-        if let Some(op) = self.mask_log.pop() {
-            self.mask_redo.push(op);
-        }
-    }
-    /// Mueve la ultima op de mascara deshecha de vuelta a `mask_log` (al rehacer).
-    fn mask_log_redo(&mut self) {
-        if let Some(op) = self.mask_redo.pop() {
-            self.mask_log.push(op);
-        }
-    }
-
-    /// Deshace la ULTIMA operacion de dibujo (procedural o de pincel PS), en orden.
+    /// Deshace la ULTIMA operacion de dibujo (procedural, de pincel PS o de goma), en orden.
     fn undo_op(&mut self) {
         match self.undo_stack.pop() {
             Some(DrawOp::Procedural) => {
@@ -476,13 +455,15 @@ impl App {
                 }
             }
             Some(DrawOp::EraseMask) => {
+                // Deshacer un trazo de goma: quitarlo y reconstruir la mascara.
+                if let Some(discs) = self.erase_strokes.pop() {
+                    self.erase_redo.push(discs);
+                    self.rebuild_mask();
+                }
                 self.redo_stack.push(RedoOp::EraseMask);
             }
-            None => return,
+            None => {}
         }
-        // Toda op tiene su entrada en el log de mascara: revertirla y reconstruir M.
-        self.mask_log_undo();
-        self.rebuild_mask();
     }
 
     /// Rehace la ultima operacion deshecha.
@@ -504,12 +485,14 @@ impl App {
                 self.undo_stack.push(DrawOp::Ps { tip, count });
             }
             Some(RedoOp::EraseMask) => {
+                if let Some(discs) = self.erase_redo.pop() {
+                    self.erase_strokes.push(discs);
+                    self.rebuild_mask();
+                }
                 self.undo_stack.push(DrawOp::EraseMask);
             }
-            None => return,
+            None => {}
         }
-        self.mask_log_redo();
-        self.rebuild_mask();
     }
 
     /// ¿Hay algo que deshacer / rehacer? (historial unificado)
@@ -730,15 +713,9 @@ impl App {
         (self.brush.width * 0.5).max(2.0)
     }
 
-    /// Fuerza/opacidad de la goma (= opacidad de la rueda). 1.0 = borra del todo.
-    fn eraser_strength(&self) -> f32 {
-        self.brush.opacity.clamp(0.05, 1.0)
-    }
-
     /// Asegura que la ventana de mascara cubra el punto `p` (mundo). Si `p` se acerca al
-    /// borde de la ventana, la RE-CENTRA en `p` y reconstruye la mascara desde el historial
-    /// (los borrados no se pierden: viven en `mask_log`). Permite borrar en el lienzo
-    /// infinito sin tener una textura infinita.
+    /// borde de la ventana, la RE-CENTRA en `p` y reconstruye la mascara desde los trazos
+    /// de goma guardados (no se pierden). Permite borrar en el lienzo infinito.
     fn ensure_mask_covers(&mut self, p: Vec2) {
         let Some(w) = self.gpu.as_ref().map(|g| g.mask_world()) else { return };
         let half = w * 0.5;
@@ -749,23 +726,21 @@ impl App {
             if let Some(g) = self.gpu.as_mut() {
                 g.set_mask_origin([self.mask_origin.x, self.mask_origin.y]);
             }
-            // Sin borrados, la mascara es todo 1: basta mover el origen. Con borrados hay
-            // que reconstruir para que aparezcan en la nueva ventana (y no haya fantasmas).
-            let has_erase = self.mask_log.iter().any(|o| matches!(o, MaskOp::Erase(_)));
-            if has_erase {
+            // Sin borrados, la mascara es 0 en todas partes: basta mover el origen.
+            if !self.erase_strokes.is_empty() {
                 self.rebuild_mask();
             }
         }
     }
 
-    /// Inicia un trazo de GOMA (borrado raster por pixeles).
+    /// Inicia un trazo de GOMA (borrado raster por timestamps).
     fn start_erase(&mut self) {
         self.erasing = true;
         self.cur_erase.clear();
         let w = self.camera.screen_to_world(self.cursor);
         self.last_sample_pos = w;
         self.ensure_mask_covers(w);
-        let disc = [w.x, w.y, self.eraser_radius(), self.eraser_strength()];
+        let disc = [w.x, w.y, self.eraser_radius(), self.tick];
         self.cur_erase.push(disc);
         if let Some(g) = self.gpu.as_mut() {
             g.erase_mask(&[disc]);
@@ -773,10 +748,11 @@ impl App {
     }
 
     /// Continua el borrado en `world` (interpola para no dejar huecos al mover rapido).
-    /// Todos los discos del movimiento se borran en UN solo draw (instanciado).
+    /// Todos los discos del movimiento se borran en UN solo draw (instanciado), con el
+    /// MISMO tiempo (el del trazo de goma en curso).
     fn do_erase(&mut self, world: Vec2) {
         let r = self.eraser_radius();
-        let st = self.eraser_strength();
+        let t = self.tick;
         let from = self.last_sample_pos;
         let seg = world - from;
         let len = seg.length();
@@ -785,7 +761,7 @@ impl App {
         let mut new_discs: Vec<[f32; 4]> = Vec::with_capacity(n);
         for i in 1..=n {
             let p = from + seg * (i as f32 / n as f32);
-            new_discs.push([p.x, p.y, r, st]);
+            new_discs.push([p.x, p.y, r, t]);
         }
         if !new_discs.is_empty() {
             self.cur_erase.extend_from_slice(&new_discs);
@@ -796,50 +772,27 @@ impl App {
         self.last_sample_pos = world;
     }
 
-    /// Finaliza el trazo de goma: lo registra en el historial para poder deshacerlo.
+    /// Finaliza el trazo de goma: lo guarda (para deshacer/reconstruir) y avanza el reloj.
     fn finish_erase(&mut self) {
         self.erasing = false;
         if !self.cur_erase.is_empty() {
             let discs = std::mem::take(&mut self.cur_erase);
-            self.mask_log.push(MaskOp::Erase(discs));
-            self.mask_redo.clear();
+            self.erase_strokes.push(discs);
+            self.erase_redo.clear();
             self.undo_stack.push(DrawOp::EraseMask);
             self.redo_stack.clear();
+            self.tick += 1.0;
         }
     }
 
-    /// Reconstruye la mascara reproduciendo el log en orden CRONOLOGICO: limpia y aplica
-    /// cada dibujo (restaura su huella) y cada borrado (resta sus discos) en el orden en
-    /// que ocurrieron. Asi un borrado nunca afecta a lo dibujado DESPUES.
+    /// Reconstruye la mascara desde cero: limpia y re-aplica todos los discos de goma con
+    /// sus tiempos (en orden de creacion; donde se solapan, el de mayor tiempo gana).
     fn rebuild_mask(&mut self) {
-        let log = std::mem::take(&mut self.mask_log);
+        let all: Vec<[f32; 4]> = self.erase_strokes.iter().flatten().copied().collect();
         if let Some(g) = self.gpu.as_mut() {
             g.clear_mask();
-            // Agrupar operaciones consecutivas del mismo tipo en un solo draw (menos
-            // submits) conservando el ORDEN entre dibujos y borrados.
-            let mut i = 0;
-            while i < log.len() {
-                match &log[i] {
-                    MaskOp::Draw(_) => {
-                        let mut verts: Vec<Vertex> = Vec::new();
-                        while let Some(MaskOp::Draw(m)) = log.get(i) {
-                            verts.extend_from_slice(m);
-                            i += 1;
-                        }
-                        g.restore_mask(&verts);
-                    }
-                    MaskOp::Erase(_) => {
-                        let mut discs: Vec<[f32; 4]> = Vec::new();
-                        while let Some(MaskOp::Erase(d)) = log.get(i) {
-                            discs.extend_from_slice(d);
-                            i += 1;
-                        }
-                        g.erase_mask(&discs);
-                    }
-                }
-            }
+            g.erase_mask(&all);
         }
-        self.mask_log = log;
     }
 
     fn add_point_ps(&mut self, raw_world: Vec2, pressure: f32) {
@@ -910,25 +863,19 @@ impl App {
         }
         if !self.ps_active_verts.is_empty() {
             let count = self.ps_active_verts.len();
-            // Huella del trazo (posiciones) para restaurar la mascara: dibujar PS sobre una
-            // zona borrada hace reaparecer el trazo nuevo (no hereda el borrado).
-            let ps_mesh: Vec<Vertex> = self
-                .ps_active_verts
-                .iter()
-                .map(|s| Vertex { pos: s.pos, color: [0.0, 0.0, 0.0, 1.0] })
-                .collect();
+            // Marcar el tiempo de creacion en los estampados (goma por timestamps).
+            for v in &mut self.ps_active_verts {
+                v.time = self.tick;
+            }
             let v = self.ps_committed.entry(tip).or_default();
             v.extend_from_slice(&self.ps_active_verts);
             let verts = v.clone();
             if let Some(g) = self.gpu.as_mut() {
                 g.set_committed_stamps(tip, &verts);
-                g.restore_mask(&ps_mesh);
             }
-            // Registrar el trazo PS en el historial unificado de deshacer + log de mascara.
             self.undo_stack.push(DrawOp::Ps { tip, count });
             self.redo_stack.clear();
-            self.mask_log.push(MaskOp::Draw(ps_mesh));
-            self.mask_redo.clear();
+            self.tick += 1.0;
         }
         self.ps_active_verts.clear();
         self.ps_samples.clear();
@@ -1898,9 +1845,10 @@ impl ApplicationHandler for App {
                         }
                         g.clear_mask(); // quitar todos los borrados de la goma
                     }
-                    self.mask_log.clear();
-                    self.mask_redo.clear();
+                    self.erase_strokes.clear();
+                    self.erase_redo.clear();
                     self.cur_erase.clear();
+                    self.tick = 1.0;
                     self.undo_stack.clear();
                     self.redo_stack.clear();
                     self.sync_committed();

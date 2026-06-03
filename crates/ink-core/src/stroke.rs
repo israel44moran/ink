@@ -17,12 +17,16 @@ use glam::Vec2;
 pub struct Vertex {
     pub pos: [f32; 2],
     pub color: [f32; 4],
+    /// Tiempo de creacion del trazo (goma por timestamps): el vertice se ve solo si su
+    /// `time` es mayor que el tiempo del ultimo borrado en ese pixel. La teselacion lo
+    /// deja en 0; el shell (`main.rs`) lo fija por trazo antes de subirlo a la GPU.
+    pub time: f32,
 }
 
 impl Vertex {
     #[inline]
     fn new(p: Vec2, color: [f32; 4]) -> Self {
-        Self { pos: [p.x, p.y], color }
+        Self { pos: [p.x, p.y], color, time: 0.0 }
     }
 }
 
@@ -96,11 +100,14 @@ impl Default for Brush {
 pub struct Stroke {
     pub samples: Vec<InputSample>,
     pub brush: Brush,
+    /// Tiempo de creacion (goma por timestamps): se copia a cada vertice al teselar. Un
+    /// trazo se ve solo si su tiempo es mayor que el del ultimo borrado en ese pixel.
+    pub time: f32,
 }
 
 impl Stroke {
     pub fn new(brush: Brush) -> Self {
-        Self { samples: Vec::new(), brush }
+        Self { samples: Vec::new(), brush, time: 0.0 }
     }
 
     #[inline]
@@ -108,9 +115,13 @@ impl Stroke {
         self.samples.push(s);
     }
 
-    /// Tesela este trazo, *anexando* los triangulos a `out`.
+    /// Tesela este trazo, *anexando* los triangulos a `out`, con su `time` en cada vertice.
     pub fn tessellate(&self, out: &mut Vec<Vertex>) {
+        let start = out.len();
         tessellate_stroke(&self.samples, &self.brush, out);
+        for v in &mut out[start..] {
+            v.time = self.time;
+        }
     }
 }
 

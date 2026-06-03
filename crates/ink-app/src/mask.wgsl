@@ -1,11 +1,9 @@
-// Shaders que ESCRIBEN en la mascara de borrado M (textura R8 en espacio de mundo).
-//
-// - vs_erase/fs_erase: estampan discos suaves (forma/tamano/opacidad de la goma) que
-//   RESTAN cobertura de M (blend: M_new = M_old * (1 - cov*strength)). Cada disco es una
-//   INSTANCIA (center.xy, radius, strength) -> todos los discos de un trazo se dibujan en
-//   UN solo draw (sin un submit por disco), eliminando el lag al borrar y al deshacer.
-// - vs_restore/fs_restore: dibujan geometria de trazo (mundo + color) SUBIENDO M
-//   (blend Max) para que el contenido nuevo no quede borrado por borrados anteriores.
+// Shader que escribe el TIEMPO DE BORRADO en la mascara M (textura R32Float en espacio de
+// mundo). Cada disco de la goma es una INSTANCIA [center.x, center.y, radio, tiempo]. El
+// fragmento escribe `tiempo` en los pixeles dentro del circulo (descarta los de fuera).
+// Sin blend (replace): como los borrados se aplican en orden de tiempo creciente, el
+// ultimo (mayor) gana donde se solapan. Los shaders de contenido comparan: un trazo se ve
+// solo si su tiempo de creacion es mayor que el tiempo guardado aqui.
 
 struct Mask {
     min: vec2<f32>,
@@ -13,23 +11,22 @@ struct Mask {
 };
 @group(0) @binding(0) var<uniform> mask: Mask;
 
-// world -> clip de la textura M (y invertida porque la textura es y-abajo).
 fn world_to_mask_clip(world: vec2<f32>) -> vec4<f32> {
     let uv = (world - mask.min) * mask.inv_size;
     return vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
 }
 
-// ---------------- Borrar (discos instanciados) ----------------
 struct ErIn {
     @builtin(vertex_index) vi: u32,
     @location(0) center: vec2<f32>,
-    @location(1) rs: vec2<f32>, // x = radio, y = fuerza/opacidad
+    @location(1) rs: vec2<f32>, // x = radio, y = tiempo del borrado
 };
 struct ErOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec2<f32>,
     @location(1) center: vec2<f32>,
-    @location(2) rs: vec2<f32>,
+    @location(2) radius: f32,
+    @location(3) time: f32,
 };
 
 @vertex
@@ -39,47 +36,21 @@ fn vs_erase(in: ErIn) -> ErOut {
         vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
     );
     let c = corners[in.vi];
-    let r = in.rs.x * 1.2; // margen para el borde suave
-    let world = in.center + c * r;
+    let world = in.center + c * in.rs.x;
     var out: ErOut;
     out.clip = world_to_mask_clip(world);
     out.world = world;
     out.center = in.center;
-    out.rs = in.rs;
+    out.radius = in.rs.x;
+    out.time = in.rs.y;
     return out;
 }
 
 @fragment
 fn fs_erase(in: ErOut) -> @location(0) vec4<f32> {
-    let radius = in.rs.x;
-    let strength = in.rs.y;
-    let d = distance(in.world, in.center);
-    let inner = radius * 0.6;
-    let cov = 1.0 - smoothstep(inner, radius, d);
-    return vec4<f32>(cov * strength, 0.0, 0.0, 1.0);
-}
-
-// ---------------- Restaurar (geometria de trazo) ----------------
-struct RsIn {
-    @location(0) pos: vec2<f32>,
-    @location(1) color: vec4<f32>,
-};
-struct RsOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) a: f32,
-};
-
-@vertex
-fn vs_restore(in: RsIn) -> RsOut {
-    var out: RsOut;
-    out.clip = world_to_mask_clip(in.pos);
-    out.a = in.color.a;
-    return out;
-}
-
-@fragment
-fn fs_restore(in: RsOut) -> @location(0) vec4<f32> {
-    // Restaurar la mascara a 1.0 (totalmente visible) bajo la huella del trazo nuevo:
-    // dibujar sobre una zona borrada hace reaparecer el contenido nuevo completo.
-    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+    // Solo los pixeles dentro del circulo se marcan con el tiempo de borrado.
+    if (distance(in.world, in.center) > in.radius) {
+        discard;
+    }
+    return vec4<f32>(in.time, 0.0, 0.0, 0.0);
 }

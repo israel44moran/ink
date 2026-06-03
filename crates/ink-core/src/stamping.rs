@@ -24,6 +24,8 @@ pub struct StampVertex {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
+    /// Tiempo de creacion del trazo (goma por timestamps). Lo fija el shell por trazo.
+    pub time: f32,
 }
 
 /// Convierte un [`Stamp`] en dos triangulos (un quad) con UV y color, y los anexa a
@@ -60,10 +62,10 @@ pub fn push_stamp_quad(out: &mut Vec<StampVertex>, st: &Stamp, tip_aspect: f32, 
     let tr = p + right + up;
     let bl = p - right - up;
     let br = p + right - up;
-    let vtl = StampVertex { pos: [tl.x, tl.y], uv: [u0, v0], color: col };
-    let vtr = StampVertex { pos: [tr.x, tr.y], uv: [u1, v0], color: col };
-    let vbl = StampVertex { pos: [bl.x, bl.y], uv: [u0, v1], color: col };
-    let vbr = StampVertex { pos: [br.x, br.y], uv: [u1, v1], color: col };
+    let vtl = StampVertex { pos: [tl.x, tl.y], uv: [u0, v0], color: col, time: 0.0 };
+    let vtr = StampVertex { pos: [tr.x, tr.y], uv: [u1, v0], color: col, time: 0.0 };
+    let vbl = StampVertex { pos: [bl.x, bl.y], uv: [u0, v1], color: col, time: 0.0 };
+    let vbr = StampVertex { pos: [br.x, br.y], uv: [u1, v1], color: col, time: 0.0 };
     out.extend_from_slice(&[vtl, vtr, vbl, vtr, vbr, vbl]);
 }
 

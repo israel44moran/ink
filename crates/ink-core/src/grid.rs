@@ -31,9 +31,10 @@ impl Default for GridKind {
 
 #[inline]
 fn push_tri(out: &mut Vec<Vertex>, a: Vec2, b: Vec2, c: Vec2, col: [f32; 4]) {
-    out.push(Vertex { pos: [a.x, a.y], color: col });
-    out.push(Vertex { pos: [b.x, b.y], color: col });
-    out.push(Vertex { pos: [c.x, c.y], color: col });
+    // time = 0: la rejilla nunca se borra (se dibuja con la mascara "nunca-borrada").
+    out.push(Vertex { pos: [a.x, a.y], color: col, time: 0.0 });
+    out.push(Vertex { pos: [b.x, b.y], color: col, time: 0.0 });
+    out.push(Vertex { pos: [c.x, c.y], color: col, time: 0.0 });
 }
 
 /// Anexa un segmento grueso (quad) de `a` a `b` con medio-ancho `half`.
