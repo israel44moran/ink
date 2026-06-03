@@ -26,8 +26,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ink_core::{
-    push_stamp_quad, stamp_path, vec2, Brush, BrushSettings, Camera, Document, InputSample,
-    OneEuroFilter, StampVertex, Stroke, TextItem, TipKind, Tool, Vec2, Vertex,
+    point_in_polygon, push_stamp_quad, stamp_path, vec2, Aabb, Brush, BrushSettings, Camera,
+    Document, InputSample, OneEuroFilter, StampVertex, Stroke, TextItem, TipKind, Tool, Vec2,
+    Vertex,
 };
 use renderer::{present_mode_name, GpuState};
 use settings::Settings;
@@ -145,6 +146,9 @@ struct App {
     // Herramientas (seleccion / empujar / mascaras / texto)
     gesture: Option<Gesture>,
     selected: Vec<usize>,
+    /// Estampados de pincel de Photoshop seleccionados por el lazo: tip -> indices de
+    /// estampado (cada estampado son 6 vertices consecutivos en `ps_committed[tip]`).
+    selected_stamps: HashMap<u32, Vec<usize>>,
     texts: Vec<TextItem>,
     active_text: Option<usize>,
 
@@ -261,6 +265,7 @@ impl App {
             last_fps: 0.0,
             gesture: None,
             selected: Vec::new(),
+            selected_stamps: HashMap::new(),
             texts: Vec::new(),
             active_text: None,
             ps_brushes: Vec::new(),
@@ -476,6 +481,99 @@ impl App {
         }
     }
 
+    // ===================== Seleccion de estampados (lazo en pinceles Ps) =====================
+
+    /// Centro (en mundo) del estampado `i` dentro de `verts`. Cada estampado son 6
+    /// vertices (un quad); el centro es el punto medio de dos esquinas opuestas (0 y 4).
+    fn stamp_center(verts: &[StampVertex], i: usize) -> Vec2 {
+        let b = i * 6;
+        let tl = Vec2::new(verts[b].pos[0], verts[b].pos[1]);
+        let br = Vec2::new(verts[b + 4].pos[0], verts[b + 4].pos[1]);
+        (tl + br) * 0.5
+    }
+
+    /// Selecciona los estampados de pincel de Photoshop cuyo CENTRO cae dentro de `poly`.
+    /// Como los estampados se colocan muy densos a lo largo del trazo, seleccionar por
+    /// centro sigue el contorno con precision (a la resolucion del espaciado del pincel).
+    /// Esto hace que el lazo funcione con CUALQUIER pincel Ps y cualquier tamano.
+    fn select_stamps_in_polygon(&self, poly: &[Vec2]) -> HashMap<u32, Vec<usize>> {
+        let mut out: HashMap<u32, Vec<usize>> = HashMap::new();
+        if poly.len() < 3 {
+            return out;
+        }
+        for (&tip, verts) in &self.ps_committed {
+            let count = verts.len() / 6;
+            let mut idxs = Vec::new();
+            for i in 0..count {
+                if point_in_polygon(Self::stamp_center(verts, i), poly) {
+                    idxs.push(i);
+                }
+            }
+            if !idxs.is_empty() {
+                out.insert(tip, idxs);
+            }
+        }
+        out
+    }
+
+    /// Caja (AABB) que engloba TODA la seleccion: trazos procedurales + estampados Ps.
+    fn selection_bounds(&self) -> Option<Aabb> {
+        let mut acc = self.doc.bounds_of(&self.selected);
+        for (&tip, idxs) in &self.selected_stamps {
+            let Some(verts) = self.ps_committed.get(&tip) else { continue };
+            for &i in idxs {
+                let b = i * 6;
+                for v in verts.iter().skip(b).take(6) {
+                    let p = Vec2::new(v.pos[0], v.pos[1]);
+                    acc = Some(match acc {
+                        None => Aabb::from_points(p, p),
+                        Some(mut a) => {
+                            a.expand(p);
+                            a
+                        }
+                    });
+                }
+            }
+        }
+        acc
+    }
+
+    /// Mueve los estampados seleccionados sumando `d` a sus vertices y re-sube a la GPU
+    /// los buffers de los tips afectados.
+    fn move_selected_stamps(&mut self, d: Vec2) {
+        if d == Vec2::ZERO || self.selected_stamps.is_empty() {
+            return;
+        }
+        let entries: Vec<(u32, Vec<usize>)> =
+            self.selected_stamps.iter().map(|(&t, v)| (t, v.clone())).collect();
+        for (tip, idxs) in entries {
+            if let Some(verts) = self.ps_committed.get_mut(&tip) {
+                for i in idxs {
+                    let b = i * 6;
+                    for v in verts.iter_mut().skip(b).take(6) {
+                        v.pos[0] += d.x;
+                        v.pos[1] += d.y;
+                    }
+                }
+            }
+            let snapshot = self.ps_committed.get(&tip).cloned();
+            if let (Some(snapshot), Some(g)) = (snapshot, self.gpu.as_mut()) {
+                g.set_committed_stamps(tip, &snapshot);
+            }
+        }
+    }
+
+    /// Hay algo seleccionado (trazos procedurales o estampados Ps).
+    fn has_selection(&self) -> bool {
+        !self.selected.is_empty() || self.selected_stamps.values().any(|v| !v.is_empty())
+    }
+
+    /// Limpia toda la seleccion (procedural + estampados).
+    fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selected_stamps.clear();
+    }
+
     // ===================== Cuadernos (biblioteca + guardado) =====================
 
     /// Aplica una PAGINA (su dibujo, texto y borrados) al estado vivo y la sube a la GPU.
@@ -501,7 +599,7 @@ impl App {
         self.active_text = None;
         self.erase_redo.clear();
         self.cur_erase.clear();
-        self.selected.clear();
+        self.clear_selection();
         self.gesture = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -1115,15 +1213,15 @@ impl App {
         match tool {
             Tool::Select | Tool::Sector | Tool::Lasso => {
                 // Si presiono dentro de la seleccion existente, la muevo.
-                if !self.selected.is_empty() {
-                    if let Some(bb) = self.doc.bounds_of(&self.selected) {
+                if self.has_selection() {
+                    if let Some(bb) = self.selection_bounds() {
                         if bb.contains(w) {
                             self.gesture = Some(Gesture::Move { last: w });
                             return;
                         }
                     }
                 }
-                self.selected.clear();
+                self.clear_selection();
                 self.gesture = Some(match tool {
                     Tool::Select => Gesture::Marquee { start: w, end: w },
                     Tool::Sector => Gesture::Lasso { pts: vec![w] },
@@ -1214,6 +1312,7 @@ impl App {
                 let sel = self.selected.clone();
                 self.doc.translate_strokes(&sel, d);
                 self.sync_committed();
+                self.move_selected_stamps(d);
             }
             Act::Smudge(p, d) => {
                 let r = self.world_radius(22.0);
@@ -1239,13 +1338,25 @@ impl App {
         match self.gesture.take() {
             Some(Gesture::Marquee { start, end }) => {
                 self.selected = self.doc.strokes_in_rect(start, end);
+                // Estampados Ps: dentro del rectangulo (como poligono de 4 esquinas).
+                let rect = [
+                    start,
+                    Vec2::new(end.x, start.y),
+                    end,
+                    Vec2::new(start.x, end.y),
+                ];
+                self.selected_stamps = self.select_stamps_in_polygon(&rect);
             }
             Some(Gesture::Lasso { pts }) => {
                 self.selected = self.doc.strokes_in_polygon(&pts);
+                self.selected_stamps = self.select_stamps_in_polygon(&pts);
             }
             Some(Gesture::LassoCut { pts }) => {
                 // Recortar los trazos por el contorno y seleccionar solo lo de dentro.
                 self.selected = self.doc.lasso_split(&pts);
+                // Los estampados Ps no se pueden "partir": se seleccionan los que caen
+                // dentro del contorno (por su centro), que al ser densos siguen la forma.
+                self.selected_stamps = self.select_stamps_in_polygon(&pts);
                 self.sync_committed();
             }
             _ => {}
@@ -1319,8 +1430,8 @@ impl App {
         }
 
         // Caja de la seleccion actual (si "Resaltar seleccion" esta activo).
-        if self.settings.highlight_selection && !self.selected.is_empty() {
-            if let Some(bb) = self.doc.bounds_of(&self.selected) {
+        if self.settings.highlight_selection && self.has_selection() {
+            if let Some(bb) = self.selection_bounds() {
                 let r = Rect::from_two_pos(to_pt(bb.min), to_pt(bb.max));
                 p.rect_filled(r, egui::CornerRadius::same(2), Color32::from_rgba_unmultiplied(70, 140, 230, 20));
                 p.rect_stroke(r, egui::CornerRadius::same(2), Stroke::new(1.5, accent), StrokeKind::Outside);
@@ -1743,7 +1854,7 @@ impl ApplicationHandler for App {
                         KeyCode::KeyC => {
                             self.doc.clear();
                             self.texts.clear();
-                            self.selected.clear();
+                            self.clear_selection();
                             self.active_text = None;
                             let tips: Vec<u32> = self.ps_committed.keys().copied().collect();
                             self.ps_committed.clear();

@@ -28,7 +28,7 @@ pub use grid::{build_grid, GridKind};
 pub use smoothing::OneEuroFilter;
 pub use stamping::{push_stamp_quad, stamp_path, BlendMode, BrushSettings, DynControl, Stamp, StampOutput, StampVertex, TipKind};
 pub use stroke::{tessellate_incremental, tessellate_stroke, Brush, BrushKind, InputSample, Stroke, Vertex};
-pub use tools::{Aabb, TextItem, Tool};
+pub use tools::{point_in_polygon, Aabb, TextItem, Tool};
 
 #[cfg(test)]
 mod tests {

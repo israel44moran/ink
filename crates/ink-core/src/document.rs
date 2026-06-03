@@ -349,6 +349,13 @@ impl Document {
                     out.push(s); // nada dentro: el trazo queda intacto
                     continue;
                 }
+                if n == 1 {
+                    // Trazo de un solo punto (un toque, sea cual sea el grosor) totalmente
+                    // dentro del lazo: seleccionarlo entero (no se puede partir un punto).
+                    selected.push(out.len());
+                    out.push(s);
+                    continue;
+                }
                 // Recorrer el trazo partiendo en sub-trazos dentro/fuera. Al cruzar el
                 // contorno se inserta el punto de INTERSECCION EXACTO (interpolando posicion
                 // y presion) en ambos lados, asi el corte cae justo en el borde del lazo.
