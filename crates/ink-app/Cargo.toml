@@ -16,3 +16,13 @@ log = "0.4.30"
 pollster = "0.4.0"
 wgpu = "29.0.3"
 winit = "0.30.13"
+
+# Solo en Windows: leer el boton "barrel" del lapiz via la API de puntero (WM_POINTER),
+# igual que Photoshop, ya que winit no expone los botones del stylus.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_Pointer",
+] }

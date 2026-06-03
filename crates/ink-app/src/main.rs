@@ -14,6 +14,8 @@
 //!   - El panel de la derecha se puede ocultar/mostrar con su boton.
 
 mod copic;
+#[cfg(windows)]
+mod pen_win;
 mod renderer;
 mod settings;
 mod ui;
@@ -1277,6 +1279,19 @@ impl ApplicationHandler for App {
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_maximized(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("crear ventana"));
+
+        // Windows: interceptar los mensajes de puntero para leer el boton del lapiz
+        // (barrel) directamente, como Photoshop.
+        #[cfg(windows)]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = window.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    pen_win::install(w.hwnd.get());
+                }
+            }
+        }
+
         let size = window.inner_size();
         self.camera = Camera::new(vec2(size.width.max(1) as f32, size.height.max(1) as f32));
         let gpu = pollster::block_on(GpuState::new(window.clone()));
@@ -1617,6 +1632,19 @@ impl ApplicationHandler for App {
                 // una zona donde se borro, se reconstruye y se ven los borrados (infinito).
                 let view_center = self.camera.screen_to_world(self.camera.viewport * 0.5);
                 self.ensure_mask_covers(view_center);
+
+                // Windows: boton del lapiz (barrel) -> abrir/cerrar "Ajustes del pincel".
+                #[cfg(windows)]
+                {
+                    let clicks = pen_win::take_barrel_clicks();
+                    for _ in 0..clicks {
+                        self.ui.show_brush_settings = !self.ui.show_brush_settings;
+                        if self.ui.show_brush_settings {
+                            let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+                            self.ui.brush_settings_pos = egui::pos2(self.cursor.x / ppp, self.cursor.y / ppp);
+                        }
+                    }
+                }
 
                 let window = match self.window.clone() {
                     Some(w) => w,
