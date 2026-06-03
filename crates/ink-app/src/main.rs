@@ -268,6 +268,13 @@ struct App {
     new_nb_name: String,
     /// Tipo del cuaderno nuevo: infinito (true) o con hojas (false).
     new_nb_infinite: bool,
+    // --- Cartas hologr aficas de la biblioteca (Home) ---
+    /// Animacion por carta: [hover 0..1, rotX, rotY] (suavizado hacia el objetivo).
+    card_anim: Vec<[f32; 3]>,
+    /// Rectangulos (cx, cy, hx, hy en px) de las cartas del ultimo layout (para hit-test).
+    card_rects: Vec<(f32, f32, f32, f32)>,
+    /// Desplazamiento vertical de la cuadricula de cartas (rueda).
+    card_scroll: f32,
 }
 
 impl App {
@@ -348,6 +355,9 @@ impl App {
             wheel_accum: 0.0,
             new_nb_name: String::new(),
             new_nb_infinite: true,
+            card_anim: Vec::new(),
+            card_rects: Vec::new(),
+            card_scroll: 0.0,
         }
     }
 
@@ -819,6 +829,114 @@ impl App {
         self.current_path = None;
         self.app_mode = AppMode::Library;
         self.notebooks = notebook::list();
+        self.card_scroll = 0.0;
+        self.card_anim.clear();
+    }
+
+    // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
+
+    /// Layout en cuadricula de las cartas: (centro, medio-tamano) en px, por cuaderno.
+    fn library_card_layout(&self) -> Vec<(Vec2, Vec2)> {
+        let n = self.notebooks.len();
+        let vp = self.camera.viewport;
+        let (cw, ch, gap) = (188.0_f32, 263.0_f32, 36.0_f32);
+        let cols = (((vp.x - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
+        let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
+        let x0 = (vp.x - total_w) * 0.5 + cw * 0.5;
+        let top = 172.0;
+        let row_h = ch + gap + 26.0; // espacio extra para el nombre bajo cada carta
+        (0..n)
+            .map(|i| {
+                let (col, row) = (i % cols, i / cols);
+                let cx = x0 + col as f32 * (cw + gap);
+                let cy = top + ch * 0.5 + row as f32 * row_h - self.card_scroll;
+                (vec2(cx, cy), vec2(cw * 0.5, ch * 0.5))
+            })
+            .collect()
+    }
+
+    /// Suaviza la animacion (hover/tilt) de cada carta hacia su objetivo (segun el cursor) y
+    /// guarda los rects para el hit-test de los clics.
+    fn update_card_anim(&mut self, layout: &[(Vec2, Vec2)]) {
+        self.card_anim.resize(layout.len(), [0.0, 0.0, 0.0]);
+        let cur = self.cursor;
+        let max_ang = 0.20;
+        for (i, (c, h)) in layout.iter().enumerate() {
+            let inside = (cur.x - c.x).abs() <= h.x && (cur.y - c.y).abs() <= h.y;
+            let (tx, ty) = if inside {
+                (
+                    ((cur.x - (c.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0),
+                    ((cur.y - (c.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0),
+                )
+            } else {
+                (0.5, 0.5)
+            };
+            let (t_hover, t_rotx, t_roty) = if inside {
+                (1.0, (0.5 - ty) * 2.0 * max_ang, (tx - 0.5) * 2.0 * max_ang)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            let a = &mut self.card_anim[i];
+            let k = 0.28;
+            a[0] += (t_hover - a[0]) * k;
+            a[1] += (t_rotx - a[1]) * k;
+            a[2] += (t_roty - a[2]) * k;
+        }
+        self.card_rects = layout.iter().map(|(c, h)| (c.x, c.y, h.x, h.y)).collect();
+    }
+
+    /// Procesa un clic en la biblioteca: hit-test de las cartas. Clic en la papelera (esquina
+    /// sup-derecha) borra el cuaderno; clic en el resto de la carta lo abre.
+    fn library_click(&mut self) {
+        let cur = self.cursor;
+        let rects = self.card_rects.clone();
+        for (i, &(cx, cy, hx, hy)) in rects.iter().enumerate() {
+            if (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy {
+                let (dpx, dpy) = (cx + hx - 18.0, cy - hy + 18.0); // esquina papelera
+                if (cur.x - dpx).hypot(cur.y - dpy) < 16.0 {
+                    if let Some(nb) = self.notebooks.get(i) {
+                        let path = nb.path.clone();
+                        notebook::delete(&path);
+                        self.notebooks = notebook::list();
+                        self.card_anim.clear();
+                    }
+                } else if let Some(nb) = self.notebooks.get(i) {
+                    self.open_notebook(nb.path.clone());
+                }
+                return;
+            }
+        }
+    }
+
+    /// Construye las instancias de carta para la GPU. La carta bajo el cursor se dibuja al
+    /// final (encima de las demas, ya que se eleva en 3D).
+    fn build_card_instances(&self, layout: &[(Vec2, Vec2)]) -> Vec<renderer::CardInstance> {
+        const PALETTE: [[f32; 3]; 6] = [
+            [0.16, 0.30, 0.52],
+            [0.45, 0.18, 0.42],
+            [0.16, 0.42, 0.34],
+            [0.52, 0.34, 0.14],
+            [0.30, 0.20, 0.52],
+            [0.12, 0.40, 0.46],
+        ];
+        let cur = self.cursor;
+        let mut cards: Vec<renderer::CardInstance> = Vec::with_capacity(layout.len());
+        let mut hover_idx: Option<usize> = None;
+        for (i, (c, h)) in layout.iter().enumerate() {
+            let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
+            let ptr_x = ((cur.x - (c.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
+            let ptr_y = ((cur.y - (c.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
+            let base = PALETTE[i % PALETTE.len()];
+            cards.push([c.x, c.y, h.x, h.y, a[1], a[2], ptr_x, ptr_y, a[0], base[0], base[1], base[2]]);
+            if a[0] > 0.45 {
+                hover_idx = Some(i);
+            }
+        }
+        if let Some(hi) = hover_idx {
+            let card = cards.remove(hi);
+            cards.push(card);
+        }
+        cards
     }
 
     /// Deshace la ULTIMA operacion de dibujo (procedural, de pincel PS o de goma), en orden.
@@ -1923,6 +2041,9 @@ impl ApplicationHandler for App {
                             self.ui.eyedropper = false;
                         } else if self.try_eyedropper() {
                             // Cuentagotas: tomo el color y no dibujo.
+                        } else if self.app_mode == AppMode::Library {
+                            // En la biblioteca, el clic abre o borra una carta (hit-test).
+                            self.library_click();
                         } else {
                             // Tocar el lienzo cierra los paneles flotantes (color, "Mis
                             // pinceles", selector PS y Ajustes) para no estorbar al dibujar.
@@ -1999,11 +2120,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                let amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
+                };
+                if !egui_consumed && self.app_mode == AppMode::Library && amount != 0.0 {
+                    // Biblioteca: la rueda desplaza la cuadricula de cartas.
+                    self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
+                }
                 if !egui_consumed && self.app_mode == AppMode::Canvas {
-                    let amount = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y,
-                        MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
-                    };
                     if amount != 0.0 {
                         // Hace zoom el lienzo infinito siempre; en los cuadernos de hojas la
                         // rueda pasa de pagina, salvo con Alt (zoom) cuando la hoja no esta fija.
@@ -2332,6 +2457,11 @@ impl ApplicationHandler for App {
                 } else {
                     Vec::new()
                 };
+                // Layout + animacion de las cartas de la biblioteca (Home).
+                let card_layout = if in_library { self.library_card_layout() } else { Vec::new() };
+                if in_library {
+                    self.update_card_anim(&card_layout);
+                }
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
@@ -2403,18 +2533,19 @@ impl ApplicationHandler for App {
                         }
                     }
                   } else {
-                    // ---------------- BIBLIOTECA de cuadernos ----------------
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    // ---------------- BIBLIOTECA de cuadernos (cartas hologr aficas) ----------------
+                    // Panel SIN fondo: las cartas se dibujan con wgpu detras (fondo oscuro).
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
                         ui.add_space(18.0);
-                        ui.heading("Mis cuadernos");
+                        ui.label(egui::RichText::new("Mis cuadernos").size(26.0).strong().color(egui::Color32::from_gray(235)));
                         ui.label(
                             egui::RichText::new("Crea cuadernos infinitos o con hojas. Se guardan solos al volver aquí.")
-                                .color(egui::Color32::from_gray(130)),
+                                .color(egui::Color32::from_gray(170)),
                         );
                         ui.add_space(12.0);
                         // --- Crear nuevo ---
                         ui.horizontal(|ui| {
-                            ui.label("Nombre:");
+                            ui.label(egui::RichText::new("Nombre:").color(egui::Color32::from_gray(220)));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.new_nb_name)
                                     .hint_text("Mi cuaderno")
@@ -2436,62 +2567,41 @@ impl ApplicationHandler for App {
                                     .color(egui::Color32::from_gray(140)),
                             );
                         }
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                            for (name, infinite, path) in &nb_list {
-                                ui.horizontal(|ui| {
-                                    // Icono del TIPO de cuaderno, DIBUJADO (no glifos: la fuente
-                                    // no trae varios y saldrian como cuadros).
-                                    let (trect, _) = ui.allocate_exact_size(egui::vec2(34.0, 36.0), egui::Sense::hover());
-                                    let tp = ui.painter().clone();
-                                    let tc = trect.center();
-                                    let tcol = egui::Color32::from_gray(150);
-                                    if *infinite {
-                                        // Lienzo infinito: simbolo de infinito (dos aros).
-                                        tp.circle_stroke(tc - egui::vec2(5.5, 0.0), 5.0, egui::Stroke::new(2.0, tcol));
-                                        tp.circle_stroke(tc + egui::vec2(5.5, 0.0), 5.0, egui::Stroke::new(2.0, tcol));
-                                    } else {
-                                        // Cuaderno de hojas: dos paginas apiladas.
-                                        let r1 = egui::Rect::from_min_size(tc + egui::vec2(-8.0, -7.0), egui::vec2(13.0, 16.0));
-                                        let r2 = egui::Rect::from_min_size(tc + egui::vec2(-3.0, -10.0), egui::vec2(13.0, 16.0));
-                                        tp.rect_stroke(r1, egui::CornerRadius::same(2), egui::Stroke::new(1.6, tcol), egui::StrokeKind::Inside);
-                                        tp.rect_filled(r2, egui::CornerRadius::same(2), egui::Color32::from_gray(248));
-                                        tp.rect_stroke(r2, egui::CornerRadius::same(2), egui::Stroke::new(1.6, tcol), egui::StrokeKind::Inside);
-                                    }
-                                    // Boton con el nombre del cuaderno.
-                                    if ui
-                                        .add(
-                                            egui::Button::new(egui::RichText::new(name).size(16.0))
-                                                .min_size(egui::vec2(320.0, 36.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        lib_open = Some(path.clone());
-                                    }
-                                    // Boton BORRAR con icono de papelera dibujado.
-                                    let (drect, dresp) =
-                                        ui.allocate_exact_size(egui::vec2(40.0, 36.0), egui::Sense::click());
-                                    let hovered = dresp.hovered();
-                                    let dp = ui.painter().clone();
-                                    let bg = if hovered { egui::Color32::from_gray(224) } else { egui::Color32::from_gray(238) };
-                                    dp.rect_filled(drect, egui::CornerRadius::same(6), bg);
-                                    let dc = drect.center();
-                                    let dcol = if hovered { egui::Color32::from_rgb(196, 64, 64) } else { egui::Color32::from_gray(110) };
-                                    let st = egui::Stroke::new(1.7, dcol);
-                                    let body = egui::Rect::from_min_max(dc + egui::vec2(-6.0, -2.0), dc + egui::vec2(6.0, 9.0));
-                                    dp.rect_stroke(body, egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
-                                    dp.line_segment([dc + egui::vec2(-8.0, -2.0), dc + egui::vec2(8.0, -2.0)], st); // borde de la tapa
-                                    dp.line_segment([dc + egui::vec2(-3.0, -2.0), dc + egui::vec2(-3.0, -5.0)], st); // asa izquierda
-                                    dp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(3.0, -5.0)], st); // asa arriba
-                                    dp.line_segment([dc + egui::vec2(3.0, -5.0), dc + egui::vec2(3.0, -2.0)], st); // asa derecha
-                                    dp.line_segment([dc + egui::vec2(-2.0, 1.0), dc + egui::vec2(-2.0, 6.0)], st); // ranura izq
-                                    dp.line_segment([dc + egui::vec2(2.0, 1.0), dc + egui::vec2(2.0, 6.0)], st); // ranura der
-                                    if dresp.clicked() {
-                                        lib_delete = Some(path.clone());
-                                    }
-                                });
-                                ui.add_space(5.0);
-                            }
-                        });
+                        // Las CARTAS (cuadernos) se dibujan con wgpu detras de la UI; aqui solo
+                        // van, sobre cada carta, el NOMBRE y un icono de papelera. El clic para
+                        // ABRIR o BORRAR se maneja por hit-test en los eventos (no widgets egui),
+                        // para no tapar el area de las cartas.
+                        let _ = ui; // el contenido de las cartas no usa el layout de egui
+                        let ppp = ctx.pixels_per_point().max(0.01);
+                        let lp = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("card_overlay"),
+                        ));
+                        let cur = self.cursor;
+                        for (i, (name, _inf, _path)) in nb_list.iter().enumerate() {
+                            let Some((c, h)) = card_layout.get(i) else { continue };
+                            // Nombre centrado bajo la carta.
+                            lp.text(
+                                egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
+                                egui::Align2::CENTER_CENTER,
+                                name,
+                                egui::FontId::proportional(15.0),
+                                egui::Color32::from_gray(230),
+                            );
+                            // Papelera en la esquina superior derecha de la carta.
+                            let dpx = c.x + h.x - 18.0;
+                            let dpy = c.y - h.y + 18.0;
+                            let near = (cur.x - dpx).hypot(cur.y - dpy) < 16.0;
+                            let dcol = if near { egui::Color32::from_rgb(235, 92, 92) } else { egui::Color32::from_gray(205) };
+                            let dc = egui::pos2(dpx / ppp, dpy / ppp);
+                            let st = egui::Stroke::new(1.7, dcol);
+                            let body = egui::Rect::from_min_max(dc + egui::vec2(-6.0, -2.0), dc + egui::vec2(6.0, 9.0));
+                            lp.rect_stroke(body, egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
+                            lp.line_segment([dc + egui::vec2(-8.0, -2.0), dc + egui::vec2(8.0, -2.0)], st);
+                            lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(3.0, -5.0)], st);
+                            lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(-3.0, -2.0)], st);
+                            lp.line_segment([dc + egui::vec2(3.0, -5.0), dc + egui::vec2(3.0, -2.0)], st);
+                        }
                     });
                   }
                 });
@@ -2654,48 +2764,52 @@ impl ApplicationHandler for App {
                 let ppp = ctx.pixels_per_point();
                 let primitives = ctx.tessellate(full_output.shapes, ppp);
 
-                // Rejilla del lienzo (geometria que se dibuja detras de la tinta).
+                // Rejilla del lienzo (geometria que se dibuja detras de la tinta). En la
+                // biblioteca no hay lienzo (solo las cartas), asi que se omite.
                 self.grid_mesh.clear();
                 let infinite_canvas = matches!(self.settings.artboard, settings::Artboard::Infinite);
-                // Cuaderno de HOJAS: dibujar la PAGINA (con el color/papel elegido en Ajustes)
-                // detras de todo. Antes estaba fija a blanco; ahora respeta el fondo del lienzo.
-                if let Some((w, h)) = self.settings.artboard_size() {
-                    let (hw, hh) = (w * 0.5, h * 0.5);
-                    let paper = self.settings.bg_color();
-                    let v = |x: f32, y: f32| Vertex { pos: [x, y], color: paper, time: 0.0 };
-                    self.grid_mesh.extend_from_slice(&[
-                        v(-hw, -hh), v(hw, -hh), v(hw, hh),
-                        v(-hw, -hh), v(hw, hh), v(-hw, hh),
-                    ]);
+                if !in_library {
+                    // Cuaderno de HOJAS: dibujar la PAGINA (con el color/papel elegido en Ajustes).
+                    if let Some((w, h)) = self.settings.artboard_size() {
+                        let (hw, hh) = (w * 0.5, h * 0.5);
+                        let paper = self.settings.bg_color();
+                        let v = |x: f32, y: f32| Vertex { pos: [x, y], color: paper, time: 0.0 };
+                        self.grid_mesh.extend_from_slice(&[
+                            v(-hw, -hh), v(hw, -hh), v(hw, hh),
+                            v(-hw, -hh), v(hw, hh), v(-hw, hh),
+                        ]);
+                    }
+                    let grid_limit = if self.settings.grid_limit_artboard || !infinite_canvas {
+                        self.settings
+                            .artboard_size()
+                            .map(|(w, h)| (vec2(-w * 0.5, -h * 0.5), vec2(w * 0.5, h * 0.5)))
+                    } else {
+                        None
+                    };
+                    ink_core::build_grid(
+                        &mut self.grid_mesh,
+                        self.settings.grid,
+                        &self.camera,
+                        self.settings.grid_size,
+                        self.settings.grid_divisions,
+                        self.settings.grid_line_width,
+                        grid_limit,
+                        self.settings.grid_color(),
+                    );
                 }
-                let grid_limit = if self.settings.grid_limit_artboard || !infinite_canvas {
-                    // En hojas, la rejilla se limita a la pagina.
-                    self.settings
-                        .artboard_size()
-                        .map(|(w, h)| (vec2(-w * 0.5, -h * 0.5), vec2(w * 0.5, h * 0.5)))
-                } else {
-                    None
-                };
-                ink_core::build_grid(
-                    &mut self.grid_mesh,
-                    self.settings.grid,
-                    &self.camera,
-                    self.settings.grid_size,
-                    self.settings.grid_divisions,
-                    self.settings.grid_line_width,
-                    grid_limit,
-                    self.settings.grid_color(),
-                );
-                // En hojas, el fondo es una "mesa" gris para que la pagina resalte.
-                let bg = if infinite_canvas {
+                // Fondo: la BIBLIOTECA es oscura (resaltan las cartas); el lienzo usa el fondo
+                // elegido (infinito) o la "mesa" gris (hojas).
+                let bg = if in_library {
+                    [0.07, 0.08, 0.11, 1.0]
+                } else if infinite_canvas {
                     self.settings.bg_color()
                 } else {
                     [0.20, 0.21, 0.24, 1.0]
                 };
 
                 // Recorte del contenido a la HOJA (cuadernos de hojas): el dibujo y la
-                // rejilla no se salen del rectangulo de la pagina.
-                let content_clip = if infinite_canvas {
+                // rejilla no se salen del rectangulo de la pagina. En la biblioteca, sin recorte.
+                let content_clip = if in_library || infinite_canvas {
                     None
                 } else if let Some((w, h)) = self.settings.artboard_size() {
                     let (hw, hh) = (w * 0.5, h * 0.5);
@@ -2711,6 +2825,10 @@ impl ApplicationHandler for App {
                     None
                 };
 
+                // Cartas de la biblioteca (vacio en el lienzo). Se construye antes de prestar
+                // la GPU (build_card_instances usa &self).
+                let cards = if in_library { self.build_card_instances(&card_layout) } else { Vec::new() };
+
                 // --- Render (lienzo + UI encima) ---
                 if let Some(g) = self.gpu.as_mut() {
                     let screen = egui_wgpu::ScreenDescriptor {
@@ -2720,6 +2838,7 @@ impl ApplicationHandler for App {
                     g.set_bg(bg);
                     g.set_content_clip(content_clip);
                     g.set_grid(&self.grid_mesh);
+                    g.set_cards(&cards, self.camera.viewport.x, self.camera.viewport.y);
                     g.update_camera(self.camera.view_proj());
                     g.render(&primitives, &full_output.textures_delta, &screen);
                 }

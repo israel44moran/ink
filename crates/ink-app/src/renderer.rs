@@ -56,6 +56,22 @@ fn erase_inst_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// Instancia de una "carta" de la biblioteca (12 floats = 48 bytes):
+/// [center.x, center.y, half.x, half.y, rotX, rotY, pointer.x, pointer.y, hover, baseR, baseG, baseB].
+pub type CardInstance = [f32; 12];
+
+const CARD_INST_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32, 5 => Float32x3
+];
+
+fn card_inst_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: 48,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &CARD_INST_ATTRS,
+    }
+}
+
 /// Una punta de pincel ya subida a GPU: bind group con su textura + aspecto (w/h).
 struct TipGpu {
     bind_group: wgpu::BindGroup,
@@ -168,6 +184,15 @@ pub struct GpuState {
     mask_erase_stamp_pipeline: wgpu::RenderPipeline,
     /// Buffer de vertices del estampado de goma con forma (se reusa entre llamadas).
     erase_stamp_buf: DynBuffer,
+
+    // --- Cartas hologr aficas de la biblioteca (Home) ---
+    /// Pipeline que dibuja cada cuaderno como una "carta" con inclinacion 3D + holografico.
+    card_pipeline: wgpu::RenderPipeline,
+    /// Instancias de cartas a dibujar este frame (vacio = no se dibujan, p.ej. en Canvas).
+    card_inst: DynBuffer,
+    /// Uniform con el viewport (px) y la focal para la perspectiva del tilt.
+    card_view_buf: wgpu::Buffer,
+    card_view_bg: wgpu::BindGroup,
 }
 
 impl GpuState {
@@ -578,6 +603,53 @@ impl GpuState {
             cache: None,
         });
 
+        // --- Pipeline de CARTAS de la biblioteca (inclinacion 3D en perspectiva + holografico) ---
+        let card_view_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("card view buf"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let card_view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("card view bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let card_view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("card view bg"),
+            layout: &card_view_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: card_view_buf.as_entire_binding() }],
+        });
+        let card_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("card shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("card.wgsl").into()),
+        });
+        let card_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("card layout"),
+            bind_group_layouts: &[Some(&card_view_bgl)],
+            immediate_size: 0,
+        });
+        let card_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("card pipeline"),
+            layout: Some(&card_layout),
+            vertex: wgpu::VertexState { module: &card_shader, entry_point: Some("vs_main"), buffers: &[card_inst_layout()], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &card_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: SAMPLE_COUNT, mask: !0, alpha_to_coverage_enabled: false },
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Renderizador de egui (UI). Debe usar el MISMO numero de muestras MSAA
         // que nuestro render pass, porque dibuja en el mismo attachment.
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -623,6 +695,10 @@ impl GpuState {
             mask_erase_pipeline,
             mask_erase_stamp_pipeline,
             erase_stamp_buf: DynBuffer::new(),
+            card_pipeline,
+            card_inst: DynBuffer::new(),
+            card_view_buf,
+            card_view_bg,
         }
     }
 
@@ -665,6 +741,16 @@ impl GpuState {
 
     pub fn set_committed(&mut self, verts: &[Vertex]) {
         self.committed.upload(&self.device, &self.queue, verts);
+    }
+
+    /// Define las CARTAS de la biblioteca a dibujar este frame (vacio = ninguna, p.ej. en el
+    /// lienzo). Sube las instancias y actualiza el uniform de viewport/focal para el tilt 3D.
+    /// `vw`/`vh` deben estar en las MISMAS unidades que las posiciones de las cartas (las del
+    /// cursor / `camera.viewport`), para que coincidan con el hit-test del hover/clic.
+    pub fn set_cards(&mut self, cards: &[CardInstance], vw: f32, vh: f32) {
+        self.card_inst.upload(&self.device, &self.queue, cards);
+        let view: [f32; 4] = [vw.max(1.0), vh.max(1.0), 900.0, 0.0];
+        self.queue.write_buffer(&self.card_view_buf, 0, bytemuck::cast_slice(&view));
     }
 
     /// Anexa SOLO los vertices de un trazo recien confirmado al buffer committed (sin
@@ -1012,6 +1098,16 @@ impl GpuState {
             // Quitar el recorte antes de la UI (egui usa su propio scissor por elemento).
             if self.content_clip.is_some() {
                 rpass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+            }
+
+            // --- CARTAS de la biblioteca (Home): bajo la UI de egui (titulo/nombres) ---
+            if self.card_inst.len > 0 {
+                if let Some(b) = self.card_inst.buf.as_ref() {
+                    rpass.set_pipeline(&self.card_pipeline);
+                    rpass.set_bind_group(0, &self.card_view_bg, &[]);
+                    rpass.set_vertex_buffer(0, b.slice(..));
+                    rpass.draw(0..6, 0..self.card_inst.len);
+                }
             }
 
             // --- UI de egui encima ---
