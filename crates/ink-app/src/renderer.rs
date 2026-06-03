@@ -15,6 +15,13 @@ const BG: wgpu::Color = wgpu::Color { r: 0.965, g: 0.965, b: 0.975, a: 1.0 };
 /// Muestras de MSAA: 4x suaviza los bordes de los trazos sin costo notable.
 const SAMPLE_COUNT: u32 = 4;
 
+/// Mascara de borrado (goma raster). Textura R8 en espacio de mundo: 1 = visible,
+/// 0 = borrado. Los shaders de contenido multiplican el alfa por esta mascara, asi la
+/// goma borra a nivel de pixel. Cubre `MASK_WORLD` unidades de mundo centradas en el
+/// origen a `MASK_RES` px (1 texel = 1 unidad). R8 => barata en VRAM.
+const MASK_RES: u32 = 8192;
+const MASK_WORLD: f32 = 8192.0;
+
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
 
@@ -123,6 +130,22 @@ pub struct GpuState {
     /// Estampados del trazo en curso + su punta.
     active_stamps: DynBuffer,
     active_stamp_tip: Option<u32>,
+
+    // --- Mascara de borrado (goma raster) ---
+    /// Textura R8 (M) en espacio de mundo: el alfa del contenido se multiplica por ella.
+    mask_view: wgpu::TextureView,
+    /// Bind group para MUESTREAR M en los shaders de contenido (uniform + tex + sampler).
+    mask_sample_bg: wgpu::BindGroup,
+    /// Igual pero con una textura 1x1 blanca (M=1): para grid/trazo en curso (sin borrar).
+    white_sample_bg: wgpu::BindGroup,
+    /// Bind group para ESCRIBIR en M (uniform de parametros + de borrado).
+    mask_render_bg: wgpu::BindGroup,
+    /// Buffer de parametros de borrado (centro, radio, fuerza); se actualiza por trazo.
+    erase_params_buf: wgpu::Buffer,
+    /// Pipeline que resta un disco suave en M (goma).
+    mask_erase_pipeline: wgpu::RenderPipeline,
+    /// Pipeline que sube M bajo geometria de trazo nuevo (para no quedar borrado).
+    mask_restore_pipeline: wgpu::RenderPipeline,
 }
 
 impl GpuState {
@@ -210,6 +233,218 @@ impl GpuState {
             }],
         });
 
+        // ---------------- Mascara de borrado (goma raster) ----------------
+        let mask_min = -MASK_WORLD * 0.5;
+        let mask_params: [f32; 4] = [mask_min, mask_min, 1.0 / MASK_WORLD, 1.0 / MASK_WORLD];
+        let mask_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mask params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&mask_params_buf, 0, bytemuck::cast_slice(&mask_params));
+        let erase_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("erase params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("erase mask"),
+            size: wgpu::Extent3d { width: MASK_RES, height: MASK_RES, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Limpiar M a 1.0 (todo visible) con un render pass de clear.
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clear mask") });
+            enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear mask pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &mask_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            queue.submit(std::iter::once(enc.finish()));
+        }
+        // Textura 1x1 blanca (M=1) para grid/trazo en curso (no se borran).
+        let white_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("white mask"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &white_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mask sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // BGL para MUESTREAR M (en los shaders de contenido): uniform + textura + sampler.
+        let mask_sample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mask sample bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mask_sample_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask sample bg"),
+            layout: &mask_sample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: mask_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&mask_sampler) },
+            ],
+        });
+        let white_sample_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("white sample bg"),
+            layout: &mask_sample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: mask_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&white_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&mask_sampler) },
+            ],
+        });
+
+        // BGL para ESCRIBIR en M (parametros de mascara + de borrado).
+        let mask_render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mask render bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let mask_render_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask render bg"),
+            layout: &mask_render_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: mask_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: erase_params_buf.as_entire_binding() },
+            ],
+        });
+
+        // Pipelines que escriben en M (sin MSAA, target R8).
+        let mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mask shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("mask.wgsl").into()),
+        });
+        let mask_render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mask render layout"),
+            bind_group_layouts: &[Some(&mask_render_bgl)],
+            immediate_size: 0,
+        });
+        let mask_erase_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mask erase pipeline"),
+            layout: Some(&mask_render_layout),
+            vertex: wgpu::VertexState { module: &mask_shader, entry_point: Some("vs_erase"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &mask_shader,
+                entry_point: Some("fs_erase"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    // M_new = M_old * (1 - cov): resta cobertura del disco de la goma.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview_mask: None,
+            cache: None,
+        });
+        let mask_restore_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mask restore pipeline"),
+            layout: Some(&mask_render_layout),
+            vertex: wgpu::VertexState { module: &mask_shader, entry_point: Some("vs_restore"), buffers: &[vertex_layout()], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &mask_shader,
+                entry_point: Some("fs_restore"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    // M_new = max(M_old, alpha): sube la mascara bajo el trazo nuevo.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview_mask: None,
+            cache: None,
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ink shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -217,7 +452,7 @@ impl GpuState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ink pipeline layout"),
-            bind_group_layouts: &[Some(&camera_bgl)],
+            bind_group_layouts: &[Some(&camera_bgl), Some(&mask_sample_bgl)],
             immediate_size: 0,
         });
 
@@ -294,7 +529,7 @@ impl GpuState {
         });
         let stamp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("stamp pipeline layout"),
-            bind_group_layouts: &[Some(&camera_bgl), Some(&tip_bgl)],
+            bind_group_layouts: &[Some(&camera_bgl), Some(&tip_bgl), Some(&mask_sample_bgl)],
             immediate_size: 0,
         });
         let stamp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -370,6 +605,13 @@ impl GpuState {
             committed_stamps: HashMap::new(),
             active_stamps: DynBuffer::new(),
             active_stamp_tip: None,
+            mask_view,
+            mask_sample_bg,
+            white_sample_bg,
+            mask_render_bg,
+            erase_params_buf,
+            mask_erase_pipeline,
+            mask_restore_pipeline,
         }
     }
 
@@ -505,6 +747,106 @@ impl GpuState {
         buf.upload(&self.device, &self.queue, verts);
     }
 
+    // ---------------- Mascara de borrado (goma raster) ----------------
+
+    /// Mitad del lado de la region (en unidades de mundo) que cubre la mascara: el
+    /// borrado solo funciona dentro de `[-half, half]` en X e Y.
+    pub fn mask_world_half(&self) -> f32 {
+        MASK_WORLD * 0.5
+    }
+
+    /// Borra un DISCO suave en la mascara, en coordenadas de MUNDO. `strength` (0..1) es
+    /// la opacidad/fuerza de la goma. Resta cobertura de M (varias pasadas desvanecen).
+    pub fn erase_mask(&mut self, center: [f32; 2], radius: f32, strength: f32) {
+        let params: [f32; 4] = [center[0], center[1], radius.max(0.5), strength.clamp(0.0, 1.0)];
+        self.queue.write_buffer(&self.erase_params_buf, 0, bytemuck::cast_slice(&params));
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("erase mask enc") });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("erase mask pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.mask_erase_pipeline);
+            rp.set_bind_group(0, &self.mask_render_bg, &[]);
+            rp.draw(0..6, 0..1);
+        }
+        self.queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// Sube M (a 1) bajo la geometria `verts` de un trazo nuevo, para que el contenido
+    /// recien dibujado no aparezca borrado por borrados anteriores en esa zona.
+    pub fn restore_mask(&mut self, verts: &[Vertex]) {
+        if verts.is_empty() {
+            return;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(verts);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mask restore vbuf"),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytes);
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("restore mask enc") });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("restore mask pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.mask_restore_pipeline);
+            rp.set_bind_group(0, &self.mask_render_bg, &[]);
+            rp.set_vertex_buffer(0, buf.slice(..));
+            rp.draw(0..verts.len() as u32, 0..1);
+        }
+        self.queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// Restablece la mascara a 1.0 (todo visible): borra todos los borrados.
+    pub fn clear_mask(&mut self) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clear mask enc") });
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear mask pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.mask_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.queue.submit(std::iter::once(enc.finish()));
+    }
+
     pub fn render(
         &mut self,
         egui_primitives: &[egui::ClippedPrimitive],
@@ -573,18 +915,24 @@ impl GpuState {
             // --- Lienzo: rejilla (detras), luego nuestros trazos ---
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, &self.camera_bg, &[]);
+            // Rejilla: sin mascara de borrado (M=1).
+            rpass.set_bind_group(1, &self.white_sample_bg, &[]);
             if let Some(buf) = &self.grid.buf {
                 if self.grid.len > 0 {
                     rpass.set_vertex_buffer(0, buf.slice(..));
                     rpass.draw(0..self.grid.len, 0..1);
                 }
             }
+            // Trazos confirmados: SE aplican los borrados (mascara real).
+            rpass.set_bind_group(1, &self.mask_sample_bg, &[]);
             if let Some(buf) = &self.committed.buf {
                 if self.committed.len > 0 {
                     rpass.set_vertex_buffer(0, buf.slice(..));
                     rpass.draw(0..self.committed.len, 0..1);
                 }
             }
+            // Trazo en curso: sin mascara (se dibuja nitido mientras se traza).
+            rpass.set_bind_group(1, &self.white_sample_bg, &[]);
             if let Some(buf) = &self.active.buf {
                 if self.active.len > 0 {
                     rpass.set_vertex_buffer(0, buf.slice(..));
@@ -595,6 +943,8 @@ impl GpuState {
             // --- Estampados texturizados (pinceles estilo Photoshop) ---
             rpass.set_pipeline(&self.stamp_pipeline);
             rpass.set_bind_group(0, &self.camera_bg, &[]);
+            // Estampados confirmados: con mascara de borrado.
+            rpass.set_bind_group(2, &self.mask_sample_bg, &[]);
             for (tip_id, sbuf) in &self.committed_stamps {
                 if sbuf.len > 0 {
                     if let (Some(t), Some(b)) = (self.tips.get(tip_id), &sbuf.buf) {
@@ -604,6 +954,8 @@ impl GpuState {
                     }
                 }
             }
+            // Estampados en curso: sin mascara.
+            rpass.set_bind_group(2, &self.white_sample_bg, &[]);
             if let (Some(tip_id), Some(b)) = (self.active_stamp_tip, &self.active_stamps.buf) {
                 if self.active_stamps.len > 0 {
                     if let Some(t) = self.tips.get(&tip_id) {

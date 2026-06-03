@@ -58,15 +58,16 @@ enum DrawOp {
     Procedural,
     /// Un trazo de pincel de Photoshop: `count` vertices al final de ps_committed[tip].
     Ps { tip: u32, count: usize },
-    /// Un trazo de GOMA: los estampados que elimino, por punta (para restaurarlos).
-    Erase { removed: Vec<(u32, Vec<StampVertex>)> },
+    /// Un trazo de GOMA (raster): sus discos estan en `erase_strokes` (mismo orden).
+    EraseMask,
 }
 
 /// Operacion para rehacer (guarda lo necesario para reconstruir el trazo).
 enum RedoOp {
     Procedural,
     Ps { tip: u32, verts: Vec<StampVertex> },
-    Erase { removed: Vec<(u32, Vec<StampVertex>)> },
+    /// Un trazo de goma deshecho: sus discos [cx, cy, radio, fuerza] para re-aplicarlo.
+    EraseMask { discs: Vec<[f32; 4]> },
 }
 
 /// Configuracion persistente de un item de la rueda (lo que el usuario ajusta con los
@@ -158,9 +159,11 @@ struct App {
     /// Historial unificado de deshacer/rehacer (trazos procedurales + de pincel PS).
     undo_stack: Vec<DrawOp>,
     redo_stack: Vec<RedoOp>,
-    /// Estampados eliminados por la goma durante el trazo en curso (por punta), para
-    /// poder deshacer el borrado.
-    erase_removed: HashMap<u32, Vec<StampVertex>>,
+    /// Historial cronologico de trazos de GOMA (raster). Cada trazo = lista de discos
+    /// [cx, cy, radio, fuerza]. Sirve para reconstruir la mascara al deshacer/rehacer.
+    erase_strokes: Vec<Vec<[f32; 4]>>,
+    /// Discos del trazo de goma EN CURSO (se mueve a `erase_strokes` al terminar).
+    cur_erase: Vec<[f32; 4]>,
     /// Modo GOMA global: al dibujar se BORRA (con el tamano del pincel activo), sin
     /// importar que pincel/forma este seleccionado. Cambiar de pincel no lo desactiva.
     eraser_mode: bool,
@@ -232,7 +235,8 @@ impl App {
             ps_settings_map: HashMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            erase_removed: HashMap::new(),
+            erase_strokes: Vec::new(),
+            cur_erase: Vec::new(),
             eraser_mode: false,
             erasing: false,
             item_cfg: HashMap::new(),
@@ -390,8 +394,13 @@ impl App {
         self.drawing = false;
         if let Some(stroke) = self.active.take() {
             if !stroke.samples.is_empty() {
+                // Subir la mascara de borrado bajo este trazo nuevo: si se dibuja sobre una
+                // zona antes borrada, el trazo nuevo se ve completo (no heredada el borrado).
+                let mut mesh: Vec<Vertex> = Vec::new();
+                stroke.tessellate(&mut mesh);
                 self.doc.add_stroke(stroke);
                 if let Some(g) = self.gpu.as_mut() {
+                    g.restore_mask(&mesh);
                     g.set_committed(self.doc.committed_vertices());
                     g.set_active(&[]);
                 }
@@ -428,19 +437,12 @@ impl App {
                     self.redo_stack.push(RedoOp::Ps { tip, verts: removed });
                 }
             }
-            Some(DrawOp::Erase { removed }) => {
-                // Deshacer un borrado = restaurar los estampados eliminados.
-                for (tip, verts) in &removed {
-                    self.ps_committed.entry(*tip).or_default().extend_from_slice(verts);
+            Some(DrawOp::EraseMask) => {
+                // Deshacer un trazo de goma: quitarlo del historial y reconstruir M.
+                if let Some(discs) = self.erase_strokes.pop() {
+                    self.rebuild_mask();
+                    self.redo_stack.push(RedoOp::EraseMask { discs });
                 }
-                for (tip, _) in &removed {
-                    if let Some(v) = self.ps_committed.get(tip).cloned() {
-                        if let Some(g) = self.gpu.as_mut() {
-                            g.set_committed_stamps(*tip, &v);
-                        }
-                    }
-                }
-                self.redo_stack.push(RedoOp::Erase { removed });
             }
             None => {}
         }
@@ -464,22 +466,11 @@ impl App {
                 }
                 self.undo_stack.push(DrawOp::Ps { tip, count });
             }
-            Some(RedoOp::Erase { removed }) => {
-                // Rehacer un borrado = volver a quitar los estampados restaurados.
-                for (tip, verts) in &removed {
-                    if let Some(v) = self.ps_committed.get_mut(tip) {
-                        let at = v.len().saturating_sub(verts.len());
-                        v.truncate(at);
-                    }
-                }
-                for (tip, _) in &removed {
-                    if let Some(v) = self.ps_committed.get(tip).cloned() {
-                        if let Some(g) = self.gpu.as_mut() {
-                            g.set_committed_stamps(*tip, &v);
-                        }
-                    }
-                }
-                self.undo_stack.push(DrawOp::Erase { removed });
+            Some(RedoOp::EraseMask { discs }) => {
+                // Rehacer un borrado = volver a aplicar ese trazo de goma y reconstruir M.
+                self.erase_strokes.push(discs);
+                self.rebuild_mask();
+                self.undo_stack.push(DrawOp::EraseMask);
             }
             None => {}
         }
@@ -698,64 +689,6 @@ impl App {
         [self.brush.color[0], self.brush.color[1], self.brush.color[2]]
     }
 
-    /// Goma: ELIMINA los estampados y trazos bajo un disco de radio `radius` (no pinta
-    /// encima). No toca la cuadricula (es geometria aparte) y deja el area redibujable.
-    /// Acumula lo eliminado en `erase_removed` para poder deshacer.
-    fn erase_at(&mut self, center: Vec2, radius: f32, strength: f32) {
-        // Trazos procedurales: borrado por ZONA con perfil suave (alfa por-muestra).
-        if self.doc.erase_region(center, radius, strength) {
-            self.sync_committed();
-        }
-        // Estampados PS bajo la goma: atenuar el alfa de cada quad con el MISMO perfil
-        // suave por distancia (AA); si queda casi invisible, se elimina. No fragmenta.
-        let inner = radius * 0.6;
-        let denom = (radius - inner).max(1e-3);
-        let mut changed: Vec<u32> = Vec::new();
-        for (tip, verts) in self.ps_committed.iter_mut() {
-            let mut keep: Vec<StampVertex> = Vec::with_capacity(verts.len());
-            let mut removed_any = false;
-            for chunk in verts.chunks(6) {
-                if chunk.len() < 6 {
-                    keep.extend_from_slice(chunk);
-                    continue;
-                }
-                let cx = chunk.iter().map(|v| v.pos[0]).sum::<f32>() / 6.0;
-                let cy = chunk.iter().map(|v| v.pos[1]).sum::<f32>() / 6.0;
-                let d = ((cx - center.x).powi(2) + (cy - center.y).powi(2)).sqrt();
-                if d >= radius {
-                    keep.extend_from_slice(chunk);
-                    continue;
-                }
-                let t = ((radius - d) / denom).clamp(0.0, 1.0);
-                let f = t * t * (3.0 - 2.0 * t);
-                let factor = (strength * f).min(1.0);
-                let na = chunk[0].color[3] * (1.0 - factor);
-                if na < 0.02 {
-                    removed_any = true;
-                    self.erase_removed.entry(*tip).or_default().extend_from_slice(chunk);
-                } else {
-                    let mut q: [StampVertex; 6] = [chunk[0]; 6];
-                    q.copy_from_slice(chunk);
-                    for v in q.iter_mut() {
-                        v.color[3] = na;
-                    }
-                    keep.extend_from_slice(&q);
-                    removed_any = true;
-                }
-            }
-            if removed_any {
-                *verts = keep;
-                changed.push(*tip);
-            }
-        }
-        for tip in changed {
-            let v = self.ps_committed[&tip].clone();
-            if let Some(g) = self.gpu.as_mut() {
-                g.set_committed_stamps(tip, &v);
-            }
-        }
-    }
-
     /// Radio de borrado de la goma (medio diametro del pincel/tamano activo).
     fn eraser_radius(&self) -> f32 {
         (self.brush.width * 0.5).max(2.0)
@@ -766,40 +699,74 @@ impl App {
         self.brush.opacity.clamp(0.05, 1.0)
     }
 
-    /// Inicia un trazo de GOMA (modo borrador global).
-    fn start_erase(&mut self) {
-        self.erasing = true;
-        self.erase_removed.clear();
-        self.last_sample_pos = self.camera.screen_to_world(self.cursor);
+    /// Borra un disco en la MASCARA raster (en `world`), a nivel de pixel: la goma quita
+    /// exactamente su area/forma/opacidad, sin importar el grosor del trazo de debajo.
+    /// Acumula el disco en `cur_erase` para poder deshacer el trazo de goma.
+    fn erase_mask_at(&mut self, world: Vec2) {
         let r = self.eraser_radius();
         let st = self.eraser_strength();
-        self.erase_at(self.last_sample_pos, r, st);
+        self.cur_erase.push([world.x, world.y, r, st]);
+        if let Some(g) = self.gpu.as_mut() {
+            g.erase_mask([world.x, world.y], r, st);
+        }
+    }
+
+    /// Inicia un trazo de GOMA (borrado raster por pixeles).
+    fn start_erase(&mut self) {
+        self.erasing = true;
+        self.cur_erase.clear();
+        self.last_sample_pos = self.camera.screen_to_world(self.cursor);
+        self.erase_mask_at(self.last_sample_pos);
     }
 
     /// Continua el borrado en `world` (interpola para no dejar huecos al mover rapido).
     fn do_erase(&mut self, world: Vec2) {
         let r = self.eraser_radius();
-        let st = self.eraser_strength();
-        // Interpolar entre el ultimo punto y el actual (pasos ~ medio radio).
+        // Pasos finos (~0.4 r) para que los discos solapen y el borrado sea continuo.
         let from = self.last_sample_pos;
         let seg = world - from;
         let len = seg.length();
-        let step = (r * 0.5).max(1.0);
+        let step = (r * 0.4).max(0.75);
         let n = (len / step).ceil().max(1.0) as usize;
         for i in 1..=n {
             let p = from + seg * (i as f32 / n as f32);
-            self.erase_at(p, r, st);
+            self.erase_mask_at(p);
         }
         self.last_sample_pos = world;
     }
 
-    /// Finaliza el trazo de goma: registra lo borrado para poder deshacer.
+    /// Finaliza el trazo de goma: lo registra en el historial para poder deshacerlo.
     fn finish_erase(&mut self) {
         self.erasing = false;
-        if !self.erase_removed.is_empty() {
-            let removed: Vec<(u32, Vec<StampVertex>)> = self.erase_removed.drain().collect();
-            self.undo_stack.push(DrawOp::Erase { removed });
+        if !self.cur_erase.is_empty() {
+            let discs = std::mem::take(&mut self.cur_erase);
+            self.erase_strokes.push(discs);
+            self.undo_stack.push(DrawOp::EraseMask);
             self.redo_stack.clear();
+        }
+    }
+
+    /// Reconstruye la mascara de borrado desde cero: limpia, sube M bajo TODO el
+    /// contenido actual (trazos + estampados) y re-aplica los trazos de goma en orden.
+    /// Se usa al deshacer/rehacer un borrado.
+    fn rebuild_mask(&mut self) {
+        let content: Vec<Vertex> = self.doc.committed_vertices().to_vec();
+        let mut ps_verts: Vec<Vertex> = Vec::new();
+        for verts in self.ps_committed.values() {
+            for s in verts {
+                ps_verts.push(Vertex { pos: s.pos, color: [0.0, 0.0, 0.0, s.color[3]] });
+            }
+        }
+        let strokes = self.erase_strokes.clone();
+        if let Some(g) = self.gpu.as_mut() {
+            g.clear_mask();
+            g.restore_mask(&content);
+            g.restore_mask(&ps_verts);
+            for stroke in &strokes {
+                for d in stroke {
+                    g.erase_mask([d[0], d[1]], d[2], d[3]);
+                }
+            }
         }
     }
 
@@ -1788,7 +1755,10 @@ impl ApplicationHandler for App {
                         for t in tips {
                             g.set_committed_stamps(t, &[]);
                         }
+                        g.clear_mask(); // quitar todos los borrados de la goma
                     }
+                    self.erase_strokes.clear();
+                    self.cur_erase.clear();
                     self.undo_stack.clear();
                     self.redo_stack.clear();
                     self.sync_committed();
