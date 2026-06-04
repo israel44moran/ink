@@ -921,11 +921,16 @@ impl App {
     /// abre al momento para escribir. En la biblioteca, su `finish` >= 500 la dibuja como hoja.
     fn new_quick_note(&mut self) {
         let name = quick_note_name();
-        // La carátula refleja el papel actual: 500=rayas, 501=cuadrícula, 502=puntos.
+        // La carátula refleja el papel REAL de la nota (la cuadrícula activa):
+        // 500=rayas, 501=milimetrado, 502=puntos, 503=blanca (sin cuadrícula), 504=iso, 505=triángulo.
         let finish = match self.settings.grid {
+            ink_core::GridKind::Lines => 500,
             ink_core::GridKind::Squares => 501,
             ink_core::GridKind::Dots => 502,
-            _ => 500,
+            ink_core::GridKind::None => 503,
+            ink_core::GridKind::Iso => 504,
+            ink_core::GridKind::Triangle => 505,
+            _ => 503, // P1/P2/P3 (guías de perspectiva): hoja blanca
         };
         let mut nb = notebook::NotebookData::new(&name, false, finish);
         nb.fx = 0;
@@ -1288,7 +1293,18 @@ impl App {
             let dragged = self.dragging && self.drag_idx == Some(i);
             let center = if dragged { cur } else { *c };
             let flip = self.card_flip.get(i).copied().unwrap_or(0.0); // rueda = voltear (ver reverso)
-            let (rotx, roty, hov) = if dragged { (0.0, flip, 1.0) } else { (a[1], a[2] + flip, a[0]) };
+            let nb = self.notebooks.get(i);
+            let finish = nb.map_or(1, |n| n.finish);
+            let is_sheet = finish >= 500; // nota rapida = HOJA plana
+            // Las HOJAS van planas DE FRENTE (sin giro/inclinacion del estante) para no verse
+            // "arrugadas"; los cuadernos si toman su pose 3D del estante.
+            let (rotx, roty, hov) = if dragged {
+                (0.0, flip, 1.0)
+            } else if is_sheet {
+                (0.0, flip, a[0])
+            } else {
+                (a[1], a[2] + flip, a[0])
+            };
             // El "puntero" del efecto solo sigue al cursor segun el HOVER: si el cursor no esta
             // sobre la carta (p.ej. en la fila de abajo, misma columna), queda neutro (0.5) y la
             // portada no reacciona. Mezclado por `hov` -> transicion suave.
@@ -1296,16 +1312,13 @@ impl App {
             let cr_y = ((cur.y - (center.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
             let ptr_x = 0.5 + (cr_x - 0.5) * hov;
             let ptr_y = 0.5 + (cr_y - 0.5) * hov;
-            let nb = self.notebooks.get(i);
-            let finish = nb.map_or(1, |n| n.finish);
             let fx = nb.map_or(0, |n| n.fx);
             let inten = nb.map_or(1.0, |n| n.fx_intensity);
             let accent = nb.map_or(0, |n| n.accent);
-            // Nota rapida (finish >= 500): se dibuja como HOJA plana (sin grosor de cuaderno).
-            let is_sheet = finish >= 500;
             let shape = if is_sheet { 4 } else { nb.map_or(0, |n| n.shape) };
             let (df, ohf, bf) = shape_params(shape);
-            let depth = if is_sheet { 0.02 } else { df * nb.map_or(1.0, |n| n.thickness) };
+            // Hoja: muy fina (papel); cuaderno: grosor segun su forma.
+            let depth = if is_sheet { 0.012 } else { df * nb.map_or(1.0, |n| n.thickness) };
             let overh = if is_sheet { 0.0 } else { ohf * nb.map_or(1.0, |n| n.overhang) };
             let base = finish_base_color(finish);
             let ac = accent_color(accent);
@@ -1314,9 +1327,16 @@ impl App {
             // indice) para que no floten todos sincronizados. Se desvanece con `hov`.
             let t = self.clock;
             let ph = i as f32 * 1.7;
-            let rotx = rotx + (t * 1.5 + ph).sin() * 0.055 * hov;
-            let roty = roty + (t * 1.2 + ph * 1.3).cos() * 0.065 * hov;
-            let cy = center.y - (t * 1.3 + ph).sin() * 11.0 * hov;
+            // Las hojas NO giran (se mantienen planas); solo un leve sube/baja al pasar el cursor.
+            let (rotx, roty) = if is_sheet {
+                (rotx, roty)
+            } else {
+                (
+                    rotx + (t * 1.5 + ph).sin() * 0.055 * hov,
+                    roty + (t * 1.2 + ph * 1.3).cos() * 0.065 * hov,
+                )
+            };
+            let cy = center.y - (t * 1.3 + ph).sin() * (if is_sheet { 4.0 } else { 11.0 }) * hov;
             cards.push([
                 center.x, cy, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
                 base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
@@ -4040,7 +4060,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
-        f if f >= 500 => [0.95, 0.94, 0.90], // Nota rapida (hoja de papel): crema claro
+        f if f >= 500 => [0.97, 0.97, 0.95], // Nota rapida (hoja de papel): casi blanco
         f if f >= 400 => [0.02, 0.02, 0.04], // Arcade y demos: fondo oscuro
         f if f >= 300 => [0.04, 0.04, 0.06], // Cargadores 3D: fondo oscuro
         f if f >= 200 => [0.02, 0.02, 0.05], // Escenas 3D: espacio oscuro

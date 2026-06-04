@@ -751,6 +751,15 @@ fn arcade(id: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, aspect: f32, accent: vec
 }
 
 // Color de la PORTADA (cara frontal) del cuaderno: el diseño/animacion elegido + capas.
+// Lineas paralelas a un angulo `ang` para los papeles iso/triangular. `n` = celdas de ancho;
+// se corrige por `asp` (alto/ancho) para que las celdas salgan casi cuadradas.
+fn paper_dir(uv: vec2<f32>, asp: f32, ang: f32, n: f32) -> f32 {
+    let c = vec2<f32>(uv.x * n, uv.y * n * asp);
+    let d = vec2<f32>(cos(ang), sin(ang));
+    let proj = dot(c, d);
+    return smoothstep(0.45, 0.5, abs(fract(proj) - 0.5));
+}
+
 fn cover_color(in: VsOut) -> vec3<f32> {
     let h = in.hover;
     let t = in.time;
@@ -763,10 +772,11 @@ fn cover_color(in: VsOut) -> vec3<f32> {
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
     if (fin >= 500) {
-        // ---------------- NOTA RAPIDA: hoja de papel (rayas / cuadricula / puntos) ----------------
-        let kind = fin - 500; // 0 = rayas, 1 = cuadricula, 2 = puntos
-        let paper = vec3<f32>(0.95, 0.94, 0.90);
-        let ink = vec3<f32>(0.55, 0.64, 0.78); // azul claro de cuaderno
+        // ---------------- NOTA RAPIDA: hoja de papel que refleja la cuadricula REAL ----------------
+        // kind: 0 rayas, 1 milimetrado, 2 puntos, 3 blanca (sin cuadricula), 4 iso, 5 triangular.
+        let kind = fin - 500;
+        let paper = vec3<f32>(0.97, 0.97, 0.95); // casi blanco
+        let ink = vec3<f32>(0.55, 0.64, 0.78);   // azul claro de cuaderno
         col = paper;
         let rows = 13.0;
         if (kind == 0 || kind == 1) {
@@ -775,7 +785,7 @@ fn cover_color(in: VsOut) -> vec3<f32> {
             col = mix(col, ink, smoothstep(0.45, 0.5, dy) * 0.55);
         }
         if (kind == 1) {
-            // verticales (cuadricula); ~9 columnas para que salgan casi cuadradas
+            // verticales (milimetrado); ~9 columnas para que salgan casi cuadradas
             let dx = abs(fract(in.uv.x * 9.0) - 0.5);
             col = mix(col, ink, smoothstep(0.45, 0.5, dx) * 0.55);
         }
@@ -784,10 +794,21 @@ fn cover_color(in: VsOut) -> vec3<f32> {
             let f = fract(in.uv * vec2<f32>(9.0, rows)) - vec2<f32>(0.5, 0.5);
             col = mix(col, ink, smoothstep(0.18, 0.10, length(f)) * 0.6);
         }
+        if (kind == 4) {
+            // isometrica: lineas a +30, -30 y verticales
+            let l = max(max(paper_dir(in.uv, in.aspect, 0.5236, 9.0), paper_dir(in.uv, in.aspect, -0.5236, 9.0)), paper_dir(in.uv, in.aspect, 1.5708, 9.0));
+            col = mix(col, ink, l * 0.5);
+        }
+        if (kind == 5) {
+            // triangular: tres direcciones (0, +60, -60 grados)
+            let l = max(max(paper_dir(in.uv, in.aspect, 0.0, 9.0), paper_dir(in.uv, in.aspect, 1.0472, 9.0)), paper_dir(in.uv, in.aspect, -1.0472, 9.0));
+            col = mix(col, ink, l * 0.5);
+        }
         if (kind == 0 || kind == 1) {
             // margen rojo a la izquierda (estilo cuaderno)
             col = mix(col, vec3<f32>(0.86, 0.45, 0.45), smoothstep(0.012, 0.005, abs(in.uv.x - 0.12)) * 0.55);
         }
+        // kind == 3 (blanca): sin patron, queda el papel casi blanco.
     } else if (fin >= 400) {
         // ---------------- ARCADE Y DEMOS (retrowave / arcade / generativas) ----------------
         var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
@@ -910,7 +931,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (face == 0) {
             col = cover_color(in);
         } else {
-            col = vec3<f32>(0.90, 0.89, 0.85);
+            col = vec3<f32>(0.93, 0.93, 0.91);
         }
         var shs = 1.0;
         if (face == 5) { shs = 0.9; } else if (face == 4) { shs = 1.05; }
