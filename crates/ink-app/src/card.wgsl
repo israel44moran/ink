@@ -210,6 +210,124 @@ fn loader_cov(id: i32, p: vec2<f32>, t: f32) -> f32 {
     return clamp(cov, 0.0, 1.0);
 }
 
+// --- ESCENAS 3D: campo de estrellas, sistema solar y atractores extraños ---
+
+// Campo de estrellas tenue que titila.
+fn star_field(uv: vec2<f32>, t: f32) -> f32 {
+    let g = uv * vec2<f32>(64.0, 90.0);
+    let cell = floor(g);
+    let f = fract(g) - vec2<f32>(0.5);
+    let rnd = hash21(cell);
+    let d = length(f);
+    let tw = 0.6 + 0.4 * sin(t * 2.0 + rnd * 40.0);
+    return smoothstep(0.10, 0.0, d) * step(0.90, rnd) * tw;
+}
+
+fn planet_color(i: i32) -> vec3<f32> {
+    if (i == 0) { return vec3<f32>(0.72, 0.62, 0.50); }      // rocoso
+    else if (i == 1) { return vec3<f32>(0.40, 0.62, 1.00); } // oceanico
+    else if (i == 2) { return vec3<f32>(0.92, 0.42, 0.22); } // rojo
+    else if (i == 3) { return vec3<f32>(0.86, 0.76, 0.52); } // gaseoso (anillos)
+    else { return vec3<f32>(0.50, 0.86, 0.86); }             // helado
+}
+
+// Sistema solar 3D: sol central + planetas en orbitas inclinadas (con test de
+// profundidad para que pasen por delante/detras del sol), sobre estrellas.
+fn solar(p: vec2<f32>, uv: vec2<f32>, t: f32) -> vec3<f32> {
+    var col = vec3<f32>(0.01, 0.01, 0.03) + vec3<f32>(star_field(uv, t));
+    let tilt = 0.46;
+    let st = sin(tilt); let ct = cos(tilt);
+    // Sol: resplandor + nucleo.
+    let sd = length(p);
+    col = col + vec3<f32>(1.0, 0.80, 0.35) * exp(-sd * 4.0) * 0.75;
+    var zbuf = -100.0;
+    let suncore = smoothstep(0.17, 0.13, sd);
+    if (suncore > 0.0) {
+        col = mix(col, vec3<f32>(1.0, 0.92, 0.55), suncore);
+        zbuf = 0.0;
+    }
+    for (var i: i32 = 0; i < 5; i = i + 1) {
+        let fi = f32(i);
+        let r = 0.30 + fi * 0.135;
+        let spd = 0.7 / pow(r, 1.5);              // mas lentos los exteriores (Kepler)
+        let a = t * spd + fi * 1.7;
+        let ox = cos(a) * r;
+        let oz = sin(a) * r;
+        let center2 = vec2<f32>(ox, -oz * st);     // proyeccion del plano inclinado
+        let depth = oz * ct;                        // +depth = mas cerca del observador
+        let persp = 1.0 / (1.0 - depth * 0.22);
+        let c2 = center2 * persp;
+        let pr = (0.05 + fi * 0.006) * persp;
+        let pd = length(p - c2);
+        let pc = smoothstep(pr, pr * 0.6, pd);
+        if (pc > 0.0 && depth > zbuf) {
+            let off = normalize(p - c2 + vec2<f32>(0.0001, 0.0001));
+            let sundir = normalize(-c2 + vec2<f32>(0.0001, 0.0001));
+            let lit = clamp(0.30 + 0.75 * dot(off, sundir), 0.22, 1.05);
+            col = mix(col, planet_color(i) * lit, pc);
+            zbuf = depth;
+        }
+    }
+    return col;
+}
+
+// Derivada (campo vectorial) de cada atractor extraño.
+fn attractor_deriv(id: i32, s: vec3<f32>) -> vec3<f32> {
+    if (id == 0) {
+        // Lorenz
+        return vec3<f32>(10.0 * (s.y - s.x), s.x * (28.0 - s.z) - s.y, s.x * s.y - 2.6667 * s.z);
+    } else if (id == 1) {
+        // Aizawa
+        let a = 0.95; let b = 0.7; let c = 0.6; let d = 3.5; let e = 0.25; let f = 0.1;
+        return vec3<f32>(
+            (s.z - b) * s.x - d * s.y,
+            d * s.x + (s.z - b) * s.y,
+            c + a * s.z - s.z * s.z * s.z / 3.0 - (s.x * s.x + s.y * s.y) * (1.0 + e * s.z) + f * s.z * s.x * s.x * s.x
+        );
+    } else if (id == 2) {
+        // Halvorsen
+        let a = 1.89;
+        return vec3<f32>(
+            -a * s.x - 4.0 * s.y - 4.0 * s.z - s.y * s.y,
+            -a * s.y - 4.0 * s.z - 4.0 * s.x - s.z * s.z,
+            -a * s.z - 4.0 * s.x - 4.0 * s.y - s.x * s.x
+        );
+    } else if (id == 3) {
+        // Thomas
+        let b = 0.19;
+        return vec3<f32>(sin(s.y) - b * s.x, sin(s.z) - b * s.y, sin(s.x) - b * s.z);
+    }
+    // Rössler
+    let a = 0.2; let b = 0.2; let c = 5.7;
+    return vec3<f32>(-s.y - s.z, s.x + a * s.y, b + s.z * (s.x - c));
+}
+
+// Dibuja un atractor extraño (integrando su ODE en cada pixel y acumulando brillo por
+// cercania a la trayectoria) girando lentamente, en el color de acento.
+fn attractor_scene(aid: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.02, 0.02, 0.05) + vec3<f32>(star_field(uv, t)) * 0.5;
+    var s = vec3<f32>(0.1, 0.0, 0.0);
+    var dt = 0.005; var scale = 0.045; var center = vec3<f32>(0.0, 0.0, 25.0);
+    if (aid == 1) { s = vec3<f32>(0.1, 0.0, 0.0); dt = 0.01; scale = 0.62; center = vec3<f32>(0.0, 0.0, 0.0); }
+    else if (aid == 2) { s = vec3<f32>(-1.0, 0.0, 0.0); dt = 0.005; scale = 0.085; center = vec3<f32>(-2.0, -2.0, -2.0); }
+    else if (aid == 3) { s = vec3<f32>(0.5, 0.1, 0.0); dt = 0.04; scale = 0.22; center = vec3<f32>(0.0, 0.0, 0.0); }
+    else if (aid == 4) { s = vec3<f32>(0.1, 0.0, 0.0); dt = 0.025; scale = 0.075; center = vec3<f32>(0.0, 0.0, 6.0); }
+    // Calentamiento: entrar en el atractor (descartar el transitorio).
+    for (var w: i32 = 0; w < 60; w = w + 1) { s = s + attractor_deriv(aid, s) * dt; }
+    let ang = t * 0.3;
+    let ca = cos(ang); let sa = sin(ang);
+    var glow = 0.0;
+    for (var i: i32 = 0; i < 240; i = i + 1) {
+        s = s + attractor_deriv(aid, s) * dt;
+        let q = (s - center) * scale;
+        let x2 = q.x * ca + q.z * sa;     // giro lento alrededor de Y
+        let proj = vec2<f32>(x2, q.y);
+        let dd = dot(p - proj, p - proj);
+        glow += 0.00006 / (dd + 0.0008);
+    }
+    return col + accent * glow;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Esquinas redondeadas (SDF) con borde suave (alfa).
@@ -231,7 +349,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let gd = distance(in.uv, in.pointer);
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
-    if (fin >= 100) {
+    if (fin >= 200) {
+        // ---------------- ESCENAS 3D: sistema solar / atractores ----------------
+        var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
+        p.y = p.y * in.aspect;
+        if (fin == 200) {
+            col = solar(p, in.uv, t);
+        } else {
+            col = attractor_scene(fin - 210, p, in.uv, t, in.accent);
+        }
+    } else if (fin >= 100) {
         // ---------------- CARGADOR ORGANICO (B&N / acento) animado ----------------
         var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
         p.y = p.y * in.aspect;

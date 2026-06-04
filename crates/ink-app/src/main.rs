@@ -112,7 +112,7 @@ fn slot_key(slot: ui::SlotItem) -> Option<(u8, u32)> {
         _ => None,
     }
 }
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Force, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -282,6 +282,8 @@ struct App {
     new_nb_accent: u32,
     /// Panel de creación abierto (vista previa + opciones de carátula).
     creating_nb: bool,
+    /// Si se está EDITANDO la carátula de un cuaderno ya creado, su ruta (None = crear nuevo).
+    editing_nb: Option<PathBuf>,
     /// Reloj de animación (segundos acumulados) para las cartas.
     clock: f32,
     // --- Cartas hologr aficas de la biblioteca (Home) ---
@@ -380,6 +382,7 @@ impl App {
             new_nb_intensity: 1.0,
             new_nb_accent: 0,
             creating_nb: false,
+            editing_nb: None,
             clock: 0.0,
             card_anim: Vec::new(),
             card_rects: Vec::new(),
@@ -868,6 +871,7 @@ impl App {
         self.card_scroll = 0.0;
         self.card_anim.clear();
         self.creating_nb = false;
+        self.editing_nb = None;
     }
 
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
@@ -942,6 +946,47 @@ impl App {
                 }
                 return;
             }
+        }
+    }
+
+    /// Indice de la carta bajo el cursor (None si ninguna). Sin distinguir la papelera.
+    fn library_card_at(&self) -> Option<usize> {
+        let cur = self.cursor;
+        self.card_rects
+            .iter()
+            .position(|&(cx, cy, hx, hy)| (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy)
+    }
+
+    /// Abre el panel para EDITAR la carátula del cuaderno `i` (clic derecho): carga sus
+    /// valores actuales y entra en modo edición.
+    fn start_edit_cover(&mut self, i: usize) {
+        if let Some(nb) = self.notebooks.get(i) {
+            self.new_nb_finish = nb.finish;
+            self.new_nb_fx = nb.fx;
+            self.new_nb_intensity = nb.fx_intensity;
+            self.new_nb_accent = nb.accent;
+            self.editing_nb = Some(nb.path.clone());
+            self.creating_nb = true;
+        }
+    }
+
+    /// Guarda SOLO la carátula (diseño + capas) en un cuaderno ya existente, sin tocar sus
+    /// paginas, y refresca la biblioteca.
+    fn save_cover_edit(&mut self, path: &Path) {
+        if let Some(mut nb) = notebook::load(path) {
+            nb.finish = self.new_nb_finish;
+            nb.fx = self.new_nb_fx;
+            nb.fx_intensity = self.new_nb_intensity;
+            nb.accent = self.new_nb_accent;
+            let _ = notebook::save(&nb, path);
+        }
+        self.notebooks = notebook::list();
+        // Si la carta editada esta abierta, conservar tambien en memoria.
+        if self.current_path.as_deref() == Some(path) {
+            self.current_finish = self.new_nb_finish;
+            self.current_fx = self.new_nb_fx;
+            self.current_intensity = self.new_nb_intensity;
+            self.current_accent = self.new_nb_accent;
         }
     }
 
@@ -2171,10 +2216,19 @@ impl ApplicationHandler for App {
                 // derecho): abre/cierra "Ajustes del pincel" JUSTO en el puntero.
                 MouseButton::Right => {
                     if state == ElementState::Pressed {
-                        self.ui.show_brush_settings = !self.ui.show_brush_settings;
-                        if self.ui.show_brush_settings {
-                            let ppp = self.egui_ctx.pixels_per_point().max(0.01);
-                            self.ui.brush_settings_pos = egui::pos2(self.cursor.x / ppp, self.cursor.y / ppp);
+                        if self.app_mode == AppMode::Library {
+                            // Clic derecho sobre una carta = volver a EDITAR su carátula.
+                            if !egui_consumed && !self.creating_nb {
+                                if let Some(i) = self.library_card_at() {
+                                    self.start_edit_cover(i);
+                                }
+                            }
+                        } else {
+                            self.ui.show_brush_settings = !self.ui.show_brush_settings;
+                            if self.ui.show_brush_settings {
+                                let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+                                self.ui.brush_settings_pos = egui::pos2(self.cursor.x / ppp, self.cursor.y / ppp);
+                            }
                         }
                     }
                 }
@@ -2514,6 +2568,7 @@ impl ApplicationHandler for App {
                 let mut lib_open: Option<PathBuf> = None;
                 let mut lib_delete: Option<PathBuf> = None;
                 let mut lib_create = false;
+                let mut lib_save_cover = false;
                 let mut lib_open_new = false;
                 let mut lib_cancel_new = false;
                 let mut lib_go = false;
@@ -2674,29 +2729,34 @@ impl ApplicationHandler for App {
                         // dibuja wgpu a la izquierda; aqui van las opciones de la carátula.
                         if self.creating_nb {
                             let gray = egui::Color32::from_gray(180);
-                            egui::Window::new(egui::RichText::new("Nueva carátula").strong())
+                            let editing = self.editing_nb.is_some();
+                            let title = if editing { "Editar carátula" } else { "Nueva carátula" };
+                            egui::Window::new(egui::RichText::new(title).strong())
                                 .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-48.0, 0.0))
                                 .collapsible(false)
                                 .resizable(false)
                                 .default_width(380.0)
                                 .show(ctx, |ui| {
                                     ui.add_space(2.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label("Nombre:");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.new_nb_name)
-                                                .hint_text("Mi cuaderno")
-                                                .desired_width(240.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.selectable_value(&mut self.new_nb_infinite, true, "Lienzo infinito");
-                                        ui.selectable_value(&mut self.new_nb_infinite, false, "Cuaderno de hojas");
-                                    });
-                                    ui.add_space(6.0);
-                                    ui.separator();
+                                    // Nombre y tipo: solo al CREAR (al editar no se renombra ni cambia el tipo).
+                                    if !editing {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Nombre:");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.new_nb_name)
+                                                    .hint_text("Mi cuaderno")
+                                                    .desired_width(240.0),
+                                            );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.selectable_value(&mut self.new_nb_infinite, true, "Lienzo infinito");
+                                            ui.selectable_value(&mut self.new_nb_infinite, false, "Cuaderno de hojas");
+                                        });
+                                        ui.add_space(6.0);
+                                        ui.separator();
+                                    }
                                     ui.label(egui::RichText::new("Diseño base").strong());
-                                    egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, false]).show(ui, |ui| {
+                                    egui::ScrollArea::vertical().max_height(240.0).auto_shrink([false, false]).show(ui, |ui| {
                                         ui.label(egui::RichText::new("Foil").color(gray));
                                         ui.horizontal_wrapped(|ui| {
                                             for (id, name) in FOIL_DESIGNS {
@@ -2709,6 +2769,15 @@ impl ApplicationHandler for App {
                                         ui.label(egui::RichText::new("Cargadores animados").color(gray));
                                         ui.horizontal_wrapped(|ui| {
                                             for (id, name) in LOADER_DESIGNS {
+                                                if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
+                                                    self.new_nb_finish = id;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("Escenas 3D").color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (id, name) in SCENE_DESIGNS {
                                                 if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
                                                     self.new_nb_finish = id;
                                                 }
@@ -2737,8 +2806,9 @@ impl ApplicationHandler for App {
                                     });
                                     ui.add_space(10.0);
                                     ui.horizontal(|ui| {
-                                        if ui.button(egui::RichText::new("Crear").strong()).clicked() {
-                                            lib_create = true;
+                                        let confirm = if editing { "Guardar" } else { "Crear" };
+                                        if ui.button(egui::RichText::new(confirm).strong()).clicked() {
+                                            if editing { lib_save_cover = true; } else { lib_create = true; }
                                         }
                                         if ui.button("Cancelar").clicked() {
                                             lib_cancel_new = true;
@@ -2760,9 +2830,17 @@ impl ApplicationHandler for App {
                     self.open_notebook(p);
                 }
                 if lib_open_new {
+                    self.editing_nb = None;
                     self.creating_nb = true;
                 }
                 if lib_cancel_new {
+                    self.creating_nb = false;
+                    self.editing_nb = None;
+                }
+                if lib_save_cover {
+                    if let Some(path) = self.editing_nb.take() {
+                        self.save_cover_edit(&path);
+                    }
                     self.creating_nb = false;
                 }
                 if lib_create {
@@ -2777,6 +2855,7 @@ impl ApplicationHandler for App {
                     );
                     self.new_nb_name.clear();
                     self.creating_nb = false;
+                    self.editing_nb = None;
                 }
                 if let Some(p) = lib_delete {
                     notebook::delete(&p);
@@ -3085,6 +3164,13 @@ const LOADER_DESIGNS: [(u32, &str); 12] = [
     (110, "Gusano"), (111, "Lava"),
 ];
 
+/// Escenas 3D animadas (id >= 200): sistema solar y atractores extraños (el color de los
+/// atractores usa el Acento elegido).
+const SCENE_DESIGNS: [(u32, &str); 6] = [
+    (200, "Sistema solar"), (210, "Lorenz"), (211, "Aizawa"), (212, "Halvorsen"),
+    (213, "Thomas"), (214, "Rössler"),
+];
+
 /// Capas COMBINABLES (bit, nombre).
 const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4, "Resplandor")];
 
@@ -3105,6 +3191,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if f >= 200 => [0.02, 0.02, 0.05], // Escenas 3D: espacio oscuro
         f if f >= 100 => [0.05, 0.05, 0.06], // Cargadores: fondo oscuro neutro
         _ => [0.17, 0.20, 0.42],  // Holografico (azul-violeta)
     }
