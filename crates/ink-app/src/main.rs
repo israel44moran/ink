@@ -86,6 +86,11 @@ enum EraseStroke {
     Stamps { tip: u32, verts: Vec<StampVertex> },
 }
 
+/// Un trazo precalculado para la vista previa: (puntos en mundo, color RGBA, ancho de pincel).
+type PreviewStroke = (Vec<Vec2>, [f32; 4], f32);
+/// Una pagina precalculada para la vista previa: (sus trazos, limites min/max en mundo).
+type PreviewPage = (Vec<PreviewStroke>, Option<(Vec2, Vec2)>);
+
 /// En que pantalla esta la app: la BIBLIOTECA de cuadernos o el LIENZO (editor).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppMode {
@@ -325,13 +330,15 @@ struct App {
     /// Al soltar una HOJA (nota rapida) sobre un cuaderno: menu (origen, destino) para elegir
     /// entre cambiar de posicion o guardar la nota dentro de ese cuaderno.
     merge_prompt: Option<(usize, usize)>,
-    /// VISTA PREVIA (Alt+clic): cuaderno en vista previa, progreso de apertura (0..1) y el
-    /// contenido de su 1ª pagina (trazos: puntos en mundo, color, ancho) + sus limites + nombre.
+    /// VISTA PREVIA (Alt+clic): cuaderno en vista previa, progreso de apertura (0..1), nombre, el
+    /// contenido de TODAS sus paginas (para pasarlas), la pagina mostrada y el rect de origen
+    /// (la carta en la rejilla) para la animacion de "acercarse".
     preview_idx: Option<usize>,
     preview_t: f32,
     preview_name: String,
-    preview_strokes: Vec<(Vec<Vec2>, [f32; 4], f32)>,
-    preview_bounds: Option<(Vec2, Vec2)>,
+    preview_pages: Vec<PreviewPage>,
+    preview_page: usize,
+    preview_from: (Vec2, Vec2),
 }
 
 impl App {
@@ -448,8 +455,9 @@ impl App {
             preview_idx: None,
             preview_t: 0.0,
             preview_name: String::new(),
-            preview_strokes: Vec::new(),
-            preview_bounds: None,
+            preview_pages: Vec::new(),
+            preview_page: 0,
+            preview_from: (Vec2::ZERO, Vec2::ZERO),
         }
     }
 
@@ -1435,10 +1443,12 @@ impl App {
         let path = entry.path.clone();
         let name = entry.name.clone();
         let Some(nb) = notebook::load(&path) else { return };
-        let mut strokes: Vec<(Vec<Vec2>, [f32; 4], f32)> = Vec::new();
-        let mut mn = Vec2::splat(f32::MAX);
-        let mut mx = Vec2::splat(f32::MIN);
-        if let Some(pg) = nb.pages.first() {
+        // Precalcular TODAS las paginas (para poder pasarlas en la vista previa).
+        let mut pages: Vec<PreviewPage> = Vec::new();
+        for pg in &nb.pages {
+            let mut strokes: Vec<PreviewStroke> = Vec::new();
+            let mut mn = Vec2::splat(f32::MAX);
+            let mut mx = Vec2::splat(f32::MIN);
             for layer in &pg.doc.layers {
                 if !layer.visible {
                     continue;
@@ -1457,20 +1467,41 @@ impl App {
                     strokes.push((pts, c, st.brush.width));
                 }
             }
+            let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
+            pages.push((strokes, bounds));
         }
+        if pages.is_empty() {
+            pages.push((Vec::new(), None));
+        }
+        // Rect de origen (la carta en la rejilla) para que la animacion "venga" desde ahi.
+        let layout = self.library_card_layout();
+        self.preview_from = layout.get(i).copied().unwrap_or((
+            vec2(self.camera.viewport.x * 0.5, self.camera.viewport.y * 0.5),
+            vec2(94.0, 131.0),
+        ));
         self.preview_idx = Some(i);
         self.preview_t = 0.0;
         self.preview_name = name;
-        self.preview_strokes = strokes;
-        self.preview_bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
+        self.preview_pages = pages;
+        self.preview_page = 0;
     }
 
     /// Cierra la vista previa.
     fn close_preview(&mut self) {
         self.preview_idx = None;
         self.preview_t = 0.0;
-        self.preview_strokes.clear();
-        self.preview_bounds = None;
+        self.preview_pages.clear();
+        self.preview_page = 0;
+    }
+
+    /// Pasa de pagina en la vista previa (dir = +1 / -1), con limites.
+    fn preview_flip(&mut self, dir: i32) {
+        if self.preview_pages.is_empty() {
+            return;
+        }
+        let last = self.preview_pages.len() - 1;
+        let cur = self.preview_page as i32 + dir;
+        self.preview_page = cur.clamp(0, last as i32) as usize;
     }
 
     /// Construye la carta del LIBRO en vista previa: grande, desplazada a la izquierda y con un
@@ -1479,13 +1510,16 @@ impl App {
         let Some(i) = self.preview_idx else { return Vec::new() };
         let Some(nb) = self.notebooks.get(i) else { return Vec::new() };
         let vp = self.camera.viewport;
-        let t = self.preview_t * self.preview_t * (3.0 - 2.0 * self.preview_t); // smoothstep
+        let tt = self.preview_t.clamp(0.0, 1.0);
+        let t = tt * tt * (3.0 - 2.0 * tt); // smoothstep
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        // ACERCARSE: vuela desde la carta en la rejilla (origen) a la pose grande de la izquierda.
+        let (fc, fh) = self.preview_from;
         let hh = (vp.y * 0.33).clamp(150.0, 760.0);
         let hw = hh * (188.0 / 263.0);
-        let half = vec2(hw, hh) * (0.45 + 0.55 * t);
-        // Empieza centrado y se desplaza a la izquierda al "abrirse" (deja sitio a la pagina).
-        let cx = vp.x * (0.5 - 0.16 * t);
-        let cy = vp.y * 0.5;
+        let cx = lerp(fc.x, vp.x * 0.34);
+        let cy = lerp(fc.y, vp.y * 0.5);
+        let half = vec2(lerp(fh.x, hw), lerp(fh.y, hh));
         let finish = nb.finish;
         let is_sheet = finish >= 500 && finish < 600;
         let shape = if is_sheet { 4 } else { nb.shape };
@@ -1494,8 +1528,12 @@ impl App {
         let overh = if is_sheet { 0.0 } else { ohf * nb.overhang };
         let base = finish_base_color(finish);
         let ac = accent_color(nb.accent);
-        let rotx = 0.12;
-        let roty = -0.55 * t + (self.clock * 0.4).sin() * 0.03; // gira hacia "abrir" + vaiven leve
+        // ABRIRSE: de la pose del estante (inclinacion/giro) a una pose girada que muestra el
+        // canto, como si la tapa se abriera; vaiven leve al final.
+        let base_rx = self.lib_tweaks.inclinacion.to_radians();
+        let base_ry = self.lib_tweaks.giro.to_radians();
+        let rotx = lerp(base_rx, 0.12);
+        let roty = lerp(base_ry, -0.42) + (self.clock * 0.4).sin() * 0.03 * t;
         vec![[
             cx, cy, half.x, half.y, rotx, roty, 0.5, 0.4, 1.0,
             base[0], base[1], base[2], finish as f32, nb.fx as f32, nb.fx_intensity,
@@ -2749,7 +2787,10 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                 };
-                if self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
+                if self.app_mode == AppMode::Library && self.preview_idx.is_some() && amount != 0.0 {
+                    // En VISTA PREVIA, la rueda PASA DE PAGINA (arriba = anterior, abajo = siguiente).
+                    self.preview_flip(if amount > 0.0 { -1 } else { 1 });
+                } else if self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
                     // Biblioteca: la rueda SOBRE un cuaderno lo VOLTEA (ver portada/reverso); en
                     // zona vacia desplaza la cuadricula. (Las cartas son wgpu, no widgets egui.)
                     if let Some(i) = self.library_card_at() {
@@ -3089,6 +3130,8 @@ impl ApplicationHandler for App {
                 let mut lib_merge_swap = false;
                 let mut lib_merge_cancel = false;
                 let mut lib_close_preview = false;
+                let mut lib_preview_prev = false;
+                let mut lib_preview_next = false;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
@@ -3201,57 +3244,67 @@ impl ApplicationHandler for App {
                             let ppp = ctx.pixels_per_point().max(0.01);
                             let vp = self.camera.viewport;
                             let tt = self.preview_t.clamp(0.0, 1.0);
-                            let t = tt * tt * (3.0 - 2.0 * tt);
+                            let t = tt * tt * (3.0 - 2.0 * tt); // acercarse (libro)
+                            let lerp = |a: f32, b: f32| a + (b - a) * t;
+                            // Pose del libro (igual que build_preview_book) para anclar la pagina.
+                            let (fc, fh) = self.preview_from;
                             let hh = (vp.y * 0.33).clamp(150.0, 760.0);
                             let hw = hh * (188.0 / 263.0);
-                            let bhx = hw * (0.45 + 0.55 * t);
-                            let bookcx = vp.x * (0.5 - 0.16 * t);
-                            let page_h = hh * 1.84;
-                            let page_left = bookcx + bhx * 0.78;
-                            let page_w = (vp.x * 0.34) * t;
-                            let top = vp.y * 0.5 - page_h * 0.5;
+                            let book_cx = lerp(fc.x, vp.x * 0.34);
+                            let book_hx = lerp(fh.x, hw);
+                            let book_hy = lerp(fh.y, hh);
+                            let cy = lerp(fc.y, vp.y * 0.5);
+                            // ABRIRSE: la pagina se despliega DESPUES de que el libro casi llego.
+                            let to_raw = ((tt - 0.45) / 0.55).clamp(0.0, 1.0);
+                            let to = to_raw * to_raw * (3.0 - 2.0 * to_raw);
+                            let page_h = book_hy * 1.9;
+                            let page_left = book_cx + book_hx * 0.85;
+                            let page_w = (vp.x * 0.33) * to;
+                            let top = cy - page_h * 0.5;
                             let page = egui::Rect::from_min_size(
                                 egui::pos2(page_left / ppp, top / ppp),
                                 egui::vec2(page_w / ppp, page_h / ppp),
                             );
-                            let painter = ui.painter();
+                            let painter = ui.painter().clone();
                             painter.rect_filled(page.expand(3.0), 6.0, egui::Color32::from_black_alpha(70));
                             painter.rect_filled(page, 4.0, egui::Color32::from_rgb(247, 246, 242));
-                            if t > 0.22 {
-                                if let Some((mn, mx)) = self.preview_bounds {
-                                    let avail = page.shrink(14.0);
-                                    let bw = (mx.x - mn.x).max(1.0);
-                                    let bh = (mx.y - mn.y).max(1.0);
-                                    let s = (avail.width() / bw).min(avail.height() / bh);
-                                    let bcx = (mn.x + mx.x) * 0.5;
-                                    let bcy = (mn.y + mx.y) * 0.5;
-                                    let rc = avail.center();
-                                    let pp = painter.with_clip_rect(page);
-                                    for (pts, col, w) in &self.preview_strokes {
-                                        if pts.len() < 2 {
-                                            continue;
+                            if to > 0.12 {
+                                if let Some((strokes, bounds)) = self.preview_pages.get(self.preview_page) {
+                                    if let Some((mn, mx)) = bounds {
+                                        let avail = page.shrink(14.0);
+                                        let bw = (mx.x - mn.x).max(1.0);
+                                        let bh = (mx.y - mn.y).max(1.0);
+                                        let s = (avail.width() / bw).min(avail.height() / bh);
+                                        let bcx = (mn.x + mx.x) * 0.5;
+                                        let bcy = (mn.y + mx.y) * 0.5;
+                                        let rc = avail.center();
+                                        let pp = painter.with_clip_rect(page);
+                                        for (pts, col, w) in strokes {
+                                            if pts.len() < 2 {
+                                                continue;
+                                            }
+                                            let c = egui::Color32::from_rgba_unmultiplied(
+                                                (col[0] * 255.0) as u8,
+                                                (col[1] * 255.0) as u8,
+                                                (col[2] * 255.0) as u8,
+                                                (col[3] * 255.0) as u8,
+                                            );
+                                            let sw = (w * s).max(0.6);
+                                            let line: Vec<egui::Pos2> = pts
+                                                .iter()
+                                                .map(|p| egui::pos2(rc.x + (p.x - bcx) * s, rc.y + (p.y - bcy) * s))
+                                                .collect();
+                                            pp.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
                                         }
-                                        let c = egui::Color32::from_rgba_unmultiplied(
-                                            (col[0] * 255.0) as u8,
-                                            (col[1] * 255.0) as u8,
-                                            (col[2] * 255.0) as u8,
-                                            (col[3] * 255.0) as u8,
+                                    } else {
+                                        painter.text(
+                                            page.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "(página en blanco)",
+                                            egui::FontId::proportional(15.0),
+                                            egui::Color32::from_gray(160),
                                         );
-                                        let sw = (w * s).max(0.6);
-                                        let line: Vec<egui::Pos2> = pts
-                                            .iter()
-                                            .map(|p| egui::pos2(rc.x + (p.x - bcx) * s, rc.y + (p.y - bcy) * s))
-                                            .collect();
-                                        pp.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
                                     }
-                                } else {
-                                    painter.text(
-                                        page.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "(página en blanco)",
-                                        egui::FontId::proportional(15.0),
-                                        egui::Color32::from_gray(160),
-                                    );
                                 }
                             }
                             painter.text(
@@ -3261,16 +3314,34 @@ impl ApplicationHandler for App {
                                 egui::FontId::proportional(20.0),
                                 egui::Color32::from_gray(235),
                             );
+                            let npages = self.preview_pages.len();
+                            let foot = if npages > 1 {
+                                format!(
+                                    "Pág {} / {}   ·   rueda o ← → para pasar   ·   Esc o clic para cerrar",
+                                    self.preview_page + 1,
+                                    npages
+                                )
+                            } else {
+                                "Esc o clic para cerrar".to_string()
+                            };
                             painter.text(
                                 egui::pos2((vp.x * 0.5) / ppp, (top + page_h + 18.0) / ppp),
                                 egui::Align2::CENTER_CENTER,
-                                "Esc o clic para cerrar",
+                                foot,
                                 egui::FontId::proportional(13.0),
                                 egui::Color32::from_gray(150),
                             );
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                lib_close_preview = true;
-                            }
+                            ui.input(|i| {
+                                if i.key_pressed(egui::Key::Escape) {
+                                    lib_close_preview = true;
+                                }
+                                if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
+                                    lib_preview_next = true;
+                                }
+                                if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
+                                    lib_preview_prev = true;
+                                }
+                            });
                             return;
                         }
                         ui.add_space(18.0);
@@ -3777,6 +3848,12 @@ impl ApplicationHandler for App {
                 }
                 if lib_close_preview {
                     self.close_preview();
+                }
+                if lib_preview_next {
+                    self.preview_flip(1);
+                }
+                if lib_preview_prev {
+                    self.preview_flip(-1);
                 }
                 if let Some((from, target)) = self.merge_prompt {
                     if lib_merge_save {
