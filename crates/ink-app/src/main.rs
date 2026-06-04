@@ -893,7 +893,7 @@ impl App {
         let cols = (((vp.x - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
         let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
         let x0 = (vp.x - total_w) * 0.5 + cw * 0.5;
-        let top = 172.0;
+        let top = 300.0; // bajo las cartas para no solaparse con la cabecera/separador
         let row_h = ch + gap + 26.0; // espacio extra para el nombre bajo cada carta
         (0..n)
             .map(|i| {
@@ -935,29 +935,6 @@ impl App {
         self.card_rects = layout.iter().map(|(c, h)| (c.x, c.y, h.x, h.y)).collect();
     }
 
-    /// Procesa un clic en la biblioteca: hit-test de las cartas. Clic en la papelera (esquina
-    /// sup-derecha) borra el cuaderno; clic en el resto de la carta lo abre.
-    fn library_click(&mut self) {
-        let cur = self.cursor;
-        let rects = self.card_rects.clone();
-        for (i, &(cx, cy, hx, hy)) in rects.iter().enumerate() {
-            if (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy {
-                let (dpx, dpy) = (cx + hx - 18.0, cy - hy + 18.0); // esquina papelera
-                if (cur.x - dpx).hypot(cur.y - dpy) < 16.0 {
-                    if let Some(nb) = self.notebooks.get(i) {
-                        let path = nb.path.clone();
-                        notebook::delete(&path);
-                        self.notebooks = notebook::list();
-                        self.card_anim.clear();
-                    }
-                } else if let Some(nb) = self.notebooks.get(i) {
-                    self.open_notebook(nb.path.clone());
-                }
-                return;
-            }
-        }
-    }
-
     /// Indice de la carta bajo el cursor (None si ninguna). Sin distinguir la papelera.
     fn library_card_at(&self) -> Option<usize> {
         let cur = self.cursor;
@@ -966,14 +943,16 @@ impl App {
             .position(|&(cx, cy, hx, hy)| (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy)
     }
 
-    /// ¿El cursor esta sobre el icono de papelera (esquina sup-derecha) de la carta `i`?
-    fn library_over_trash(&self, i: usize) -> bool {
-        if let Some(&(cx, cy, hx, hy)) = self.card_rects.get(i) {
-            let (dpx, dpy) = (cx + hx - 18.0, cy - hy + 18.0);
-            (self.cursor.x - dpx).hypot(self.cursor.y - dpy) < 16.0
-        } else {
-            false
-        }
+    /// Zona de la PAPELERA unica (centro y radio, en px): arrastra una carta aqui para borrarla.
+    fn trash_zone(&self) -> (f32, f32, f32) {
+        let vp = self.camera.viewport;
+        (vp.x - 90.0, 86.0, 50.0)
+    }
+
+    /// ¿El cursor esta sobre la papelera (para soltar y borrar)?
+    fn over_trash_zone(&self) -> bool {
+        let (tx, ty, r) = self.trash_zone();
+        (self.cursor.x - tx).hypot(self.cursor.y - ty) < r
     }
 
     /// Borra el cuaderno `i` de la biblioteca.
@@ -2224,17 +2203,13 @@ impl ApplicationHandler for App {
                     ElementState::Pressed => {
                         if self.app_mode == AppMode::Library && !self.creating_nb {
                             // Cartas (wgpu, no widgets egui): decidir por hit-test, NO por
-                            // `egui_consumed` (egui reclama el puntero del panel). El clic en la
-                            // papelera borra; en el resto inicia un posible arrastre (al soltar se
-                            // decide: abrir si no se movio, o reordenar si se arrastro).
+                            // `egui_consumed` (egui reclama el puntero del panel). Se inicia un
+                            // posible arrastre; al soltar se decide: abrir (si no se movio),
+                            // reordenar, o borrar (si se solto sobre la papelera).
                             if let Some(i) = self.library_card_at() {
-                                if self.library_over_trash(i) {
-                                    self.delete_card(i);
-                                } else {
-                                    self.drag_idx = Some(i);
-                                    self.drag_start = self.cursor;
-                                    self.dragging = false;
-                                }
+                                self.drag_idx = Some(i);
+                                self.drag_start = self.cursor;
+                                self.dragging = false;
                             }
                         } else if egui_consumed {
                             // Interaccion con la UI: no dibujar. Si el cuentagotas estaba
@@ -2277,9 +2252,12 @@ impl ApplicationHandler for App {
                     }
                     ElementState::Released => {
                         if self.app_mode == AppMode::Library {
-                            // Soltar en la biblioteca: si se arrastro, reordenar; si no, abrir.
+                            // Soltar en la biblioteca: sobre la papelera = borrar; si se arrastro,
+                            // reordenar; si no se movio, abrir.
                             if let Some(i) = self.drag_idx.take() {
-                                if self.dragging {
+                                if self.dragging && self.over_trash_zone() {
+                                    self.delete_card(i);
+                                } else if self.dragging {
                                     self.drop_card(i);
                                 } else if let Some(nb) = self.notebooks.get(i) {
                                     self.open_notebook(nb.path.clone());
@@ -2786,15 +2764,18 @@ impl ApplicationHandler for App {
                                         .color(egui::Color32::from_gray(140)),
                                 );
                             }
-                            // Las CARTAS se dibujan con wgpu detras de la UI; aqui solo van, sobre
-                            // cada carta, el NOMBRE y la papelera. El clic se maneja por hit-test.
+                            // Las CARTAS se dibujan con wgpu detras de la UI; aqui solo va, bajo
+                            // cada carta, su NOMBRE. El clic/arrastre se maneja por hit-test.
                             let ppp = ctx.pixels_per_point().max(0.01);
                             let lp = ctx.layer_painter(egui::LayerId::new(
                                 egui::Order::Foreground,
                                 egui::Id::new("card_overlay"),
                             ));
-                            let cur = self.cursor;
                             for (i, (name, _inf, _path)) in nb_list.iter().enumerate() {
+                                // La carta que se arrastra va al cursor: no dibujar su nombre fijo.
+                                if self.dragging && self.drag_idx == Some(i) {
+                                    continue;
+                                }
                                 let Some((c, h)) = card_layout.get(i) else { continue };
                                 lp.text(
                                     egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
@@ -2803,19 +2784,43 @@ impl ApplicationHandler for App {
                                     egui::FontId::proportional(15.0),
                                     egui::Color32::from_gray(230),
                                 );
-                                let dpx = c.x + h.x - 18.0;
-                                let dpy = c.y - h.y + 18.0;
-                                let near = (cur.x - dpx).hypot(cur.y - dpy) < 16.0;
-                                let dcol = if near { egui::Color32::from_rgb(235, 92, 92) } else { egui::Color32::from_gray(205) };
-                                let dc = egui::pos2(dpx / ppp, dpy / ppp);
-                                let st = egui::Stroke::new(1.7, dcol);
-                                let body = egui::Rect::from_min_max(dc + egui::vec2(-6.0, -2.0), dc + egui::vec2(6.0, 9.0));
-                                lp.rect_stroke(body, egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
-                                lp.line_segment([dc + egui::vec2(-8.0, -2.0), dc + egui::vec2(8.0, -2.0)], st);
-                                lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(3.0, -5.0)], st);
-                                lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(-3.0, -2.0)], st);
-                                lp.line_segment([dc + egui::vec2(3.0, -5.0), dc + egui::vec2(3.0, -2.0)], st);
                             }
+                            // PAPELERA unica: arrastra una carta aqui (y suelta) para borrarla.
+                            let (tzx, tzy, tzr) = self.trash_zone();
+                            let drag_on = self.dragging && self.drag_idx.is_some();
+                            let over = drag_on && self.over_trash_zone();
+                            let tcol = if over {
+                                egui::Color32::from_rgb(245, 90, 90)
+                            } else if drag_on {
+                                egui::Color32::from_rgb(225, 130, 130)
+                            } else {
+                                egui::Color32::from_gray(140)
+                            };
+                            let tc = egui::pos2(tzx / ppp, tzy / ppp);
+                            if drag_on {
+                                lp.circle_stroke(tc, tzr / ppp, egui::Stroke::new(2.0, tcol));
+                            }
+                            let s = 1.8_f32;
+                            let st = egui::Stroke::new(2.2, tcol);
+                            let body = egui::Rect::from_min_max(
+                                tc + egui::vec2(-6.5 * s, -2.0 * s),
+                                tc + egui::vec2(6.5 * s, 9.5 * s),
+                            );
+                            lp.rect_stroke(body, egui::CornerRadius::same(2), st, egui::StrokeKind::Inside);
+                            lp.line_segment([tc + egui::vec2(-9.0 * s, -2.0 * s), tc + egui::vec2(9.0 * s, -2.0 * s)], st);
+                            lp.line_segment([tc + egui::vec2(-3.5 * s, -5.0 * s), tc + egui::vec2(3.5 * s, -5.0 * s)], st);
+                            lp.line_segment([tc + egui::vec2(-3.5 * s, -5.0 * s), tc + egui::vec2(-3.5 * s, -2.0 * s)], st);
+                            lp.line_segment([tc + egui::vec2(3.5 * s, -5.0 * s), tc + egui::vec2(3.5 * s, -2.0 * s)], st);
+                            lp.line_segment([tc + egui::vec2(-2.5 * s, 0.5 * s), tc + egui::vec2(-2.5 * s, 7.0 * s)], st);
+                            lp.line_segment([tc + egui::vec2(0.0, 0.5 * s), tc + egui::vec2(0.0, 7.0 * s)], st);
+                            lp.line_segment([tc + egui::vec2(2.5 * s, 0.5 * s), tc + egui::vec2(2.5 * s, 7.0 * s)], st);
+                            lp.text(
+                                egui::pos2(tzx / ppp, (tzy + tzr + 6.0) / ppp),
+                                egui::Align2::CENTER_TOP,
+                                if drag_on { "Soltar para borrar" } else { "Borrar" },
+                                egui::FontId::proportional(12.0),
+                                tcol,
+                            );
                         } else {
                             ui.label(
                                 egui::RichText::new("Vista previa de la carátula a la izquierda; ajústala en el panel de la derecha.")
