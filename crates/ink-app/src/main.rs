@@ -1016,12 +1016,13 @@ impl App {
     /// al desplazar, para que no tapen el titulo. La cabecera mide ~130 pt de alto.
     fn library_header_px(&self) -> f32 {
         let ppp = self.egui_ctx.pixels_per_point().max(0.5);
-        130.0 * ppp
+        138.0 * ppp
     }
 
-    /// Borde superior (px fisicos) donde empieza la primera fila de cartas (un poco bajo la cabecera).
+    /// Borde superior (px fisicos) donde empieza la primera fila de cartas. Se deja MARGEN extra
+    /// porque la carta, inclinada en 3D, "sube" su esquina superior por encima de este punto.
     fn library_top(&self) -> f32 {
-        self.library_header_px() + 22.0
+        self.library_header_px() + 58.0
     }
 
     /// Cuanto se puede desplazar la cuadricula hacia arriba (px). 0 si todo cabe en pantalla.
@@ -3504,7 +3505,7 @@ impl ApplicationHandler for App {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             let (bar, _) = ui.allocate_exact_size(egui::vec2(5.0, 34.0), egui::Sense::hover());
-                            ui.painter().rect_filled(bar, egui::CornerRadius::same(2), egui::Color32::from_rgb(120, 112, 255));
+                            ui.painter().rect_filled(bar, egui::CornerRadius::same(2), egui::Color32::from_rgb(94, 106, 210));
                             ui.add_space(12.0);
                             ui.vertical(|ui| {
                                 ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(egui::FontId::new(30.0, egui::FontFamily::Name("inter_sb".into()))).color(egui::Color32::from_gray(244))).selectable(false));
@@ -3515,20 +3516,22 @@ impl ApplicationHandler for App {
                         if !self.creating_nb {
                             // Botones "pill" con iconos vectoriales: primario (acento) + secundario
                             // + Ajustes (fantasma, a la derecha).
-                            let accent = egui::Color32::from_rgb(108, 99, 255);
+                            let accent = egui::Color32::from_rgb(94, 106, 210); // indigo sobrio
+                            let soft = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16); // vidrio sutil
+                            let faint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
                                 if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, accent, egui::Color32::WHITE, None).clicked() {
                                     lib_open_new = true;
                                 }
-                                if pill_button(ui, "Nota rápida", BtnIcon::Note, egui::Color32::from_rgb(44, 46, 58), egui::Color32::from_gray(228), None)
+                                if pill_button(ui, "Nota rápida", BtnIcon::Note, soft, egui::Color32::from_gray(225), Some(faint))
                                     .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
                                     .clicked()
                                 {
                                     lib_quick_note = true;
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, egui::Color32::TRANSPARENT, egui::Color32::from_gray(200), Some(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28))).clicked() {
+                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, egui::Color32::TRANSPARENT, egui::Color32::from_gray(195), Some(faint)).clicked() {
                                         lib_toggle_tweaks = true;
                                     }
                                 });
@@ -4709,7 +4712,7 @@ fn set_dark_titlebar(hwnd: isize) {
         DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-    let cap = COLORREF(0x001C_1412); // 0x00BBGGRR -> RGB(18,20,28), parte superior del degradado
+    let cap = COLORREF(0x0014_0F0E); // 0x00BBGGRR -> RGB(14,15,20) = borde superior del fondo
     unsafe {
         let dark = BOOL(1);
         let _ = DwmSetWindowAttribute(
