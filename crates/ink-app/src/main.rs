@@ -1039,16 +1039,6 @@ impl App {
             .position(|&(cx, cy, hx, hy)| (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy)
     }
 
-    /// Indice del cuaderno cuyo NOMBRE (texto bajo la carta, hasta 3 renglones) esta bajo el
-    /// cursor.
-    fn library_name_at(&self) -> Option<usize> {
-        let cur = self.cursor;
-        // Cubre los 3 renglones del nombre (desde justo bajo la carta hasta el hueco de fila).
-        self.card_rects.iter().position(|&(cx, cy, hx, hy)| {
-            (cur.x - cx).abs() <= hx && cur.y >= cy + hy + 8.0 && cur.y <= cy + hy + 128.0
-        })
-    }
-
     /// Renombra el cuaderno `idx`: cambia su nombre y MUEVE su archivo para que el nombre de
     /// archivo coincida (asi se conserva al guardar). Tambien actualiza el orden manual.
     fn rename_notebook(&mut self, idx: usize, new_name: &str) {
@@ -2380,13 +2370,10 @@ impl ApplicationHandler for App {
                             // Cartas (wgpu, no widgets egui): decidir por hit-test, NO por
                             // `egui_consumed`. Clic en el NOMBRE = editarlo en linea; en la carta =
                             // posible arrastre (al soltar: abrir / reordenar / borrar).
+                            // El NOMBRE se renombra con una zona clicable de egui (ver abajo); aqui
+                            // solo gestionamos la CARTA (arrastrar/abrir).
                             if self.renaming.is_none() {
-                                if let Some(i) = self.library_name_at() {
-                                    self.renaming = Some(i);
-                                    self.rename_buf =
-                                        self.notebooks.get(i).map(|n| n.name.clone()).unwrap_or_default();
-                                    self.rename_grace = 5; // sobrevive al "soltar" del clic inicial
-                                } else if let Some(i) = self.library_card_at() {
+                                if let Some(i) = self.library_card_at() {
                                     self.drag_idx = Some(i);
                                     self.drag_start = self.cursor;
                                     self.dragging = false;
@@ -2842,6 +2829,7 @@ impl ApplicationHandler for App {
                 let mut lib_close_tweaks = false;
                 let mut tweaks_save = false;
                 let mut lib_rename: Option<usize> = None;
+                let mut lib_start_rename: Option<usize> = None;
                 let mut lib_cancel_rename = false;
                 let mut lib_go = false;
                 let mut page_prev = false;
@@ -3033,6 +3021,22 @@ impl ApplicationHandler for App {
                                             egui::Color32::from_gray(230),
                                         );
                                     }
+                                    // Zona CLICABLE (invisible) de egui sobre TODO el nombre (los 3
+                                    // renglones) para renombrar: el clic siempre se detecta aqui.
+                                    let nh = 3.0 * line_h + 14.0;
+                                    let tl = egui::pos2((c.x - h.x) / ppp, (c.y + h.y + 22.0) / ppp);
+                                    egui::Area::new(egui::Id::new(("nmhit", i)))
+                                        .order(egui::Order::Foreground)
+                                        .fixed_pos(tl)
+                                        .show(ctx, |ui| {
+                                            let (_r, resp) = ui.allocate_exact_size(
+                                                egui::vec2(card_w_pts, nh),
+                                                egui::Sense::click(),
+                                            );
+                                            if resp.clicked() {
+                                                lib_start_rename = Some(i);
+                                            }
+                                        });
                                 }
                             }
                             // PAPELERA unica: arrastra una carta aqui (y suelta) para borrarla.
@@ -3300,6 +3304,13 @@ impl ApplicationHandler for App {
                 }
                 if tweaks_save {
                     notebook::save_tweaks(&self.lib_tweaks);
+                }
+                if let Some(ri) = lib_start_rename {
+                    if self.renaming.is_none() {
+                        self.renaming = Some(ri);
+                        self.rename_buf = self.notebooks.get(ri).map(|n| n.name.clone()).unwrap_or_default();
+                        self.rename_grace = 5;
+                    }
                 }
                 if let Some(ri) = lib_rename {
                     let name = self.rename_buf.clone();
