@@ -12,6 +12,24 @@ struct View {
     time: f32,
 };
 @group(0) @binding(0) var<uniform> view: View;
+// Texturas de MATERIAL realistas (array de capas). El indice de capa = (texture - 1).
+@group(0) @binding(1) var mat_tex: texture_2d_array<f32>;
+@group(0) @binding(2) var mat_samp: sampler;
+
+// Muestrea una capa de material a un LOD fijo (textureSampleLevel: valido en cualquier flujo;
+// LOD 1.5 ~ acorde al tamaño de la carta -> nitido y sin aliasing). uv se repite (tileado).
+fn mat_sample(layer: i32, uv: vec2<f32>) -> vec3<f32> {
+    return textureSampleLevel(mat_tex, mat_samp, uv, layer, 1.5).rgb;
+}
+// Muestreo triplanar (para las figuras 3D): mezcla por la normal las 3 proyecciones.
+fn mat_triplanar(layer: i32, p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let an = abs(n);
+    let w = an / max(an.x + an.y + an.z, 0.001);
+    let cx = mat_sample(layer, p.yz * 0.5 + vec2<f32>(0.5));
+    let cy = mat_sample(layer, p.xz * 0.5 + vec2<f32>(0.5));
+    let cz = mat_sample(layer, p.xy * 0.5 + vec2<f32>(0.5));
+    return cx * w.x + cy * w.y + cz * w.z;
+}
 
 struct VsIn {
     @builtin(vertex_index) vi: u32,
@@ -635,7 +653,8 @@ fn figure3d(id: i32, p2: vec2<f32>, t: f32, accent: vec3<f32>, tex: i32) -> vec3
         let dif = clamp(dot(n, ldir), 0.0, 1.0);
         let spec = pow(clamp(dot(reflect(rdo, n), ldir), 0.0, 1.0), 26.0);
         let rim = pow(1.0 - clamp(dot(n, -rdo), 0.0, 1.0), 3.0) * 0.35;
-        let base = tex_surface(tex, accent, pr, n);
+        var base = accent;
+        if (tex > 0) { base = mat_triplanar(tex - 1, pr, n); } // material realista sobre la figura
         col = base * (0.22 + 0.95 * dif) + vec3<f32>(1.0) * spec * 0.6 + accent * rim;
     }
     return col;
@@ -1008,8 +1027,10 @@ fn cover_color(in: VsOut) -> vec3<f32> {
         // madera/kraft/carbono) + su grano realista; el foil/efecto se anade encima. Asi, Mate +
         // textura = un cuaderno de material puro (sin diseño de carátula).
         let tex = i32(round(in.texture));
-        if (tex > 0) { col = material_color(tex); }
-        col = tex_surface(tex, col, vec3<f32>(in.uv * 3.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
+        if (tex > 0) {
+            // MATERIAL realista (textura CC0 tileada en la tapa); el foil se anade encima.
+            col = mat_sample(tex - 1, in.uv * vec2<f32>(1.0, in.aspect));
+        }
         // ---------------- FOIL: el efecto vive a reposo (idle) y crece con el cursor ----------------
         let eff = (0.30 + 0.70 * h) * (0.6 + 0.4 * inten);
         if (fin == 1) {
@@ -1131,7 +1152,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // carton oscuro. Encima, una "cinta de masquin" beige para el nombre (lo dibuja la UI).
         let tex1 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
         if (tex1 > 0) {
-            col = tex_surface(tex1, material_color(tex1), vec3<f32>(in.uv * 3.0, 0.4), vec3<f32>(0.0, 0.0, 1.0));
+            col = mat_sample(tex1 - 1, in.uv * vec2<f32>(1.0, in.aspect));
         } else {
             col = vec3<f32>(0.15, 0.13, 0.12);
         }
@@ -1143,7 +1164,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // LOMO (encuadernacion). Con textura, el lomo tambien es del material.
         let tex3 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
         if (tex3 > 0 && shp != 3) {
-            col = tex_surface(tex3, material_color(tex3), vec3<f32>(in.uv.yx * vec2<f32>(2.0, 1.0), 0.7), vec3<f32>(0.0, 0.0, 1.0));
+            col = mat_sample(tex3 - 1, in.uv * vec2<f32>(1.0, in.aspect));
         } else if (shp == 3) {
             // ESPIRAL: anillos metalicos a lo largo del lomo (uv.x recorre el largo del lomo).
             let rings = grid_line(in.uv.x * 22.0, 0.32);

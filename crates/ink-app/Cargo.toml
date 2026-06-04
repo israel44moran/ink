@@ -10,6 +10,8 @@ egui-wgpu = "0.34.3"
 egui-winit = "0.34.3"
 env_logger = "0.11.10"
 glam = "0.33.0"
+# Decodificar las texturas de material (JPG CC0 incrustadas) para subirlas a la GPU.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ink-core = { version = "0.1.0", path = "../ink-core" }
 ink-brush = { version = "0.1.0", path = "../ink-brush" }
 log = "0.4.30"

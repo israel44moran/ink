@@ -3990,9 +3990,12 @@ const FIGURE_DESIGNS: [(u32, &str); 5] = [
     (600, "Cubo"), (601, "Esfera"), (602, "Pirámide"), (603, "Toro"), (604, "Octaedro"),
 ];
 
-/// Texturas del material (idx = texture). 0 = ninguna. Se aplican a portadas (foils) y figuras.
-const TEXTURE_NAMES: [&str; 7] = [
-    "Ninguna", "Cuero", "Tela", "Madera", "Kraft", "Fibra carbono", "Cuadros",
+/// Materiales realistas (idx = texture; 0 = ninguno). Son fotos CC0 (Poly Haven) incrustadas;
+/// el orden DEBE coincidir con MATERIAL_JPGS en renderer.rs (capa = idx - 1). Se aplican a TODO
+/// el cuaderno (tapa+lomo+contratapa) y a las figuras 3D.
+const TEXTURE_NAMES: [&str; 9] = [
+    "Ninguno", "Cuero", "Madera", "Lino", "Denim", "Lana bouclé", "Cuero rojo", "Tela de libro",
+    "Contrachapado",
 ];
 
 /// Capas COMBINABLES (bit, nombre).

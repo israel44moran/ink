@@ -75,6 +75,87 @@ fn card_inst_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// Texturas de MATERIAL realistas (fotos CC0 de Poly Haven, 1K, incrustadas en el binario).
+/// El indice de capa = (campo `texture` del cuaderno) - 1. Orden = ver TEXTURE_NAMES en main.rs.
+const MATERIAL_JPGS: [&[u8]; 8] = [
+    include_bytes!("../assets/textures/cuero.jpg"),
+    include_bytes!("../assets/textures/madera.jpg"),
+    include_bytes!("../assets/textures/lino.jpg"),
+    include_bytes!("../assets/textures/denim.jpg"),
+    include_bytes!("../assets/textures/lana.jpg"),
+    include_bytes!("../assets/textures/cuerorojo.jpg"),
+    include_bytes!("../assets/textures/libro.jpg"),
+    include_bytes!("../assets/textures/plywood.jpg"),
+];
+
+/// Crea el array de texturas de material (con cadena de mipmaps generada en CPU) y su sampler
+/// (repetir + filtrado trilineal). Formato Rgba8Unorm: el byte del JPG se usa tal cual (la
+/// superficie es no-sRGB, WYSIWYG). Si una imagen no decodifica, esa capa queda en negro.
+fn create_material_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    const SIZE: u32 = 1024;
+    let mips = SIZE.ilog2() + 1; // 11 niveles (1024..1)
+    let layers = MATERIAL_JPGS.len() as u32;
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("material textures"),
+        size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: layers },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (li, bytes) in MATERIAL_JPGS.iter().enumerate() {
+        let Ok(img) = image::load_from_memory(bytes) else { continue };
+        let mut base = img.to_rgba8();
+        if base.width() != SIZE || base.height() != SIZE {
+            base = image::imageops::resize(&base, SIZE, SIZE, image::imageops::FilterType::Triangle);
+        }
+        for mip in 0..mips {
+            let w = (SIZE >> mip).max(1);
+            let level = if mip == 0 {
+                base.clone()
+            } else {
+                image::imageops::resize(&base, w, w, image::imageops::FilterType::Triangle)
+            };
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: li as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                level.as_raw(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(w),
+                },
+                wgpu::Extent3d { width: w, height: w, depth_or_array_layers: 1 },
+            );
+        }
+    }
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("material view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("material sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+    (tex, view, sampler)
+}
+
 /// Una punta de pincel ya subida a GPU: bind group con su textura + aspecto (w/h).
 struct TipGpu {
     bind_group: wgpu::BindGroup,
@@ -613,19 +694,44 @@ impl GpuState {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Texturas de material realistas (array) + su sampler, para las portadas/cuadernos.
+        // (La TextureView mantiene viva la textura; el BindGroup mantiene vivos view y sampler.)
+        let (_material_tex, material_view, material_sampler) = create_material_array(&device, &queue);
         let card_view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("card view bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let card_view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("card view bg"),
             layout: &card_view_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: card_view_buf.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: card_view_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&material_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&material_sampler) },
+            ],
         });
         let card_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("card shader"),

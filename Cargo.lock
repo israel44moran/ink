@@ -1091,6 +1091,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1113,6 +1115,7 @@ dependencies = [
  "egui-winit",
  "env_logger",
  "glam",
+ "image",
  "ink-brush",
  "ink-core",
  "log",
