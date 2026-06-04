@@ -95,6 +95,9 @@ pub struct NotebookData {
     pub cover_a: [f32; 3],
     #[serde(default = "default_white3")]
     pub cover_b: [f32; 3],
+    /// Archivero (carpeta) al que pertenece; "" = sin archivero (aparece solo en "Todos").
+    #[serde(default)]
+    pub archivero: String,
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -127,6 +130,7 @@ impl NotebookData {
             texture: 0,
             cover_a: [1.0, 1.0, 1.0],
             cover_b: [1.0, 1.0, 1.0],
+            archivero: String::new(),
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -166,6 +170,7 @@ pub struct NotebookEntry {
     pub texture: u32,
     pub cover_a: [f32; 3],
     pub cover_b: [f32; 3],
+    pub archivero: String,
     pub path: PathBuf,
 }
 
@@ -260,6 +265,23 @@ pub fn save_order(files: &[String]) {
     }
 }
 
+/// Lista de ARCHIVEROS (carpetas) definidos por el usuario; persiste aunque esten vacios.
+fn archiveros_path() -> PathBuf {
+    notebooks_dir().join("_archiveros.json")
+}
+pub fn load_archiveros() -> Vec<String> {
+    std::fs::read_to_string(archiveros_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+pub fn save_archiveros(list: &[String]) {
+    let _ = ensure_dir();
+    if let Ok(s) = serde_json::to_string(list) {
+        let _ = std::fs::write(archiveros_path(), s);
+    }
+}
+
 /// Lista los cuadernos guardados, en el ORDEN manual (`_order.json`); los que no esten en el
 /// orden (cuadernos nuevos) van al final, alfabeticamente.
 pub fn list() -> Vec<NotebookEntry> {
@@ -268,7 +290,7 @@ pub fn list() -> Vec<NotebookEntry> {
         for e in rd.flatten() {
             let p = e.path();
             // Saltar archivos internos (orden / tweaks), no son cuadernos.
-            if p.file_name().map_or(false, |n| n == "_order.json" || n == "_tweaks.json") {
+            if p.file_name().map_or(false, |n| n == "_order.json" || n == "_tweaks.json" || n == "_archiveros.json") {
                 continue;
             }
             if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) {
@@ -286,6 +308,7 @@ pub fn list() -> Vec<NotebookEntry> {
                         texture: nb.texture,
                         cover_a: nb.cover_a,
                         cover_b: nb.cover_b,
+                        archivero: nb.archivero,
                         path: p,
                     });
                 }

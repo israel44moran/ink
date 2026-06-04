@@ -345,6 +345,17 @@ struct App {
     preview_pages: Vec<PreviewPage>,
     preview_page: usize,
     preview_from: (Vec2, Vec2),
+    /// Biblioteca v2: archiveros (carpetas), filtro activo, busqueda y orden.
+    archiveros: Vec<String>,
+    active_archivero: String, // "" = Todos
+    current_archivero: String, // archivero del cuaderno abierto (para guardar)
+    search_query: String,
+    sort_mode: u32, // 0 Recientes, 1 A-Z, 2 Cuadernos, 3 Notas
+    new_archivero_buf: String,
+    creating_archivero: bool,
+    /// Zonas (px fisicos) de los archiveros en la barra lateral, para soltar un cuaderno encima y
+    /// asignarlo: (min_x, min_y, max_x, max_y, nombre_archivero). "" = Todos (quitar de archivero).
+    archivero_drop: Vec<(f32, f32, f32, f32, String)>,
 }
 
 impl App {
@@ -468,6 +479,14 @@ impl App {
             preview_pages: Vec::new(),
             preview_page: 0,
             preview_from: (Vec2::ZERO, Vec2::ZERO),
+            archiveros: notebook::load_archiveros(),
+            active_archivero: String::new(),
+            current_archivero: String::new(),
+            search_query: String::new(),
+            sort_mode: 0,
+            new_archivero_buf: String::new(),
+            creating_archivero: false,
+            archivero_drop: Vec::new(),
         }
     }
 
@@ -897,6 +916,7 @@ impl App {
         self.current_texture = nb.texture;
         self.current_cover_a = nb.cover_a;
         self.current_cover_b = nb.cover_b;
+        self.current_archivero = nb.archivero.clone();
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -933,6 +953,7 @@ impl App {
         nb.texture = self.current_texture;
         nb.cover_a = self.current_cover_a;
         nb.cover_b = self.current_cover_b;
+        nb.archivero = self.current_archivero.clone();
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -959,6 +980,7 @@ impl App {
         nb.texture = self.new_nb_texture;
         nb.cover_a = self.new_nb_cover_a;
         nb.cover_b = self.new_nb_cover_b;
+        nb.archivero = self.active_archivero.clone(); // entra al archivero activo
         let path = notebook::path_for(name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
@@ -980,11 +1002,45 @@ impl App {
         nb.shape = 0;
         nb.thickness = 1.0;
         nb.overhang = 1.0;
+        nb.archivero = self.active_archivero.clone(); // entra al archivero activo
         let path = notebook::path_for(&name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
         self.current_path = Some(path);
         self.app_mode = AppMode::Canvas;
+    }
+
+    /// Indices (en self.notebooks) de los cuadernos VISIBLES segun archivero + busqueda + orden.
+    fn visible_notebooks(&self) -> Vec<usize> {
+        let q = self.search_query.trim().to_lowercase();
+        let mut v: Vec<usize> = (0..self.notebooks.len())
+            .filter(|&i| {
+                let nb = &self.notebooks[i];
+                let arch_ok = self.active_archivero.is_empty() || nb.archivero == self.active_archivero;
+                let is_note = nb.finish >= 500 && nb.finish < 600;
+                let kind_ok = match self.sort_mode {
+                    2 => !is_note, // Cuadernos
+                    3 => is_note,  // Notas
+                    _ => true,
+                };
+                let search_ok = q.is_empty() || nb.name.to_lowercase().contains(&q);
+                arch_ok && kind_ok && search_ok
+            })
+            .collect();
+        if self.sort_mode == 1 {
+            // A - Z
+            v.sort_by(|&a, &b| self.notebooks[a].name.to_lowercase().cmp(&self.notebooks[b].name.to_lowercase()));
+        }
+        v
+    }
+
+    /// Numero de cuadernos en un archivero ("" = todos).
+    fn archivero_count(&self, arch: &str) -> usize {
+        if arch.is_empty() {
+            self.notebooks.len()
+        } else {
+            self.notebooks.iter().filter(|n| n.archivero == arch).count()
+        }
     }
 
     /// Guarda el cuaderno actual y vuelve a la biblioteca (refrescando la lista).
@@ -1029,62 +1085,71 @@ impl App {
 
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
 
-    /// Linea (px fisicos) justo BAJO la cabecera (titulo + botones): donde se recortan las cartas
-    /// al desplazar, para que no tapen el titulo. La cabecera mide ~130 pt de alto.
-    fn library_header_px(&self) -> f32 {
-        let ppp = self.egui_ctx.pixels_per_point().max(0.5);
-        138.0 * ppp
+    /// Ancho (px fisicos) reservado por la barra lateral izquierda.
+    fn library_sidebar_px(&self) -> f32 {
+        self.egui_ctx.pixels_per_point().max(0.5) * 340.0
     }
 
-    /// Borde superior (px fisicos) donde empieza la primera fila de cartas. Se deja MARGEN extra
-    /// porque la carta, inclinada en 3D, "sube" su esquina superior por encima de este punto.
+    /// Linea (px fisicos) BAJO la barra superior del area derecha (titulo de seccion + buscador +
+    /// pestañas): donde se recortan las cartas al desplazar (no tapan esa barra).
+    fn library_header_px(&self) -> f32 {
+        self.egui_ctx.pixels_per_point().max(0.5) * 188.0
+    }
+
+    /// Borde superior (px fisicos) donde empieza la primera fila de cartas (con margen por la
+    /// inclinacion 3D que sube la esquina de la carta).
     fn library_top(&self) -> f32 {
-        self.library_header_px() + 58.0
+        self.library_header_px() + 46.0
+    }
+
+    /// Columnas que caben en el area de la cuadricula (a la derecha de la barra lateral).
+    fn library_cols(&self) -> usize {
+        let vp = self.camera.viewport;
+        let (cw, gap) = (188.0_f32, 36.0_f32);
+        let left = self.library_sidebar_px() + 24.0;
+        let reserve_r = if self.show_tweaks { 300.0 * self.egui_ctx.pixels_per_point().max(0.5) } else { 0.0 };
+        let usable = (vp.x - left - reserve_r).max(cw + 20.0);
+        (((usable + gap) / (cw + gap)).floor() as usize).max(1)
     }
 
     /// Cuanto se puede desplazar la cuadricula hacia arriba (px). 0 si todo cabe en pantalla.
     fn library_max_scroll(&self) -> f32 {
-        let n = self.notebooks.len();
-        if n == 0 {
+        let nvis = self.visible_notebooks().len();
+        if nvis == 0 {
             return 0.0;
         }
         let vp = self.camera.viewport;
-        let (cw, ch, gap) = (188.0_f32, 263.0_f32, 36.0_f32);
-        let ppp = self.egui_ctx.pixels_per_point().max(0.5);
-        let reserve = if self.show_tweaks { 300.0 * ppp } else { 0.0 };
-        let usable = (vp.x - reserve).max(cw + 80.0);
-        let cols = (((usable - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
-        let rows = n.div_ceil(cols);
+        let (ch, gap) = (263.0_f32, 36.0_f32);
+        let cols = self.library_cols();
+        let rows = nvis.div_ceil(cols);
         let row_h = ch + gap + 96.0;
-        let top = self.library_top();
-        // Borde inferior del contenido (ultima fila + su nombre) a scroll 0.
-        let lowest = top + rows.saturating_sub(1) as f32 * row_h + ch + 100.0;
+        let lowest = self.library_top() + rows.saturating_sub(1) as f32 * row_h + ch + 100.0;
         (lowest - vp.y + 20.0).max(0.0)
     }
 
-    /// Layout en cuadricula de las cartas: (centro, medio-tamano) en px, por cuaderno.
+    /// Layout en cuadricula: posiciones (centro, medio-tamano) por cuaderno. SOLO los visibles
+    /// (segun archivero/busqueda/orden) reciben hueco; los ocultos van fuera de pantalla. Asi el
+    /// resto del sistema (animacion, arrastre, vista previa) sigue usando el indice del cuaderno.
     fn library_card_layout(&self) -> Vec<(Vec2, Vec2)> {
         let n = self.notebooks.len();
         let vp = self.camera.viewport;
         let (cw, ch, gap) = (188.0_f32, 263.0_f32, 36.0_f32);
-        // Si el panel Tweaks esta abierto, reservar su franja (arriba-derecha) para que NINGUN
-        // cuaderno quede debajo (los que no caben pasan a la siguiente fila).
-        let ppp = self.egui_ctx.pixels_per_point().max(0.5);
-        let reserve = if self.show_tweaks { 300.0 * ppp } else { 0.0 };
-        let usable = (vp.x - reserve).max(cw + 80.0);
-        let cols = (((usable - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
+        let left = self.library_sidebar_px() + 24.0;
+        let reserve_r = if self.show_tweaks { 300.0 * self.egui_ctx.pixels_per_point().max(0.5) } else { 0.0 };
+        let usable = (vp.x - left - reserve_r).max(cw + 20.0);
+        let cols = self.library_cols();
         let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
-        let x0 = (usable - total_w) * 0.5 + cw * 0.5;
-        let top = self.library_top(); // justo bajo la cabecera (titulo + botones)
-        let row_h = ch + gap + 96.0; // espacio para el nombre (hasta 3 renglones) bajo la carta
-        (0..n)
-            .map(|i| {
-                let (col, row) = (i % cols, i / cols);
-                let cx = x0 + col as f32 * (cw + gap);
-                let cy = top + ch * 0.5 + row as f32 * row_h - self.card_scroll;
-                (vec2(cx, cy), vec2(cw * 0.5, ch * 0.5))
-            })
-            .collect()
+        let x0 = left + (usable - total_w) * 0.5 + cw * 0.5;
+        let top = self.library_top();
+        let row_h = ch + gap + 96.0;
+        let mut out = vec![(vec2(-9999.0, -9999.0), vec2(cw * 0.5, ch * 0.5)); n];
+        for (slot, &i) in self.visible_notebooks().iter().enumerate() {
+            let (col, row) = (slot % cols, slot / cols);
+            let cx = x0 + col as f32 * (cw + gap);
+            let cy = top + ch * 0.5 + row as f32 * row_h - self.card_scroll;
+            out[i] = (vec2(cx, cy), vec2(cw * 0.5, ch * 0.5));
+        }
+        out
     }
 
     /// Suaviza la animacion (hover/tilt) de cada carta hacia su objetivo (segun el cursor) y
@@ -1228,6 +1293,32 @@ impl App {
     fn over_trash_zone(&self) -> bool {
         let (tx, ty, r) = self.trash_zone();
         (self.cursor.x - tx).hypot(self.cursor.y - ty) < r
+    }
+
+    /// Si el cursor esta sobre una fila de archivero de la barra lateral, devuelve su nombre
+    /// ("" = Todos, para quitar el cuaderno de cualquier archivero). None si no hay ninguna.
+    fn archivero_at_cursor(&self) -> Option<String> {
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        self.archivero_drop
+            .iter()
+            .find(|(x0, y0, x1, y1, _)| x >= *x0 && x <= *x1 && y >= *y0 && y <= *y1)
+            .map(|(_, _, _, _, name)| name.clone())
+    }
+
+    /// Asigna el cuaderno `i` al archivero `name` ("" = ninguno): persiste el campo y actualiza la
+    /// copia en memoria SIN recargar la lista (asi no hay "salto" ni reinicio de las animaciones).
+    fn assign_archivero(&mut self, i: usize, name: String) {
+        let path = match self.notebooks.get(i) {
+            Some(nb) if nb.archivero != name => nb.path.clone(),
+            _ => return,
+        };
+        if let Some(mut data) = notebook::load(&path) {
+            data.archivero = name.clone();
+            let _ = notebook::save(&data, &path);
+        }
+        if let Some(nb) = self.notebooks.get_mut(i) {
+            nb.archivero = name;
+        }
     }
 
     /// Borra el cuaderno `i` de la biblioteca.
@@ -2868,6 +2959,11 @@ impl ApplicationHandler for App {
                             if let Some(i) = self.drag_idx.take() {
                                 if self.dragging && self.over_trash_zone() {
                                     self.delete_card(i);
+                                } else if self.dragging && self.archivero_at_cursor().is_some() {
+                                    // Soltar sobre una fila de la barra lateral = asignar a ese archivero.
+                                    if let Some(name) = self.archivero_at_cursor() {
+                                        self.assign_archivero(i, name);
+                                    }
                                 } else if self.dragging {
                                     // Si arrastramos una HOJA (nota rapida) sobre un CUADERNO
                                     // (no hoja), ofrecer el menu reordenar/guardar-dentro; si no,
@@ -3277,8 +3373,6 @@ impl ApplicationHandler for App {
                 let mut ps_load_all = false;
                 let mut ps_new_round: Option<f32> = None;
                 // Acciones de la BIBLIOTECA de cuadernos (se procesan tras construir la UI).
-                let mut lib_open: Option<PathBuf> = None;
-                let mut lib_delete: Option<PathBuf> = None;
                 let mut lib_create = false;
                 let mut lib_save_cover = false;
                 let mut lib_open_new = false;
@@ -3290,6 +3384,10 @@ impl ApplicationHandler for App {
                 let mut lib_preview_prev = false;
                 let mut lib_preview_next = false;
                 let mut lib_set_theme: Option<u32> = None;
+                let mut lib_set_archivero: Option<String> = None;
+                let mut lib_new_archivero = false;
+                let mut lib_create_archivero = false;
+                let mut lib_set_sort: Option<u32> = None;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
@@ -3393,8 +3491,58 @@ impl ApplicationHandler for App {
                         }
                     }
                   } else {
-                    // ---------------- BIBLIOTECA de cuadernos (cartas hologr aficas) ----------------
-                    // Panel SIN fondo: las cartas se dibujan con wgpu detras (fondo oscuro).
+                    // ---------------- BIBLIOTECA (v2): barra lateral + area de cuadrícula ----------------
+                    let th = home_theme(self.lib_tweaks.theme);
+                    // BARRA LATERAL izquierda: kicker + titulo + botones + archiveros (solo en grid).
+                    if self.preview_idx.is_none() && !self.creating_nb {
+                        egui::SidePanel::left("lib_sidebar")
+                            .resizable(false)
+                            .exact_width(340.0)
+                            .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 36, right: 22, top: 24, bottom: 16 }))
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add(egui::Label::new(egui::RichText::new("INK · ").font(egui::FontId::new(11.0, egui::FontFamily::Monospace)).color(th.kicker)).selectable(false));
+                                    ui.add(egui::Label::new(egui::RichText::new("BIBLIOTECA").font(egui::FontId::new(11.0, egui::FontFamily::Monospace)).color(th.kicker_b)).selectable(false));
+                                });
+                                ui.add_space(6.0);
+                                let tf = if th.serif { egui::FontId::new(33.0, egui::FontFamily::Name("serif".into())) } else { egui::FontId::new(31.0, egui::FontFamily::Name("head".into())) };
+                                ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(tf).color(th.title)).selectable(false));
+                                let sub = if th.serif { egui::RichText::new("Tu biblioteca de cuadernos y notas").font(egui::FontId::new(14.0, egui::FontFamily::Name("serif_it".into()))).color(th.sub) } else { egui::RichText::new("Tu biblioteca de cuadernos y notas").size(13.0).color(th.sub) };
+                                ui.add(egui::Label::new(sub).selectable(false));
+                                ui.add_space(20.0);
+                                let fw = ui.available_width();
+                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, th.primary, fw).clicked() { lib_open_new = true; }
+                                ui.add_space(9.0);
+                                if pill_button(ui, "Nota rápida", BtnIcon::Note, th.secondary, fw).clicked() { lib_quick_note = true; }
+                                ui.add_space(22.0);
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new("ARCHIVEROS").font(egui::FontId::new(10.5, egui::FontFamily::Monospace)).color(th.kicker)).selectable(false));
+                                });
+                                ui.add_space(7.0);
+                                // Registrar las zonas de soltar (px fisicos) para asignar cuadernos por arrastre.
+                                self.archivero_drop.clear();
+                                let ppp_s = ui.ctx().pixels_per_point();
+                                let r0 = archivero_row(ui, "Todos", self.archivero_count(""), self.active_archivero.is_empty(), &th);
+                                self.archivero_drop.push((r0.rect.min.x * ppp_s, r0.rect.min.y * ppp_s, r0.rect.max.x * ppp_s, r0.rect.max.y * ppp_s, String::new()));
+                                if r0.clicked() { lib_set_archivero = Some(String::new()); }
+                                for a in self.archiveros.clone() {
+                                    let r = archivero_row(ui, &a, self.archivero_count(&a), self.active_archivero == a, &th);
+                                    self.archivero_drop.push((r.rect.min.x * ppp_s, r.rect.min.y * ppp_s, r.rect.max.x * ppp_s, r.rect.max.y * ppp_s, a.clone()));
+                                    if r.clicked() { lib_set_archivero = Some(a.clone()); }
+                                }
+                                ui.add_space(4.0);
+                                if self.creating_archivero {
+                                    let r = ui.add(egui::TextEdit::singleline(&mut self.new_archivero_buf).hint_text("Nombre…").desired_width(fw));
+                                    r.request_focus();
+                                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) { lib_create_archivero = true; }
+                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) { self.creating_archivero = false; self.new_archivero_buf.clear(); }
+                                } else if ui.add(egui::Label::new(egui::RichText::new("＋  Nuevo archivero").size(13.5).color(th.sub)).sense(egui::Sense::click())).clicked() {
+                                    lib_new_archivero = true;
+                                }
+                            });
+                    }
+                    // ---------------- AREA DERECHA (cuadrícula) ----------------
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(40, 26)))
                         .show(ctx, |ui| {
@@ -3522,50 +3670,46 @@ impl ApplicationHandler for App {
                             });
                             return;
                         }
-                        // --- Cabecera editorial segun el TEMA (Tinta / Cuaderno) ---
-                        let th = home_theme(self.lib_tweaks.theme);
-                        ui.add_space(10.0);
-                        // Kicker monoespaciado: "INK · BIBLIOTECA".
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.add(egui::Label::new(egui::RichText::new("INK · ").font(egui::FontId::new(11.0, egui::FontFamily::Monospace)).color(th.kicker)).selectable(false));
-                            ui.add(egui::Label::new(egui::RichText::new("BIBLIOTECA").font(egui::FontId::new(11.0, egui::FontFamily::Monospace)).color(th.kicker_b)).selectable(false));
-                        });
-                        ui.add_space(6.0);
-                        let title_font = if th.serif {
-                            egui::FontId::new(38.0, egui::FontFamily::Name("serif".into()))
-                        } else {
-                            egui::FontId::new(34.0, egui::FontFamily::Name("head".into()))
-                        };
-                        ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(title_font).color(th.title)).selectable(false));
-                        let sub = if th.serif {
-                            egui::RichText::new("Tu biblioteca de cuadernos y notas").font(egui::FontId::new(15.0, egui::FontFamily::Name("serif_it".into()))).color(th.sub)
-                        } else {
-                            egui::RichText::new("Tu biblioteca de cuadernos y notas").size(14.0).color(th.sub)
-                        };
-                        ui.add(egui::Label::new(sub).selectable(false));
-                        ui.add_space(16.0);
+                        // --- Barra superior del area derecha: titulo de seccion + buscador + pestañas ---
                         if !self.creating_nb {
+                            ui.add_space(2.0);
+                            let count = self.visible_notebooks().len();
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 12.0;
-                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, th.primary).clicked() {
-                                    lib_open_new = true;
-                                }
-                                if pill_button(ui, "Nota rápida", BtnIcon::Note, th.secondary)
-                                    .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
-                                    .clicked()
-                                {
-                                    lib_quick_note = true;
-                                }
+                                let stitle = if self.active_archivero.is_empty() { "Todos".to_string() } else { self.active_archivero.clone() };
+                                let sf = if th.serif { egui::FontId::new(23.0, egui::FontFamily::Name("serif".into())) } else { egui::FontId::new(21.0, egui::FontFamily::Name("head".into())) };
+                                ui.add(egui::Label::new(egui::RichText::new(stitle).font(sf).color(th.title)).selectable(false));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, th.secondary).clicked() {
+                                    ui.add_space(64.0); // hueco para la papelera (esquina sup. der.)
+                                    if icon_btn(ui, BtnIcon::Sliders, th.icon_btn).clicked() {
                                         lib_toggle_tweaks = true;
                                     }
+                                    ui.add_space(12.0);
+                                    ui.add(egui::Label::new(egui::RichText::new(format!("{count} piezas")).font(egui::FontId::new(11.5, egui::FontFamily::Monospace)).color(th.sub)).selectable(false));
+                                    ui.add_space(12.0);
+                                    egui::Frame::NONE
+                                        .fill(th.search_fill)
+                                        .stroke(egui::Stroke::new(1.0, th.sep))
+                                        .corner_radius(9)
+                                        .inner_margin(egui::Margin::symmetric(12, 7))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new("⌕").size(16.0).color(th.sub)).selectable(false));
+                                                ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Buscar…").frame(egui::Frame::NONE).desired_width(190.0).text_color(th.title));
+                                            });
+                                        });
                                 });
                             });
-                            ui.add_space(16.0);
-                            let sep = ui.available_rect_before_wrap();
-                            ui.painter().hline(sep.x_range(), sep.top(), egui::Stroke::new(1.0, th.sep));
+                            ui.add_space(14.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 24.0;
+                                for (i, t) in ["RECIENTES", "A — Z", "CUADERNOS", "NOTAS"].iter().enumerate() {
+                                    let on = self.sort_mode == i as u32;
+                                    let lbl = egui::Label::new(egui::RichText::new(*t).font(egui::FontId::new(11.5, egui::FontFamily::Monospace)).color(if on { th.title } else { th.kicker })).sense(egui::Sense::click());
+                                    if ui.add(lbl).clicked() {
+                                        lib_set_sort = Some(i as u32);
+                                    }
+                                }
+                            });
                             ui.add_space(10.0);
                             if nb_list.is_empty() {
                                 ui.label(
@@ -3668,6 +3812,21 @@ impl ApplicationHandler for App {
                                             ln,
                                             egui::FontId::proportional(size),
                                             th.name,
+                                        );
+                                    }
+                                    // KINDTAG: forma del cuaderno (o "NOTA RÁPIDA") en monoespaciada.
+                                    if let Some(nbk) = self.notebooks.get(i) {
+                                        let ktag = if nbk.finish >= 500 && nbk.finish < 600 {
+                                            "NOTA RÁPIDA".to_string()
+                                        } else {
+                                            SHAPE_NAMES.get(nbk.shape as usize).copied().unwrap_or("").to_uppercase()
+                                        };
+                                        lp.text(
+                                            egui::pos2(c.x / ppp, top_y + lines.len() as f32 * line_h + 5.0),
+                                            egui::Align2::CENTER_TOP,
+                                            ktag,
+                                            egui::FontId::new(9.5, egui::FontFamily::Monospace),
+                                            th.kicker,
                                         );
                                     }
                                     // Zona CLICABLE (invisible) de egui sobre TODO el nombre (los 3
@@ -4089,9 +4248,6 @@ impl ApplicationHandler for App {
                 if lib_go {
                     self.go_to_library();
                 }
-                if let Some(p) = lib_open {
-                    self.open_notebook(p);
-                }
                 if lib_toggle_tweaks {
                     self.show_tweaks = !self.show_tweaks;
                 }
@@ -4131,6 +4287,28 @@ impl ApplicationHandler for App {
                     self.lib_tweaks.theme = t;
                     notebook::save_tweaks(&self.lib_tweaks);
                     self.apply_titlebar();
+                }
+                if let Some(a) = lib_set_archivero {
+                    self.active_archivero = a;
+                    self.card_scroll = 0.0;
+                }
+                if let Some(s) = lib_set_sort {
+                    self.sort_mode = s;
+                    self.card_scroll = 0.0;
+                }
+                if lib_new_archivero {
+                    self.creating_archivero = true;
+                    self.new_archivero_buf.clear();
+                }
+                if lib_create_archivero {
+                    let name = self.new_archivero_buf.trim().to_string();
+                    if !name.is_empty() && !self.archiveros.iter().any(|a| a == &name) {
+                        self.archiveros.push(name.clone());
+                        notebook::save_archiveros(&self.archiveros);
+                        self.active_archivero = name;
+                    }
+                    self.new_archivero_buf.clear();
+                    self.creating_archivero = false;
                 }
                 if lib_preview_next {
                     self.preview_flip(1);
@@ -4172,10 +4350,6 @@ impl ApplicationHandler for App {
                     self.new_nb_name.clear();
                     self.creating_nb = false;
                     self.editing_nb = None;
-                }
-                if let Some(p) = lib_delete {
-                    notebook::delete(&p);
-                    self.notebooks = notebook::list();
                 }
                 // Navegacion de paginas.
                 if page_prev && self.current_page > 0 {
@@ -4867,9 +5041,24 @@ struct HomeTheme {
     name: egui::Color32,
     sep: egui::Color32,
     icon_btn: egui::Color32,
+    search_fill: egui::Color32,
     serif: bool, // Cuaderno usa titulo/subtitulo serif (Spectral)
     primary: BtnStyle,
     secondary: BtnStyle,
+}
+
+/// Botón solo-icono (Ajustes, etc.): 34x34, hover sutil.
+fn icon_btn(ui: &mut egui::Ui, icon: BtnIcon, col: egui::Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::click());
+    let p = ui.painter();
+    let c = if resp.hovered() {
+        p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+        egui::Color32::from_rgb(col.r().saturating_add(45), col.g().saturating_add(45), col.b().saturating_add(45))
+    } else {
+        col
+    };
+    draw_btn_icon(p, icon, rect.center(), c);
+    resp
 }
 
 fn home_theme(theme: u32) -> HomeTheme {
@@ -4885,6 +5074,7 @@ fn home_theme(theme: u32) -> HomeTheme {
             name: rgb(43, 37, 27),
             sep: rgba(60, 48, 30, 46),
             icon_btn: rgb(111, 99, 80),
+            search_fill: rgba(255, 255, 255, 110),
             serif: true,
             primary: BtnStyle {
                 fill: rgb(33, 27, 18),
@@ -4914,6 +5104,7 @@ fn home_theme(theme: u32) -> HomeTheme {
             name: rgb(205, 202, 214),
             sep: rgba(202, 191, 167, 26),
             icon_btn: rgb(127, 124, 138),
+            search_fill: rgb(21, 19, 29),
             serif: false,
             primary: BtnStyle {
                 fill: egui::Color32::TRANSPARENT,
@@ -4936,11 +5127,13 @@ fn home_theme(theme: u32) -> HomeTheme {
 }
 
 /// Botón con estilo de tema (relleno/borde/hover) + icono vectorial + texto (Hanken peso 600).
-fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, st: BtnStyle) -> egui::Response {
+/// `min_w` > 0 fija el ancho (icono+texto centrados); 0 = ancho automatico segun el texto.
+fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, st: BtnStyle, min_w: f32) -> egui::Response {
     let font = egui::FontId::new(15.0, egui::FontFamily::Name("head".into()));
     let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), st.text);
     let (icon_w, pad, gap) = (16.0_f32, 17.0_f32, 9.0_f32);
-    let w = pad * 2.0 + icon_w + gap + galley.size().x;
+    let content = icon_w + gap + galley.size().x;
+    let w = (pad * 2.0 + content).max(min_w);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 38.0), egui::Sense::click());
     let hov = resp.hovered();
     let off = if resp.is_pointer_button_down_on() { egui::vec2(0.0, 1.0) } else { egui::Vec2::ZERO };
@@ -4954,11 +5147,33 @@ fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, st: BtnStyle) -> eg
         p.rect_stroke(r, egui::CornerRadius::same(7), egui::Stroke::new(1.5, st.border), egui::StrokeKind::Inside);
     }
     let (tcol, icol) = if hov { (st.hover_text, st.hover_text) } else { (st.text, st.icon) };
-    let ic = egui::pos2(r.left() + pad + icon_w * 0.5, r.center().y);
+    // Contenido centrado dentro del boton (importante cuando min_w lo hace ancho).
+    let cstart = r.left() + (r.width() - content) * 0.5;
+    let ic = egui::pos2(cstart + icon_w * 0.5, r.center().y);
     draw_btn_icon(p, icon, ic, icol);
-    // Re-layout solo si cambia el color del texto al pasar el cursor.
     let g = if hov { ui.painter().layout_no_wrap(text.to_string(), font, tcol) } else { galley };
-    p.galley(egui::pos2(r.left() + pad + icon_w + gap, r.center().y - g.size().y * 0.5), g, tcol);
+    p.galley(egui::pos2(cstart + icon_w + gap, r.center().y - g.size().y * 0.5), g, tcol);
+    resp
+}
+
+/// Fila de un ARCHIVERO en la barra lateral: icono + nombre + contador; resalta el activo.
+fn archivero_row(ui: &mut egui::Ui, label: &str, count: usize, active: bool, th: &HomeTheme) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
+    let p = ui.painter();
+    if active {
+        p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(202, 191, 167, 22));
+    } else if resp.hovered() {
+        p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10));
+    }
+    let col = if active { th.title } else { th.sub };
+    // icono carpeta (rectangulo con pestaña)
+    let ic = egui::pos2(rect.left() + 14.0, rect.center().y);
+    let fr = egui::Rect::from_center_size(ic, egui::vec2(13.0, 11.0));
+    p.rect_stroke(fr, egui::CornerRadius::same(2), egui::Stroke::new(1.4, col), egui::StrokeKind::Inside);
+    p.line_segment([fr.left_top() + egui::vec2(0.0, -2.5), fr.left_top() + egui::vec2(5.0, -2.5)], egui::Stroke::new(1.4, col));
+    p.text(egui::pos2(rect.left() + 32.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), col);
+    p.text(egui::pos2(rect.right() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::new(11.5, egui::FontFamily::Monospace), th.sub);
     resp
 }
 
