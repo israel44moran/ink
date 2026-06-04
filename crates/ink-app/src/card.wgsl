@@ -1168,15 +1168,15 @@ fn cover_color(in: VsOut) -> vec3<f32> {
 
 // Fondo del Home: degradado vertical profundo + glow suave + viñeta + leve dither (anti-banding).
 fn bg_gradient(uv: vec2<f32>) -> vec3<f32> {
-    // El borde SUPERIOR debe igualar el color de la barra de titulo (RGB 14,15,20) para que no
-    // se note la transicion: arriba plano, glow/viñeta muy suaves y centrados (no llegan arriba).
-    let top = vec3<f32>(0.0549, 0.0588, 0.0784); // = barra de titulo
-    let bot = vec3<f32>(0.034, 0.038, 0.056);
-    var c = mix(bot, top, uv.y);
-    let gd = distance(uv, vec2<f32>(0.5, 0.46));
-    c = c + vec3<f32>(0.016, 0.018, 0.028) * smoothstep(0.55, 0.0, gd); // glow central tenue
+    // OJO: en este quad uv.y=0 es el borde SUPERIOR de la pantalla. El borde superior debe
+    // igualar EXACTO el color de la barra de titulo (RGB 14,15,20) para que no se note el corte.
+    let c_top = vec3<f32>(0.0549, 0.0588, 0.0784); // arriba = barra de titulo (RGB 14,15,20)
+    let c_bot = vec3<f32>(0.040, 0.044, 0.062);    // abajo, un pelin mas oscuro (degradado sutil)
+    var c = mix(c_top, c_bot, uv.y);
+    let gd = distance(uv, vec2<f32>(0.5, 0.55));
+    c = c + vec3<f32>(0.014, 0.016, 0.026) * smoothstep(0.55, 0.0, gd); // glow central tenue
     let d = distance(uv, vec2<f32>(0.5, 0.5));
-    c = c * (1.0 - smoothstep(0.62, 1.12, d) * 0.40); // viñeta solo en esquinas
+    c = c * (1.0 - smoothstep(0.75, 1.2, d) * 0.35); // viñeta solo en esquinas extremas
     return c + (hash21(uv * 997.0) - 0.5) * 0.004;
 }
 
