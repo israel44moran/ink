@@ -5167,12 +5167,24 @@ fn archivero_row(ui: &mut egui::Ui, label: &str, count: usize, active: bool, th:
         p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10));
     }
     let col = if active { th.title } else { th.sub };
-    // icono carpeta (rectangulo con pestaña)
-    let ic = egui::pos2(rect.left() + 14.0, rect.center().y);
-    let fr = egui::Rect::from_center_size(ic, egui::vec2(13.0, 11.0));
-    p.rect_stroke(fr, egui::CornerRadius::same(2), egui::Stroke::new(1.4, col), egui::StrokeKind::Inside);
-    p.line_segment([fr.left_top() + egui::vec2(0.0, -2.5), fr.left_top() + egui::vec2(5.0, -2.5)], egui::Stroke::new(1.4, col));
-    p.text(egui::pos2(rect.left() + 32.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), col);
+    let ic = egui::pos2(rect.left() + 15.0, rect.center().y);
+    let st = egui::Stroke::new(1.4, col);
+    if label == "Todos" {
+        // "Todos" = rejilla 2x2 (ver todo).
+        let (s, g) = (5.0_f32, 2.2_f32);
+        for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let c = egui::pos2(ic.x + dx * (s + g) * 0.5, ic.y + dy * (s + g) * 0.5);
+            p.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s, s)), egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
+        }
+    } else {
+        // Icono ARCHIVERO (caja de archivo): tapa que sobresale + cuerpo + tirador central.
+        let lid = egui::Rect::from_min_size(egui::pos2(ic.x - 8.0, ic.y - 7.0), egui::vec2(16.0, 4.2));
+        p.rect_stroke(lid, egui::CornerRadius { nw: 2, ne: 2, sw: 1, se: 1 }, st, egui::StrokeKind::Inside);
+        let body = egui::Rect::from_min_size(egui::pos2(ic.x - 6.5, ic.y - 2.8), egui::vec2(13.0, 9.8));
+        p.rect_stroke(body, egui::CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }, st, egui::StrokeKind::Inside);
+        p.line_segment([egui::pos2(ic.x - 2.6, ic.y + 2.2), egui::pos2(ic.x + 2.6, ic.y + 2.2)], st);
+    }
+    p.text(egui::pos2(rect.left() + 34.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), col);
     p.text(egui::pos2(rect.right() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::new(11.5, egui::FontFamily::Monospace), th.sub);
     resp
 }
