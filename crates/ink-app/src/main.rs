@@ -3501,41 +3501,37 @@ impl ApplicationHandler for App {
                             });
                             return;
                         }
-                        // --- Cabecera: barra de acento + titulo + subtitulo ---
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            let (bar, _) = ui.allocate_exact_size(egui::vec2(5.0, 34.0), egui::Sense::hover());
-                            ui.painter().rect_filled(bar, egui::CornerRadius::same(2), egui::Color32::from_rgb(94, 106, 210));
-                            ui.add_space(12.0);
-                            ui.vertical(|ui| {
-                                ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(egui::FontId::new(30.0, egui::FontFamily::Name("inter_sb".into()))).color(egui::Color32::from_gray(244))).selectable(false));
-                                ui.add(egui::Label::new(egui::RichText::new("Tu biblioteca de cuadernos y notas").size(13.0).color(egui::Color32::from_gray(150))).selectable(false));
-                            });
-                        });
+                        // --- Cabecera editorial: titulo (Hanken Bold) + subtitulo ---
+                        ui.add_space(10.0);
+                        ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(egui::FontId::new(34.0, egui::FontFamily::Name("head".into()))).color(egui::Color32::from_gray(245))).selectable(false));
+                        ui.add(egui::Label::new(egui::RichText::new("Tu biblioteca de cuadernos y notas").size(14.0).color(egui::Color32::from_gray(150))).selectable(false));
                         ui.add_space(16.0);
                         if !self.creating_nb {
                             // Botones "pill" con iconos vectoriales: primario (acento) + secundario
                             // + Ajustes (fantasma, a la derecha).
-                            let accent = egui::Color32::from_rgb(94, 106, 210); // indigo sobrio
-                            let soft = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16); // vidrio sutil
-                            let faint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30);
+                            // Estilo "Trazo": contorno en acento papel/lavanda (#cabfa7), sin relleno.
+                            let accent = egui::Color32::from_rgb(202, 191, 167);
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, accent, egui::Color32::WHITE, None).clicked() {
+                                ui.spacing_mut().item_spacing.x = 12.0;
+                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, accent).clicked() {
                                     lib_open_new = true;
                                 }
-                                if pill_button(ui, "Nota rápida", BtnIcon::Note, soft, egui::Color32::from_gray(225), Some(faint))
+                                if pill_button(ui, "Nota rápida", BtnIcon::Note, accent)
                                     .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
                                     .clicked()
                                 {
                                     lib_quick_note = true;
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, egui::Color32::TRANSPARENT, egui::Color32::from_gray(195), Some(faint)).clicked() {
+                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, accent).clicked() {
                                         lib_toggle_tweaks = true;
                                     }
                                 });
                             });
+                            ui.add_space(16.0);
+                            // Separador editorial fino (cards ya estan mas abajo, no las cruza).
+                            let sep = ui.available_rect_before_wrap();
+                            ui.painter().hline(sep.x_range(), sep.top(), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(202, 191, 167, 26)));
                             ui.add_space(10.0);
                             if nb_list.is_empty() {
                                 ui.label(
@@ -4424,14 +4420,18 @@ fn smoothing_string_radius_px(smoothing: f32) -> f32 {
 fn setup_fonts(ctx: &egui::Context) {
     use std::sync::Arc;
     let mut fonts = egui::FontDefinitions::default();
-    // Fuente principal: INTER (incrustada) — limpia y profesional. SemiBold para titulos.
+    // Tipografias EDITORIALES (incrustadas, OFL): Hanken Grotesk (texto) + JetBrains Mono (mono).
     fonts.font_data.insert(
-        "inter".to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))),
+        "hanken".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/HankenGrotesk-Regular.ttf"))),
     );
     fonts.font_data.insert(
-        "inter_sb".to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
+        "hanken_b".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/HankenGrotesk-Bold.ttf"))),
+    );
+    fonts.font_data.insert(
+        "mono".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))),
     );
     // Respaldo del sistema (acentos/glifos que falten): Segoe UI / Calibri / DejaVu.
     let fallback = ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/calibri.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
@@ -4440,16 +4440,19 @@ fn setup_fonts(ctx: &egui::Context) {
     if let Some(bytes) = fallback {
         fonts.font_data.insert("ui_fallback".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
     }
-    // Proporcional: Inter primero; luego los de egui (emoji) + el respaldo del sistema al final.
+    // Proporcional: Hanken primero; emoji de egui + respaldo del sistema al final.
     let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-    prop.insert(0, "inter".to_owned());
+    prop.insert(0, "hanken".to_owned());
     if fonts.font_data.contains_key("ui_fallback") {
         prop.push("ui_fallback".to_owned());
     }
-    // Familia SemiBold (titulos del Home): Inter SemiBold con Inter como respaldo.
+    // Monospace: JetBrains Mono (etiquetas tipo devtool).
+    let monop = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+    monop.insert(0, "mono".to_owned());
+    // Familia "head" (titulos): Hanken Bold.
     fonts
         .families
-        .insert(egui::FontFamily::Name("inter_sb".into()), vec!["inter_sb".to_owned(), "inter".to_owned()]);
+        .insert(egui::FontFamily::Name("head".into()), vec!["hanken_b".to_owned(), "hanken".to_owned()]);
     ctx.set_fonts(fonts);
 }
 
@@ -4769,44 +4772,27 @@ fn draw_btn_icon(p: &egui::Painter, icon: BtnIcon, c: egui::Pos2, col: egui::Col
     }
 }
 
-/// Botón "pill" minimalista (fondo redondeado + icono vectorial + texto), con hover.
-/// `fill`=fondo (TRANSPARENT para fantasma), `border`=borde opcional.
-fn pill_button(
-    ui: &mut egui::Ui,
-    text: &str,
-    icon: BtnIcon,
-    fill: egui::Color32,
-    text_col: egui::Color32,
-    border: Option<egui::Color32>,
-) -> egui::Response {
-    let font = egui::FontId::proportional(14.5);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, text_col);
-    let (icon_w, pad, gap) = (18.0_f32, 15.0_f32, 8.0_f32);
+/// Botón estilo "Trazo" (contorno de tinta): sin relleno, borde 1.5px en `accent`, icono+texto en
+/// `accent`, radio 7, peso ~600 (Hanken Bold). Hover = relleno tenue del acento; active baja 1px.
+fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, accent: egui::Color32) -> egui::Response {
+    let font = egui::FontId::new(15.0, egui::FontFamily::Name("head".into()));
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, accent);
+    let (icon_w, pad, gap) = (16.0_f32, 16.0_f32, 9.0_f32);
     let w = pad * 2.0 + icon_w + gap + galley.size().x;
-    let h = 38.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
-    let hovered = resp.hovered();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 38.0), egui::Sense::click());
+    let off = if resp.is_pointer_button_down_on() { egui::vec2(0.0, 1.0) } else { egui::Vec2::ZERO };
+    let r = rect.translate(off);
     let p = ui.painter();
-    let lighten = |c: egui::Color32, a: u8| {
-        egui::Color32::from_rgba_unmultiplied(
-            c.r().saturating_add(a),
-            c.g().saturating_add(a),
-            c.b().saturating_add(a),
-            c.a().max(if c.a() == 0 { 26 } else { c.a() }),
-        )
-    };
-    let bg = if hovered { lighten(fill, 22) } else { fill };
-    if bg.a() > 0 {
-        p.rect_filled(rect, egui::CornerRadius::same(10), bg);
+    if resp.hovered() {
+        // relleno tenue rgba(acento, .08)
+        let h = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 20);
+        p.rect_filled(r, egui::CornerRadius::same(7), h);
     }
-    if let Some(bc) = border {
-        p.rect_stroke(rect, egui::CornerRadius::same(10), egui::Stroke::new(1.0, bc), egui::StrokeKind::Inside);
-    }
-    let ic = egui::pos2(rect.left() + pad + icon_w * 0.5, rect.center().y);
-    draw_btn_icon(p, icon, ic, text_col);
-    let tx = rect.left() + pad + icon_w + gap;
-    let ty = rect.center().y - galley.size().y * 0.5;
-    p.galley(egui::pos2(tx, ty), galley, text_col);
+    p.rect_stroke(r, egui::CornerRadius::same(7), egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+    let ic = egui::pos2(r.left() + pad + icon_w * 0.5, r.center().y);
+    draw_btn_icon(p, icon, ic, accent);
+    let tx = r.left() + pad + icon_w + gap;
+    p.galley(egui::pos2(tx, r.center().y - galley.size().y * 0.5), galley, accent);
     resp
 }
 
