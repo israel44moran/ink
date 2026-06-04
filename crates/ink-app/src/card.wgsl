@@ -492,6 +492,40 @@ fn nz2(p: vec2<f32>) -> f32 {
                mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), u.x), u.y);
 }
 
+// Ruido fractal (3 octavas) en 0..~0.94.
+fn fbm2(p: vec2<f32>) -> f32 {
+    return nz2(p) * 0.5 + nz2(p * 2.03 + vec2<f32>(1.7, 9.2)) * 0.25 + nz2(p * 4.01 + vec2<f32>(8.3, 2.8)) * 0.125;
+}
+
+// Voronoi (celulas): devuelve (distancia a la celda mas cercana, valor aleatorio de esa celda).
+// Para el grano del cuero y materiales celulares.
+fn vor(p: vec2<f32>) -> vec2<f32> {
+    let n = floor(p);
+    let f = fract(p);
+    var md = 8.0;
+    var mr = 0.0;
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            let g = vec2<f32>(f32(i), f32(j));
+            let o = vec2<f32>(hash21(n + g), hash21(n + g + vec2<f32>(31.0, 17.0)));
+            let r = g + o - f;
+            let d = dot(r, r);
+            if (d < md) { md = d; mr = hash21(n + g + vec2<f32>(7.0, 3.0)); }
+        }
+    }
+    return vec2<f32>(sqrt(md), mr);
+}
+
+// Color base CARACTERISTICO de cada material (para cuadernos de material entero).
+fn material_color(tex: i32) -> vec3<f32> {
+    if (tex == 1) { return vec3<f32>(0.42, 0.26, 0.16); } // cuero (marron)
+    if (tex == 2) { return vec3<f32>(0.80, 0.74, 0.62); } // tela / lino (natural)
+    if (tex == 3) { return vec3<f32>(0.52, 0.34, 0.18); } // madera (nogal)
+    if (tex == 4) { return vec3<f32>(0.72, 0.55, 0.34); } // kraft
+    if (tex == 5) { return vec3<f32>(0.10, 0.10, 0.12); } // fibra de carbono (oscuro)
+    return vec3<f32>(0.88, 0.88, 0.86);                   // cuadros / otros (claro)
+}
+
 fn sd_box3(p: vec3<f32>, b: vec3<f32>) -> f32 {
     let q = abs(p) - b;
     return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
@@ -524,32 +558,46 @@ fn tex_surface(tex: i32, base: vec3<f32>, q: vec3<f32>, n: vec3<f32>) -> vec3<f3
     if (an.x >= an.y && an.x >= an.z) { uv2 = q.yz; }
     else if (an.y >= an.z) { uv2 = q.xz; }
     else { uv2 = q.xy; }
-    if (tex == 1) { // cuero: grano por ruido
-        let g1 = nz2(uv2 * 7.0);
-        let g2 = nz2(uv2 * 17.0 + vec2<f32>(3.0, 3.0));
-        return base * (0.80 + 0.22 * g1 + 0.08 * g2);
+    if (tex == 1) { // CUERO: celulas Voronoi (grano) + surcos + poros + variacion de tono
+        let v = vor(uv2 * 6.0);
+        let groove = smoothstep(0.0, 0.07, v.x);        // surcos oscuros entre celulas
+        let pores = fbm2(uv2 * 26.0);
+        var c = base * (0.82 + 0.30 * v.y);             // cada celula, tono ligeramente distinto
+        c = c * (0.66 + 0.34 * groove);                 // hundir los surcos
+        c = c * (0.92 + 0.12 * pores);                  // poros finos
+        // leve brillo en el centro de las celulas
+        c = c + vec3<f32>(0.05) * (1.0 - groove) * 0.5;
+        return c;
     }
-    if (tex == 2) { // tela / lino: trama cruzada
-        let wx = 0.5 + 0.5 * sin(uv2.x * 48.0);
-        let wy = 0.5 + 0.5 * sin(uv2.y * 48.0);
-        return base * mix(0.82, 1.12, wx * wy);
+    if (tex == 2) { // TELA / LINO: hilos entrelazados (urdimbre/trama) con sombreado
+        let s = uv2 * 30.0;
+        let warp = 0.5 + 0.5 * sin(s.x * 6.2831);
+        let weft = 0.5 + 0.5 * sin(s.y * 6.2831);
+        let over = step(0.5, fract((floor(s.x) + floor(s.y)) * 0.5)); // alternancia del tejido
+        let th = mix(warp, weft, over);
+        let fuzz = 0.94 + 0.10 * fbm2(uv2 * 70.0);
+        return base * (0.74 + 0.36 * th) * fuzz;
     }
-    if (tex == 3) { // madera: vetas
-        let rings = 0.5 + 0.5 * sin(uv2.x * 9.0 + nz2(uv2 * vec2<f32>(2.0, 6.0)) * 6.0);
-        return base * (0.68 + 0.34 * rings);
+    if (tex == 3) { // MADERA: anillos con domain warp + vetas finas + nudos
+        let w = fbm2(uv2 * vec2<f32>(1.4, 3.2)) * 1.8;
+        let rings = 0.5 + 0.5 * sin((uv2.x * 7.5 + w) * 6.2831);
+        let grain = 0.86 + 0.14 * fbm2(uv2 * vec2<f32>(46.0, 9.0));
+        return base * mix(0.66, 1.10, rings) * grain;
     }
-    if (tex == 4) { // kraft: papel rugoso
-        let nn = nz2(uv2 * 38.0);
-        return base * (0.88 + 0.16 * nn);
+    if (tex == 4) { // KRAFT: fibra de papel + motas
+        let fib = fbm2(uv2 * 30.0);
+        let fleck = step(0.94, hash21(floor(uv2 * 90.0))) * 0.12;
+        return base * (0.90 + 0.16 * fib) - vec3<f32>(fleck);
     }
-    if (tex == 5) { // fibra de carbono: tejido 2x2
-        let g = fract(uv2 * 9.0);
-        let a = step(0.5, g.x);
-        let b = step(0.5, g.y);
-        let w = abs(a - b);
-        return mix(base * 0.45, base, w) * (0.75 + 0.25 * sin((g.x + g.y) * 18.0));
+    if (tex == 5) { // FIBRA DE CARBONO: sarga 2x2 con brillo direccional
+        let s = uv2 * 11.0;
+        let blk = floor(s);
+        let diag = fract((blk.x - blk.y) * 0.5);                 // direccion de la sarga
+        let dirv = select(fract(s.y), fract(s.x), diag < 0.5);
+        let sheen = 0.35 + 0.65 * pow(0.5 + 0.5 * sin(dirv * 6.2831), 2.0);
+        return base * (0.5 + 1.0 * sheen);
     }
-    // tex == 6: cuadros (tablero)
+    // tex == 6: CUADROS (tablero)
     let g = floor(uv2 * 6.0);
     let c = abs(fract((g.x + g.y) * 0.5) * 2.0 - 1.0);
     return mix(base * 0.55, base, 1.0 - c);
@@ -956,9 +1004,12 @@ fn cover_color(in: VsOut) -> vec3<f32> {
         col = mix(in.base, in.accent, cov);
         col = col + in.accent * cov * 0.08; // leve halo
     } else {
-        // Textura procedural del MATERIAL de la tapa (cuero/tela/madera/kraft/carbono/cuadros)
-        // sobre el color base; el foil/efecto se anade encima.
-        col = tex_surface(i32(round(in.texture)), col, vec3<f32>(in.uv * 2.2, 0.0), vec3<f32>(0.0, 0.0, 1.0));
+        // MATERIAL del cuaderno: si hay textura, la tapa toma el COLOR del material (cuero/tela/
+        // madera/kraft/carbono) + su grano realista; el foil/efecto se anade encima. Asi, Mate +
+        // textura = un cuaderno de material puro (sin diseño de carátula).
+        let tex = i32(round(in.texture));
+        if (tex > 0) { col = material_color(tex); }
+        col = tex_surface(tex, col, vec3<f32>(in.uv * 3.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
         // ---------------- FOIL: el efecto vive a reposo (idle) y crece con el cursor ----------------
         let eff = (0.30 + 0.70 * h) * (0.6 + 0.4 * inten);
         if (fin == 1) {
@@ -1076,15 +1127,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             col = mix(col, vec3<f32>(0.11, 0.10, 0.13), elastic * 0.85);
         }
     } else if (face == 1) {
-        // Reverso: carton oscuro + una "cinta de masquin" beige (el NOMBRE lo dibuja la UI).
-        col = vec3<f32>(0.15, 0.13, 0.12);
+        // Reverso: si hay TEXTURA, el material envuelve TODO el cuaderno (cuaderno real); si no,
+        // carton oscuro. Encima, una "cinta de masquin" beige para el nombre (lo dibuja la UI).
+        let tex1 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
+        if (tex1 > 0) {
+            col = tex_surface(tex1, material_color(tex1), vec3<f32>(in.uv * 3.0, 0.4), vec3<f32>(0.0, 0.0, 1.0));
+        } else {
+            col = vec3<f32>(0.15, 0.13, 0.12);
+        }
         let d = abs(in.uv - vec2<f32>(0.5, 0.5));
         let tape = step(d.x, 0.40) * step(d.y, 0.15);
         let tcol = vec3<f32>(0.86, 0.80, 0.62) * (0.96 + 0.04 * sin(in.uv.x * 70.0));
         col = mix(col, tcol, tape);
     } else if (face == 3) {
-        // LOMO (encuadernacion).
-        if (shp == 3) {
+        // LOMO (encuadernacion). Con textura, el lomo tambien es del material.
+        let tex3 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
+        if (tex3 > 0 && shp != 3) {
+            col = tex_surface(tex3, material_color(tex3), vec3<f32>(in.uv.yx * vec2<f32>(2.0, 1.0), 0.7), vec3<f32>(0.0, 0.0, 1.0));
+        } else if (shp == 3) {
             // ESPIRAL: anillos metalicos a lo largo del lomo (uv.x recorre el largo del lomo).
             let rings = grid_line(in.uv.x * 22.0, 0.32);
             let metal = mix(vec3<f32>(0.32, 0.34, 0.38), vec3<f32>(0.88, 0.91, 0.96), rings);
