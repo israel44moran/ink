@@ -317,7 +317,7 @@ struct App {
     /// Renombrado en linea: indice del cuaderno cuyo nombre se edita (clic en el nombre).
     renaming: Option<usize>,
     rename_buf: String,
-    rename_focus: bool,
+    rename_grace: i32,
 }
 
 impl App {
@@ -427,7 +427,7 @@ impl App {
             dragging: false,
             renaming: None,
             rename_buf: String::new(),
-            rename_focus: false,
+            rename_grace: 0,
         }
     }
 
@@ -998,26 +998,35 @@ impl App {
                 (0.0, base_rx, base_ry)
             };
             let a = &mut self.card_anim[i];
-            let k = 0.22;
+            let k = 0.12; // suave: el hover/tilt llega despacio (no brusco)
             a[0] += (t_hover - a[0]) * k;
             a[1] += (t_rotx - a[1]) * k;
             a[2] += (t_roty - a[2]) * k;
-            // Volteo con INERCIA (gravedad cero): integra la velocidad y la amortigua por un
-            // rozamiento muy suave -> el cuaderno "flota" girando y frena despacio.
-            let mut nf = self.card_flip[i] + self.card_flip_vel[i];
-            self.card_flip_vel[i] *= 0.94;
-            if nf < 0.0 {
-                nf = 0.0;
+            // Volteo: mientras el cursor ESTA encima, gira con INERCIA (gravedad cero) y se queda
+            // donde lo dejes; al SALIR el cursor, vuelve suave a la portada (0).
+            if inside {
+                let mut nf = self.card_flip[i] + self.card_flip_vel[i];
+                self.card_flip_vel[i] *= 0.94; // rozamiento muy suave -> flota y frena despacio
+                if nf < 0.0 {
+                    nf = 0.0;
+                    self.card_flip_vel[i] = 0.0;
+                }
+                if nf > std::f32::consts::PI {
+                    nf = std::f32::consts::PI;
+                    self.card_flip_vel[i] = 0.0;
+                }
+                if self.card_flip_vel[i].abs() < 0.0004 {
+                    self.card_flip_vel[i] = 0.0;
+                }
+                self.card_flip[i] = nf;
+            } else {
+                // El cursor ya no esta encima: regresa fluido a su posicion original.
                 self.card_flip_vel[i] = 0.0;
+                self.card_flip[i] += (0.0 - self.card_flip[i]) * 0.10;
+                if self.card_flip[i].abs() < 0.002 {
+                    self.card_flip[i] = 0.0;
+                }
             }
-            if nf > std::f32::consts::PI {
-                nf = std::f32::consts::PI;
-                self.card_flip_vel[i] = 0.0;
-            }
-            if self.card_flip_vel[i].abs() < 0.0004 {
-                self.card_flip_vel[i] = 0.0;
-            }
-            self.card_flip[i] = nf;
         }
         self.card_rects = layout.iter().map(|(c, h)| (c.x, c.y, h.x, h.y)).collect();
     }
@@ -2376,7 +2385,7 @@ impl ApplicationHandler for App {
                                     self.renaming = Some(i);
                                     self.rename_buf =
                                         self.notebooks.get(i).map(|n| n.name.clone()).unwrap_or_default();
-                                    self.rename_focus = true;
+                                    self.rename_grace = 5; // sobrevive al "soltar" del clic inicial
                                 } else if let Some(i) = self.library_card_at() {
                                     self.drag_idx = Some(i);
                                     self.drag_start = self.cursor;
@@ -3082,11 +3091,14 @@ impl ApplicationHandler for App {
                                                     .char_limit(char_limit)
                                                     .horizontal_align(egui::Align::Center),
                                             );
-                                            if self.rename_focus {
+                                            // Margen de gracia: durante unos frames forzamos el
+                                            // foco para que el "soltar" del clic que inicio el
+                                            // renombrado (aunque sea en el 2º/3er renglon, fuera
+                                            // del cuadro) NO lo cierre al instante.
+                                            if self.rename_grace > 0 {
                                                 resp.request_focus();
-                                                self.rename_focus = false;
-                                            }
-                                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                self.rename_grace -= 1;
+                                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                                 lib_cancel_rename = true;
                                             } else if resp.lost_focus() {
                                                 lib_rename = Some(ri);
