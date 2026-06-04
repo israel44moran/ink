@@ -56,18 +56,19 @@ fn erase_inst_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// Instancia de una "carta" de la biblioteca (13 floats = 52 bytes):
+/// Instancia de una "carta" de la biblioteca (18 floats = 72 bytes):
 /// [center.x, center.y, half.x, half.y, rotX, rotY, pointer.x, pointer.y, hover, baseR, baseG,
-///  baseB, finish].
-pub type CardInstance = [f32; 13];
+///  baseB, finish, fx, fx_intensity, accentR, accentG, accentB].
+pub type CardInstance = [f32; 18];
 
-const CARD_INST_ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
-    0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32, 5 => Float32x3, 6 => Float32
+const CARD_INST_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
+    0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32, 5 => Float32x3,
+    6 => Float32, 7 => Float32, 8 => Float32, 9 => Float32x3
 ];
 
 fn card_inst_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: 52,
+        array_stride: 72,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &CARD_INST_ATTRS,
     }
@@ -748,9 +749,9 @@ impl GpuState {
     /// lienzo). Sube las instancias y actualiza el uniform de viewport/focal para el tilt 3D.
     /// `vw`/`vh` deben estar en las MISMAS unidades que las posiciones de las cartas (las del
     /// cursor / `camera.viewport`), para que coincidan con el hit-test del hover/clic.
-    pub fn set_cards(&mut self, cards: &[CardInstance], vw: f32, vh: f32) {
+    pub fn set_cards(&mut self, cards: &[CardInstance], vw: f32, vh: f32, time: f32) {
         self.card_inst.upload(&self.device, &self.queue, cards);
-        let view: [f32; 4] = [vw.max(1.0), vh.max(1.0), 900.0, 0.0];
+        let view: [f32; 4] = [vw.max(1.0), vh.max(1.0), 900.0, time];
         self.queue.write_buffer(&self.card_view_buf, 0, bytemuck::cast_slice(&view));
     }
 

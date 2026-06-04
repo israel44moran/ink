@@ -15,6 +15,10 @@ fn default_finish() -> u32 {
     1 // holografico
 }
 
+fn default_intensity() -> f32 {
+    1.0
+}
+
 /// Una pagina (hoja) del cuaderno: su propio dibujo, texto y borrados. Un cuaderno
 /// infinito tiene UNA pagina (el espacio infinito); uno de hojas tiene varias.
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,10 +53,21 @@ pub struct NotebookData {
     pub name: String,
     /// `true` = lienzo infinito (1 pagina); `false` = con hojas (varias paginas A4).
     pub infinite: bool,
-    /// Acabado/diseño de la "carta" en la biblioteca (0=mate, 1=holo, 2=galaxia, 3=oro,
-    /// 4=prisma, 5=destellos).
+    /// Diseño BASE de la "carta" en la biblioteca. Foils: 0=mate, 1=holo, 2=galaxia, 3=oro,
+    /// 4=prisma, 5=destellos, 6=aurora, 7=neon, 8=esmeralda, 9=rubi, 10=cromo, 11=atardecer.
+    /// Cargadores organicos animados: >= 100 (100+indice).
     #[serde(default = "default_finish")]
     pub finish: u32,
+    /// Capas/efectos COMBINABLES encima del diseño base (mascara de bits):
+    /// 1=destellos, 2=brillo animado (barrido), 4=resplandor (latido).
+    #[serde(default)]
+    pub fx: u32,
+    /// Intensidad de las capas/efectos (0..1).
+    #[serde(default = "default_intensity")]
+    pub fx_intensity: f32,
+    /// Acento de color (indice de paleta; 0 = por defecto / blanco y negro en los cargadores).
+    #[serde(default)]
+    pub accent: u32,
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -76,6 +91,9 @@ impl NotebookData {
             name: name.to_string(),
             infinite,
             finish,
+            fx: 0,
+            fx_intensity: 1.0,
+            accent: 0,
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -106,6 +124,9 @@ pub struct NotebookEntry {
     pub name: String,
     pub infinite: bool,
     pub finish: u32,
+    pub fx: u32,
+    pub fx_intensity: f32,
+    pub accent: u32,
     pub path: PathBuf,
 }
 
@@ -143,7 +164,15 @@ pub fn list() -> Vec<NotebookEntry> {
             let p = e.path();
             if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) {
                 if let Some(nb) = load(&p) {
-                    out.push(NotebookEntry { name: nb.name, infinite: nb.infinite, finish: nb.finish, path: p });
+                    out.push(NotebookEntry {
+                        name: nb.name,
+                        infinite: nb.infinite,
+                        finish: nb.finish,
+                        fx: nb.fx,
+                        fx_intensity: nb.fx_intensity,
+                        accent: nb.accent,
+                        path: p,
+                    });
                 }
             }
         }

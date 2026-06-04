@@ -258,6 +258,10 @@ struct App {
     current_path: Option<std::path::PathBuf>,
     /// Acabado/diseño del cuaderno abierto (se conserva al guardar).
     current_finish: u32,
+    /// Capas (fx), intensidad y acento del cuaderno abierto (se conservan al guardar).
+    current_fx: u32,
+    current_intensity: f32,
+    current_accent: u32,
     /// Paginas del cuaderno abierto (la pagina activa esta volcada en doc/texts/...).
     pages: Vec<notebook::PageData>,
     /// Indice de la pagina activa.
@@ -270,8 +274,16 @@ struct App {
     new_nb_name: String,
     /// Tipo del cuaderno nuevo: infinito (true) o con hojas (false).
     new_nb_infinite: bool,
-    /// Acabado/diseño elegido para el cuaderno nuevo (0..5).
+    /// Diseño base elegido para el cuaderno nuevo (foil 0..11 o cargador >= 100).
     new_nb_finish: u32,
+    /// Capas (fx), intensidad y acento elegidos para el cuaderno nuevo.
+    new_nb_fx: u32,
+    new_nb_intensity: f32,
+    new_nb_accent: u32,
+    /// Panel de creación abierto (vista previa + opciones de carátula).
+    creating_nb: bool,
+    /// Reloj de animación (segundos acumulados) para las cartas.
+    clock: f32,
     // --- Cartas hologr aficas de la biblioteca (Home) ---
     /// Animacion por carta: [hover 0..1, rotX, rotY] (suavizado hacia el objetivo).
     card_anim: Vec<[f32; 3]>,
@@ -354,6 +366,9 @@ impl App {
             notebooks: Vec::new(),
             current_path: None,
             current_finish: 1,
+            current_fx: 0,
+            current_intensity: 1.0,
+            current_accent: 0,
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
             lock_page: false,
@@ -361,6 +376,11 @@ impl App {
             new_nb_name: String::new(),
             new_nb_infinite: true,
             new_nb_finish: 1,
+            new_nb_fx: 0,
+            new_nb_intensity: 1.0,
+            new_nb_accent: 0,
+            creating_nb: false,
+            clock: 0.0,
             card_anim: Vec::new(),
             card_rects: Vec::new(),
             card_scroll: 0.0,
@@ -784,6 +804,9 @@ impl App {
     fn apply_notebook(&mut self, nb: notebook::NotebookData) {
         self.commit_text();
         self.current_finish = nb.finish;
+        self.current_fx = nb.fx;
+        self.current_intensity = nb.fx_intensity;
+        self.current_accent = nb.accent;
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -806,6 +829,9 @@ impl App {
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cuaderno").to_string();
         let infinite = matches!(self.settings.artboard, settings::Artboard::Infinite);
         let mut nb = notebook::NotebookData::new(&name, infinite, self.current_finish);
+        nb.fx = self.current_fx;
+        nb.fx_intensity = self.current_intensity;
+        nb.accent = self.current_accent;
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -819,10 +845,13 @@ impl App {
         }
     }
 
-    /// Crea un cuaderno nuevo, lo guarda y lo abre.
-    fn new_notebook(&mut self, name: &str, infinite: bool, finish: u32) {
+    /// Crea un cuaderno nuevo (con su carátula: diseño base + capas), lo guarda y lo abre.
+    fn new_notebook(&mut self, name: &str, infinite: bool, finish: u32, fx: u32, intensity: f32, accent: u32) {
         let name = if name.trim().is_empty() { "Cuaderno" } else { name.trim() };
-        let nb = notebook::NotebookData::new(name, infinite, finish);
+        let mut nb = notebook::NotebookData::new(name, infinite, finish);
+        nb.fx = fx;
+        nb.fx_intensity = intensity;
+        nb.accent = accent;
         let path = notebook::path_for(name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
@@ -838,6 +867,7 @@ impl App {
         self.notebooks = notebook::list();
         self.card_scroll = 0.0;
         self.card_anim.clear();
+        self.creating_nb = false;
     }
 
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
@@ -925,9 +955,17 @@ impl App {
             let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
             let ptr_x = ((cur.x - (c.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
             let ptr_y = ((cur.y - (c.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
-            let finish = self.notebooks.get(i).map_or(1, |n| n.finish);
+            let nb = self.notebooks.get(i);
+            let finish = nb.map_or(1, |n| n.finish);
+            let fx = nb.map_or(0, |n| n.fx);
+            let inten = nb.map_or(1.0, |n| n.fx_intensity);
+            let accent = nb.map_or(0, |n| n.accent);
             let base = finish_base_color(finish);
-            cards.push([c.x, c.y, h.x, h.y, a[1], a[2], ptr_x, ptr_y, a[0], base[0], base[1], base[2], finish as f32]);
+            let ac = accent_color(accent);
+            cards.push([
+                c.x, c.y, h.x, h.y, a[1], a[2], ptr_x, ptr_y, a[0],
+                base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
+            ]);
             if a[0] > 0.45 {
                 hover_idx = Some(i);
             }
@@ -937,6 +975,34 @@ impl App {
             cards.push(card);
         }
         cards
+    }
+
+    /// Rectangulo (centro, medio-tamano en px) de la carta de VISTA PREVIA del panel de
+    /// creación: grande, a la izquierda de la pantalla (proporcion 5:7).
+    fn preview_rect(&self) -> (Vec2, Vec2) {
+        let vp = self.camera.viewport;
+        let hh = (vp.y * 0.30).clamp(180.0, 720.0);
+        let hw = hh * (188.0 / 263.0);
+        (vec2(vp.x * 0.28, vp.y * 0.54), vec2(hw, hh))
+    }
+
+    /// Construye la UNICA carta de vista previa (efecto pleno + vaiven 3D automatico) que se
+    /// muestra mientras se elige la carátula en el panel de creación.
+    fn build_preview_card(&self) -> Vec<renderer::CardInstance> {
+        let (c, h) = self.preview_rect();
+        let finish = self.new_nb_finish;
+        let base = finish_base_color(finish);
+        let ac = accent_color(self.new_nb_accent);
+        let t = self.clock;
+        let rotx = (t * 0.7).sin() * 0.12; // vaiven suave para lucir el 3D
+        let roty = (t * 0.9).cos() * 0.16;
+        let ptr_x = 0.5 + 0.42 * (t * 0.6).sin(); // el brillo recorre la carta
+        let ptr_y = 0.5 + 0.42 * (t * 0.5).cos();
+        vec![[
+            c.x, c.y, h.x, h.y, rotx, roty, ptr_x, ptr_y, 1.0,
+            base[0], base[1], base[2], finish as f32, self.new_nb_fx as f32,
+            self.new_nb_intensity, ac[0], ac[1], ac[2],
+        ]]
     }
 
     /// Deshace la ULTIMA operacion de dibujo (procedural, de pincel PS o de goma), en orden.
@@ -2041,7 +2107,7 @@ impl ApplicationHandler for App {
                             self.ui.eyedropper = false;
                         } else if self.try_eyedropper() {
                             // Cuentagotas: tomo el color y no dibujo.
-                        } else if self.app_mode == AppMode::Library {
+                        } else if self.app_mode == AppMode::Library && !self.creating_nb {
                             // En la biblioteca, el clic abre o borra una carta (hit-test).
                             self.library_click();
                         } else {
@@ -2124,7 +2190,7 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                 };
-                if !egui_consumed && self.app_mode == AppMode::Library && amount != 0.0 {
+                if !egui_consumed && self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
                     // Biblioteca: la rueda desplaza la cuadricula de cartas.
                     self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
                 }
@@ -2354,6 +2420,8 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
+                // Reloj de animacion de las cartas (acotado para no dar saltos al reanudar).
+                self.clock += dt.min(0.05);
                 self.fps_timer += dt;
                 self.fps_frames += 1;
                 if self.fps_timer >= 0.5 {
@@ -2446,6 +2514,8 @@ impl ApplicationHandler for App {
                 let mut lib_open: Option<PathBuf> = None;
                 let mut lib_delete: Option<PathBuf> = None;
                 let mut lib_create = false;
+                let mut lib_open_new = false;
+                let mut lib_cancel_new = false;
                 let mut lib_go = false;
                 let mut page_prev = false;
                 let mut page_next = false;
@@ -2457,10 +2527,14 @@ impl ApplicationHandler for App {
                 } else {
                     Vec::new()
                 };
-                // Layout + animacion de las cartas de la biblioteca (Home).
-                let card_layout = if in_library { self.library_card_layout() } else { Vec::new() };
-                if in_library {
+                // Layout + animacion de las cartas de la biblioteca (Home). Con el panel de
+                // creación abierto no hay cuadricula (solo la vista previa).
+                let show_grid = in_library && !self.creating_nb;
+                let card_layout = if show_grid { self.library_card_layout() } else { Vec::new() };
+                if show_grid {
                     self.update_card_anim(&card_layout);
+                } else {
+                    self.card_rects.clear();
                 }
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
@@ -2543,74 +2617,134 @@ impl ApplicationHandler for App {
                                 .color(egui::Color32::from_gray(170)),
                         );
                         ui.add_space(12.0);
-                        // --- Crear nuevo ---
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Nombre:").color(egui::Color32::from_gray(220)));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.new_nb_name)
-                                    .hint_text("Mi cuaderno")
-                                    .desired_width(220.0),
-                            );
-                            ui.selectable_value(&mut self.new_nb_infinite, true, "Lienzo infinito");
-                            ui.selectable_value(&mut self.new_nb_infinite, false, "Cuaderno de hojas");
-                            if ui.button(egui::RichText::new("Crear").strong()).clicked() {
-                                lib_create = true;
+                        if !self.creating_nb {
+                            // Boton que abre el panel de creación con vista previa.
+                            if ui.button(egui::RichText::new("Nuevo cuaderno").strong()).clicked() {
+                                lib_open_new = true;
                             }
-                        });
-                        ui.add_space(6.0);
-                        // Acabado/diseño de la carta del cuaderno nuevo.
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Diseño:").color(egui::Color32::from_gray(220)));
-                            for (idx, fname) in FINISH_NAMES.iter().enumerate() {
-                                if ui.selectable_label(self.new_nb_finish == idx as u32, *fname).clicked() {
-                                    self.new_nb_finish = idx as u32;
-                                }
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            if nb_list.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("Aún no tienes cuadernos. Pulsa «Nuevo cuaderno».")
+                                        .italics()
+                                        .color(egui::Color32::from_gray(140)),
+                                );
                             }
-                        });
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        if nb_list.is_empty() {
+                            // Las CARTAS se dibujan con wgpu detras de la UI; aqui solo van, sobre
+                            // cada carta, el NOMBRE y la papelera. El clic se maneja por hit-test.
+                            let ppp = ctx.pixels_per_point().max(0.01);
+                            let lp = ctx.layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::new("card_overlay"),
+                            ));
+                            let cur = self.cursor;
+                            for (i, (name, _inf, _path)) in nb_list.iter().enumerate() {
+                                let Some((c, h)) = card_layout.get(i) else { continue };
+                                lp.text(
+                                    egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
+                                    egui::Align2::CENTER_CENTER,
+                                    name,
+                                    egui::FontId::proportional(15.0),
+                                    egui::Color32::from_gray(230),
+                                );
+                                let dpx = c.x + h.x - 18.0;
+                                let dpy = c.y - h.y + 18.0;
+                                let near = (cur.x - dpx).hypot(cur.y - dpy) < 16.0;
+                                let dcol = if near { egui::Color32::from_rgb(235, 92, 92) } else { egui::Color32::from_gray(205) };
+                                let dc = egui::pos2(dpx / ppp, dpy / ppp);
+                                let st = egui::Stroke::new(1.7, dcol);
+                                let body = egui::Rect::from_min_max(dc + egui::vec2(-6.0, -2.0), dc + egui::vec2(6.0, 9.0));
+                                lp.rect_stroke(body, egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
+                                lp.line_segment([dc + egui::vec2(-8.0, -2.0), dc + egui::vec2(8.0, -2.0)], st);
+                                lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(3.0, -5.0)], st);
+                                lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(-3.0, -2.0)], st);
+                                lp.line_segment([dc + egui::vec2(3.0, -5.0), dc + egui::vec2(3.0, -2.0)], st);
+                            }
+                        } else {
                             ui.label(
-                                egui::RichText::new("Aún no tienes cuadernos. Escribe un nombre y pulsa Crear.")
+                                egui::RichText::new("Vista previa de la carátula a la izquierda; ajústala en el panel de la derecha.")
                                     .italics()
-                                    .color(egui::Color32::from_gray(140)),
+                                    .color(egui::Color32::from_gray(150)),
                             );
                         }
-                        // Las CARTAS (cuadernos) se dibujan con wgpu detras de la UI; aqui solo
-                        // van, sobre cada carta, el NOMBRE y un icono de papelera. El clic para
-                        // ABRIR o BORRAR se maneja por hit-test en los eventos (no widgets egui),
-                        // para no tapar el area de las cartas.
-                        let _ = ui; // el contenido de las cartas no usa el layout de egui
-                        let ppp = ctx.pixels_per_point().max(0.01);
-                        let lp = ctx.layer_painter(egui::LayerId::new(
-                            egui::Order::Foreground,
-                            egui::Id::new("card_overlay"),
-                        ));
-                        let cur = self.cursor;
-                        for (i, (name, _inf, _path)) in nb_list.iter().enumerate() {
-                            let Some((c, h)) = card_layout.get(i) else { continue };
-                            // Nombre centrado bajo la carta.
-                            lp.text(
-                                egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
-                                egui::Align2::CENTER_CENTER,
-                                name,
-                                egui::FontId::proportional(15.0),
-                                egui::Color32::from_gray(230),
-                            );
-                            // Papelera en la esquina superior derecha de la carta.
-                            let dpx = c.x + h.x - 18.0;
-                            let dpy = c.y - h.y + 18.0;
-                            let near = (cur.x - dpx).hypot(cur.y - dpy) < 16.0;
-                            let dcol = if near { egui::Color32::from_rgb(235, 92, 92) } else { egui::Color32::from_gray(205) };
-                            let dc = egui::pos2(dpx / ppp, dpy / ppp);
-                            let st = egui::Stroke::new(1.7, dcol);
-                            let body = egui::Rect::from_min_max(dc + egui::vec2(-6.0, -2.0), dc + egui::vec2(6.0, 9.0));
-                            lp.rect_stroke(body, egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
-                            lp.line_segment([dc + egui::vec2(-8.0, -2.0), dc + egui::vec2(8.0, -2.0)], st);
-                            lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(3.0, -5.0)], st);
-                            lp.line_segment([dc + egui::vec2(-3.0, -5.0), dc + egui::vec2(-3.0, -2.0)], st);
-                            lp.line_segment([dc + egui::vec2(3.0, -5.0), dc + egui::vec2(3.0, -2.0)], st);
+
+                        // Panel de CREACION (ventana a la derecha): la carta de vista previa la
+                        // dibuja wgpu a la izquierda; aqui van las opciones de la carátula.
+                        if self.creating_nb {
+                            let gray = egui::Color32::from_gray(180);
+                            egui::Window::new(egui::RichText::new("Nueva carátula").strong())
+                                .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-48.0, 0.0))
+                                .collapsible(false)
+                                .resizable(false)
+                                .default_width(380.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(2.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Nombre:");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.new_nb_name)
+                                                .hint_text("Mi cuaderno")
+                                                .desired_width(240.0),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(&mut self.new_nb_infinite, true, "Lienzo infinito");
+                                        ui.selectable_value(&mut self.new_nb_infinite, false, "Cuaderno de hojas");
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Diseño base").strong());
+                                    egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, false]).show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Foil").color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (id, name) in FOIL_DESIGNS {
+                                                if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
+                                                    self.new_nb_finish = id;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("Cargadores animados").color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (id, name) in LOADER_DESIGNS {
+                                                if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
+                                                    self.new_nb_finish = id;
+                                                }
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Capas (combinables)").strong());
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (bit, name) in FX_LAYERS {
+                                            let on = (self.new_nb_fx & bit) != 0;
+                                            if ui.selectable_label(on, name).clicked() {
+                                                self.new_nb_fx ^= bit;
+                                            }
+                                        }
+                                    });
+                                    pct_row(ui, "Intensidad", &mut self.new_nb_intensity);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Acento:");
+                                        for (idx, name) in ACCENTS.iter().enumerate() {
+                                            if ui.selectable_label(self.new_nb_accent == idx as u32, *name).clicked() {
+                                                self.new_nb_accent = idx as u32;
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(10.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.button(egui::RichText::new("Crear").strong()).clicked() {
+                                            lib_create = true;
+                                        }
+                                        if ui.button("Cancelar").clicked() {
+                                            lib_cancel_new = true;
+                                        }
+                                    });
+                                });
                         }
                     });
                   }
@@ -2625,10 +2759,24 @@ impl ApplicationHandler for App {
                 if let Some(p) = lib_open {
                     self.open_notebook(p);
                 }
+                if lib_open_new {
+                    self.creating_nb = true;
+                }
+                if lib_cancel_new {
+                    self.creating_nb = false;
+                }
                 if lib_create {
                     let name = self.new_nb_name.clone();
-                    self.new_notebook(&name, self.new_nb_infinite, self.new_nb_finish);
+                    self.new_notebook(
+                        &name,
+                        self.new_nb_infinite,
+                        self.new_nb_finish,
+                        self.new_nb_fx,
+                        self.new_nb_intensity,
+                        self.new_nb_accent,
+                    );
                     self.new_nb_name.clear();
+                    self.creating_nb = false;
                 }
                 if let Some(p) = lib_delete {
                     notebook::delete(&p);
@@ -2837,7 +2985,13 @@ impl ApplicationHandler for App {
 
                 // Cartas de la biblioteca (vacio en el lienzo). Se construye antes de prestar
                 // la GPU (build_card_instances usa &self).
-                let cards = if in_library { self.build_card_instances(&card_layout) } else { Vec::new() };
+                let cards = if !in_library {
+                    Vec::new()
+                } else if self.creating_nb {
+                    self.build_preview_card()
+                } else {
+                    self.build_card_instances(&card_layout)
+                };
 
                 // --- Render (lienzo + UI encima) ---
                 if let Some(g) = self.gpu.as_mut() {
@@ -2848,7 +3002,7 @@ impl ApplicationHandler for App {
                     g.set_bg(bg);
                     g.set_content_clip(content_clip);
                     g.set_grid(&self.grid_mesh);
-                    g.set_cards(&cards, self.camera.viewport.x, self.camera.viewport.y);
+                    g.set_cards(&cards, self.camera.viewport.x, self.camera.viewport.y, self.clock);
                     g.update_camera(self.camera.view_proj());
                     g.render(&primitives, &full_output.textures_delta, &screen);
                 }
@@ -2918,18 +3072,55 @@ fn smoothing_string_radius_px(smoothing: f32) -> f32 {
     smoothing.clamp(0.0, 1.0) * 48.0
 }
 
-/// Nombres de los acabados de carta de la biblioteca (indice = id del acabado).
-const FINISH_NAMES: [&str; 6] = ["Mate", "Holográfico", "Galaxia", "Oro", "Prisma", "Destellos"];
+/// Diseños FOIL (id, nombre) que se eligen como carátula base.
+const FOIL_DESIGNS: [(u32, &str); 12] = [
+    (0, "Mate"), (1, "Holográfico"), (2, "Galaxia"), (3, "Oro"), (4, "Prisma"), (5, "Destellos"),
+    (6, "Aurora"), (7, "Neón"), (8, "Esmeralda"), (9, "Rubí"), (10, "Cromo"), (11, "Atardecer"),
+];
 
-/// Color base de cada acabado (el shader de cartas anade el efecto encima).
+/// Cargadores ORGANICOS animados (id >= 100, nombre).
+const LOADER_DESIGNS: [(u32, &str); 12] = [
+    (100, "Gota"), (101, "Metábolas"), (102, "Onda"), (103, "Pulso"), (104, "Órbita"),
+    (105, "Espiral"), (106, "Ameba"), (107, "Burbujas"), (108, "Cometa"), (109, "Flor"),
+    (110, "Gusano"), (111, "Lava"),
+];
+
+/// Capas COMBINABLES (bit, nombre).
+const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4, "Resplandor")];
+
+/// Paleta de ACENTO (idx, nombre). El 0 es blanco (B&N en los cargadores).
+const ACCENTS: [&str; 8] = ["Blanco", "Cian", "Magenta", "Ámbar", "Verde", "Rojo", "Violeta", "Azul"];
+
+/// Color base de cada diseño (el shader de cartas anade el efecto encima).
 fn finish_base_color(finish: u32) -> [f32; 3] {
     match finish {
-        0 => [0.82, 0.82, 0.86], // Mate (claro, sin holografico)
-        2 => [0.06, 0.05, 0.16], // Galaxia (azul casi negro)
-        3 => [0.34, 0.24, 0.07], // Oro (marron oscuro)
-        4 => [0.12, 0.13, 0.18], // Prisma (gris oscuro)
-        5 => [0.17, 0.10, 0.24], // Destellos (morado oscuro)
-        _ => [0.17, 0.20, 0.42], // Holografico (azul-violeta)
+        0 => [0.82, 0.82, 0.86],  // Mate (claro)
+        2 => [0.06, 0.05, 0.16],  // Galaxia (azul casi negro)
+        3 => [0.34, 0.24, 0.07],  // Oro (marron oscuro)
+        4 => [0.12, 0.13, 0.18],  // Prisma (gris oscuro)
+        5 => [0.17, 0.10, 0.24],  // Destellos (morado oscuro)
+        6 => [0.04, 0.10, 0.10],  // Aurora (verde-azulado oscuro)
+        7 => [0.05, 0.04, 0.10],  // Neón (azul muy oscuro)
+        8 => [0.03, 0.10, 0.06],  // Esmeralda (verde oscuro)
+        9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
+        10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
+        11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if f >= 100 => [0.05, 0.05, 0.06], // Cargadores: fondo oscuro neutro
+        _ => [0.17, 0.20, 0.42],  // Holografico (azul-violeta)
+    }
+}
+
+/// Color del acento elegido (idx 0 = blanco; el resto, colores para cargadores/resplandor).
+fn accent_color(accent: u32) -> [f32; 3] {
+    match accent {
+        1 => [0.20, 0.85, 1.00], // Cian
+        2 => [1.00, 0.25, 0.75], // Magenta
+        3 => [1.00, 0.72, 0.25], // Ámbar
+        4 => [0.35, 0.95, 0.45], // Verde
+        5 => [1.00, 0.32, 0.30], // Rojo
+        6 => [0.65, 0.45, 1.00], // Violeta
+        7 => [0.35, 0.55, 1.00], // Azul
+        _ => [0.95, 0.95, 0.97], // Blanco (B&N)
     }
 }
 
