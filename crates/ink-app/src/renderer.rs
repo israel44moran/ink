@@ -77,7 +77,7 @@ fn card_inst_layout() -> wgpu::VertexBufferLayout<'static> {
 
 /// Texturas de MATERIAL realistas (fotos CC0 de Poly Haven, 1K, incrustadas en el binario).
 /// El indice de capa = (campo `texture` del cuaderno) - 1. Orden = ver TEXTURE_NAMES en main.rs.
-const MATERIAL_JPGS: [&[u8]; 8] = [
+const MATERIAL_JPGS: [&[u8]; 10] = [
     include_bytes!("../assets/textures/cuero.jpg"),
     include_bytes!("../assets/textures/madera.jpg"),
     include_bytes!("../assets/textures/lino.jpg"),
@@ -86,6 +86,8 @@ const MATERIAL_JPGS: [&[u8]; 8] = [
     include_bytes!("../assets/textures/cuerorojo.jpg"),
     include_bytes!("../assets/textures/libro.jpg"),
     include_bytes!("../assets/textures/plywood.jpg"),
+    include_bytes!("../assets/textures/azulejo.jpg"),
+    include_bytes!("../assets/textures/gema.jpg"),
 ];
 
 /// Crea el array de texturas de material (con cadena de mipmaps generada en CPU) y su sampler

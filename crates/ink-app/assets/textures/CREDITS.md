@@ -13,6 +13,10 @@ Fotos de materiales **CC0 (dominio público)** descargadas de [Poly Haven](https
 | cuerorojo.jpg | Cuero rojo | `leather_red_02` |
 | libro.jpg | Tela de libro | `book_pattern` |
 | plywood.jpg | Contrachapado | `plywood` |
+| azulejo.jpg | Azulejo | `blue_floor_tiles_01` |
+| gema.jpg | Piedras preciosas (mármol) | `marble_01` |
+
+Además, **Diamante** (acolchado capitoné) es PROCEDURAL (en `card.wgsl`, no es una imagen).
 
 Se incrustan en el binario con `include_bytes!` (ver `MATERIAL_JPGS` en `renderer.rs`) y se suben a
 la GPU como un array de texturas con mipmaps. Para añadir más: descarga el JPG 1K de color de un

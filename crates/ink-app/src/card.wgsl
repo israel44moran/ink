@@ -31,6 +31,42 @@ fn mat_triplanar(layer: i32, p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return cx * w.x + cy * w.y + cz * w.z;
 }
 
+// DIAMANTE: acolchado capitoné (rombos puff + costuras + boton), cuero/satén burdeos. Procedural.
+fn diamante(uv: vec2<f32>) -> vec3<f32> {
+    let p = uv * 5.0;
+    let q = vec2<f32>(p.x + p.y, p.x - p.y);            // ejes diagonales -> rombos
+    let cell = fract(q) - vec2<f32>(0.5);
+    let d = max(abs(cell.x), abs(cell.y));              // 0 centro .. 0.5 borde del rombo
+    let seam = smoothstep(0.5, 0.40, d);                // costura hundida en el borde
+    let puff = clamp(1.0 - d * 1.6, 0.0, 1.0);          // abultamiento hacia el centro
+    let button = smoothstep(0.09, 0.0, length(cell));   // boton central
+    let base = vec3<f32>(0.34, 0.05, 0.09);             // burdeos
+    var c = base * (0.70 + 0.55 * puff);
+    c = c * (1.0 - 0.6 * seam);
+    c = c - vec3<f32>(button * 0.22);
+    let sheen = pow(puff, 3.0) * 0.32;                  // brillo satinado
+    return c + vec3<f32>(0.95, 0.75, 0.78) * sheen;
+}
+
+const TEX_DIAMOND: i32 = 11; // indice procedural (no es capa de imagen)
+// Material por UV (tapa/caras): diamante procedural o textura de imagen segun el indice.
+fn material_at(tex: i32, uv: vec2<f32>) -> vec3<f32> {
+    if (tex == TEX_DIAMOND) { return diamante(uv); }
+    return mat_sample(tex - 1, uv);
+}
+// Material para figuras 3D (triplanar); diamante usa la proyeccion dominante.
+fn material_tri(tex: i32, p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (tex == TEX_DIAMOND) {
+        let an = abs(n);
+        var uv2: vec2<f32>;
+        if (an.x >= an.y && an.x >= an.z) { uv2 = p.yz; }
+        else if (an.y >= an.z) { uv2 = p.xz; }
+        else { uv2 = p.xy; }
+        return diamante(uv2 * 0.5 + vec2<f32>(0.5));
+    }
+    return mat_triplanar(tex - 1, p, n);
+}
+
 struct VsIn {
     @builtin(vertex_index) vi: u32,
     @location(0) center: vec2<f32>,
@@ -654,7 +690,7 @@ fn figure3d(id: i32, p2: vec2<f32>, t: f32, accent: vec3<f32>, tex: i32) -> vec3
         let spec = pow(clamp(dot(reflect(rdo, n), ldir), 0.0, 1.0), 26.0);
         let rim = pow(1.0 - clamp(dot(n, -rdo), 0.0, 1.0), 3.0) * 0.35;
         var base = accent;
-        if (tex > 0) { base = mat_triplanar(tex - 1, pr, n); } // material realista sobre la figura
+        if (tex > 0) { base = material_tri(tex, pr, n); } // material realista/diamante sobre la figura
         col = base * (0.22 + 0.95 * dif) + vec3<f32>(1.0) * spec * 0.6 + accent * rim;
     }
     return col;
@@ -1028,8 +1064,8 @@ fn cover_color(in: VsOut) -> vec3<f32> {
         // textura = un cuaderno de material puro (sin diseño de carátula).
         let tex = i32(round(in.texture));
         if (tex > 0) {
-            // MATERIAL realista (textura CC0 tileada en la tapa); el foil se anade encima.
-            col = mat_sample(tex - 1, in.uv * vec2<f32>(1.0, in.aspect));
+            // MATERIAL realista (textura CC0 tileada) o diamante procedural; el foil va encima.
+            col = material_at(tex, in.uv * vec2<f32>(1.0, in.aspect));
         }
         // ---------------- FOIL: el efecto vive a reposo (idle) y crece con el cursor ----------------
         let eff = (0.30 + 0.70 * h) * (0.6 + 0.4 * inten);
@@ -1152,7 +1188,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // carton oscuro. Encima, una "cinta de masquin" beige para el nombre (lo dibuja la UI).
         let tex1 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
         if (tex1 > 0) {
-            col = mat_sample(tex1 - 1, in.uv * vec2<f32>(1.0, in.aspect));
+            col = material_at(tex1, in.uv * vec2<f32>(1.0, in.aspect));
         } else {
             col = vec3<f32>(0.15, 0.13, 0.12);
         }
@@ -1164,7 +1200,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // LOMO (encuadernacion). Con textura, el lomo tambien es del material.
         let tex3 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
         if (tex3 > 0 && shp != 3) {
-            col = mat_sample(tex3 - 1, in.uv * vec2<f32>(1.0, in.aspect));
+            col = material_at(tex3, in.uv * vec2<f32>(1.0, in.aspect));
         } else if (shp == 3) {
             // ESPIRAL: anillos metalicos a lo largo del lomo (uv.x recorre el largo del lomo).
             let rings = grid_line(in.uv.x * 22.0, 0.32);
