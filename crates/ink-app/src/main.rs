@@ -325,6 +325,13 @@ struct App {
     /// Al soltar una HOJA (nota rapida) sobre un cuaderno: menu (origen, destino) para elegir
     /// entre cambiar de posicion o guardar la nota dentro de ese cuaderno.
     merge_prompt: Option<(usize, usize)>,
+    /// VISTA PREVIA (Alt+clic): cuaderno en vista previa, progreso de apertura (0..1) y el
+    /// contenido de su 1ª pagina (trazos: puntos en mundo, color, ancho) + sus limites + nombre.
+    preview_idx: Option<usize>,
+    preview_t: f32,
+    preview_name: String,
+    preview_strokes: Vec<(Vec<Vec2>, [f32; 4], f32)>,
+    preview_bounds: Option<(Vec2, Vec2)>,
 }
 
 impl App {
@@ -438,6 +445,11 @@ impl App {
             rename_buf: String::new(),
             rename_grace: 0,
             merge_prompt: None,
+            preview_idx: None,
+            preview_t: 0.0,
+            preview_name: String::new(),
+            preview_strokes: Vec::new(),
+            preview_bounds: None,
         }
     }
 
@@ -966,6 +978,8 @@ impl App {
         self.drag_idx = None;
         self.dragging = false;
         self.renaming = None;
+        self.preview_idx = None;
+        self.preview_t = 0.0;
         // Limpiar la tinta del cuaderno que se cerro para que NO se vea en el Home.
         if let Some(g) = self.gpu.as_mut() {
             g.clear_ink();
@@ -1411,6 +1425,81 @@ impl App {
             base[0], base[1], base[2], finish as f32, self.new_nb_fx as f32,
             self.new_nb_intensity, ac[0], ac[1], ac[2],
             depth, overh, bf, self.new_nb_shape as f32, self.new_nb_texture as f32,
+        ]]
+    }
+
+    /// Abre la VISTA PREVIA (Alt+clic) del cuaderno `i`: carga su 1ª pagina y precalcula los
+    /// trazos (puntos en mundo, color, ancho) para previsualizar el contenido sin abrir el libro.
+    fn open_preview(&mut self, i: usize) {
+        let Some(entry) = self.notebooks.get(i) else { return };
+        let path = entry.path.clone();
+        let name = entry.name.clone();
+        let Some(nb) = notebook::load(&path) else { return };
+        let mut strokes: Vec<(Vec<Vec2>, [f32; 4], f32)> = Vec::new();
+        let mut mn = Vec2::splat(f32::MAX);
+        let mut mx = Vec2::splat(f32::MIN);
+        if let Some(pg) = nb.pages.first() {
+            for layer in &pg.doc.layers {
+                if !layer.visible {
+                    continue;
+                }
+                for st in &layer.strokes {
+                    if st.samples.is_empty() {
+                        continue;
+                    }
+                    let pts: Vec<Vec2> = st.samples.iter().map(|s| s.pos).collect();
+                    for p in &pts {
+                        mn = mn.min(*p);
+                        mx = mx.max(*p);
+                    }
+                    let mut c = st.brush.color;
+                    c[3] *= layer.opacity * st.brush.opacity;
+                    strokes.push((pts, c, st.brush.width));
+                }
+            }
+        }
+        self.preview_idx = Some(i);
+        self.preview_t = 0.0;
+        self.preview_name = name;
+        self.preview_strokes = strokes;
+        self.preview_bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
+    }
+
+    /// Cierra la vista previa.
+    fn close_preview(&mut self) {
+        self.preview_idx = None;
+        self.preview_t = 0.0;
+        self.preview_strokes.clear();
+        self.preview_bounds = None;
+    }
+
+    /// Construye la carta del LIBRO en vista previa: grande, desplazada a la izquierda y con un
+    /// giro que sugiere "abrirse" (la pagina con el contenido la dibuja egui a la derecha).
+    fn build_preview_book(&self) -> Vec<renderer::CardInstance> {
+        let Some(i) = self.preview_idx else { return Vec::new() };
+        let Some(nb) = self.notebooks.get(i) else { return Vec::new() };
+        let vp = self.camera.viewport;
+        let t = self.preview_t * self.preview_t * (3.0 - 2.0 * self.preview_t); // smoothstep
+        let hh = (vp.y * 0.33).clamp(150.0, 760.0);
+        let hw = hh * (188.0 / 263.0);
+        let half = vec2(hw, hh) * (0.45 + 0.55 * t);
+        // Empieza centrado y se desplaza a la izquierda al "abrirse" (deja sitio a la pagina).
+        let cx = vp.x * (0.5 - 0.16 * t);
+        let cy = vp.y * 0.5;
+        let finish = nb.finish;
+        let is_sheet = finish >= 500 && finish < 600;
+        let shape = if is_sheet { 4 } else { nb.shape };
+        let (df, ohf, bf) = shape_params(shape);
+        let depth = if is_sheet { 0.012 } else { df * nb.thickness };
+        let overh = if is_sheet { 0.0 } else { ohf * nb.overhang };
+        let base = finish_base_color(finish);
+        let ac = accent_color(nb.accent);
+        let rotx = 0.12;
+        let roty = -0.55 * t + (self.clock * 0.4).sin() * 0.03; // gira hacia "abrir" + vaiven leve
+        vec![[
+            cx, cy, half.x, half.y, rotx, roty, 0.5, 0.4, 1.0,
+            base[0], base[1], base[2], finish as f32, nb.fx as f32, nb.fx_intensity,
+            ac[0], ac[1], ac[2], depth, overh, bf, shape as f32, nb.texture as f32,
         ]]
     }
 
@@ -2520,17 +2609,23 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => match button {
                 MouseButton::Left => match state {
                     ElementState::Pressed => {
-                        if self.app_mode == AppMode::Library && !self.creating_nb {
+                        if self.app_mode == AppMode::Library && self.preview_idx.is_some() {
+                            // Un clic durante la VISTA PREVIA la cierra (vuelve a la biblioteca).
+                            self.close_preview();
+                        } else if self.app_mode == AppMode::Library && !self.creating_nb {
                             // Cartas (wgpu, no widgets egui): decidir por hit-test, NO por
-                            // `egui_consumed`. Clic en el NOMBRE = editarlo en linea; en la carta =
-                            // posible arrastre (al soltar: abrir / reordenar / borrar).
-                            // El NOMBRE se renombra con una zona clicable de egui (ver abajo); aqui
-                            // solo gestionamos la CARTA (arrastrar/abrir).
+                            // `egui_consumed`. Alt+clic = VISTA PREVIA (abrir libro sin entrar);
+                            // clic normal = posible arrastre (al soltar: abrir / reordenar / borrar).
+                            // El NOMBRE se renombra con una zona clicable de egui (ver abajo).
                             if self.renaming.is_none() {
                                 if let Some(i) = self.library_card_at() {
-                                    self.drag_idx = Some(i);
-                                    self.drag_start = self.cursor;
-                                    self.dragging = false;
+                                    if self.alt_down {
+                                        self.open_preview(i);
+                                    } else {
+                                        self.drag_idx = Some(i);
+                                        self.drag_start = self.cursor;
+                                        self.dragging = false;
+                                    }
                                 }
                             }
                         } else if egui_consumed {
@@ -2626,7 +2721,9 @@ impl ApplicationHandler for App {
                             // Clic derecho sobre una carta = volver a EDITAR su carátula. Las
                             // cartas las dibuja wgpu (no son widgets egui), asi que se decide por
                             // hit-test, no por `egui_consumed` (egui reclama el puntero del panel).
-                            if !self.creating_nb {
+                            if self.preview_idx.is_some() {
+                                self.close_preview();
+                            } else if !self.creating_nb {
                                 if let Some(i) = self.library_card_at() {
                                     self.start_edit_cover(i);
                                 }
@@ -2991,6 +3088,7 @@ impl ApplicationHandler for App {
                 let mut lib_merge_save = false;
                 let mut lib_merge_swap = false;
                 let mut lib_merge_cancel = false;
+                let mut lib_close_preview = false;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
@@ -3011,12 +3109,17 @@ impl ApplicationHandler for App {
                 };
                 // Layout + animacion de las cartas de la biblioteca (Home). Con el panel de
                 // creación abierto no hay cuadricula (solo la vista previa).
-                let show_grid = in_library && !self.creating_nb;
+                let show_grid = in_library && !self.creating_nb && self.preview_idx.is_none();
                 let card_layout = if show_grid { self.library_card_layout() } else { Vec::new() };
                 if show_grid {
                     self.update_card_anim(&card_layout, dt.min(0.05));
                 } else {
                     self.card_rects.clear();
+                }
+                // Animacion de apertura de la vista previa (Alt+clic): preview_t 0 -> 1, suave.
+                if self.preview_idx.is_some() {
+                    let k = 1.0 - (-6.0 * dt.min(0.05)).exp();
+                    self.preview_t += (1.0 - self.preview_t) * k;
                 }
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
@@ -3092,6 +3195,84 @@ impl ApplicationHandler for App {
                     // ---------------- BIBLIOTECA de cuadernos (cartas hologr aficas) ----------------
                     // Panel SIN fondo: las cartas se dibujan con wgpu detras (fondo oscuro).
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        // VISTA PREVIA (Alt+clic): el LIBRO grande lo dibuja wgpu (izquierda); aqui
+                        // dibujamos la PAGINA con su contenido (a la derecha) que "se abre".
+                        if self.preview_idx.is_some() {
+                            let ppp = ctx.pixels_per_point().max(0.01);
+                            let vp = self.camera.viewport;
+                            let tt = self.preview_t.clamp(0.0, 1.0);
+                            let t = tt * tt * (3.0 - 2.0 * tt);
+                            let hh = (vp.y * 0.33).clamp(150.0, 760.0);
+                            let hw = hh * (188.0 / 263.0);
+                            let bhx = hw * (0.45 + 0.55 * t);
+                            let bookcx = vp.x * (0.5 - 0.16 * t);
+                            let page_h = hh * 1.84;
+                            let page_left = bookcx + bhx * 0.78;
+                            let page_w = (vp.x * 0.34) * t;
+                            let top = vp.y * 0.5 - page_h * 0.5;
+                            let page = egui::Rect::from_min_size(
+                                egui::pos2(page_left / ppp, top / ppp),
+                                egui::vec2(page_w / ppp, page_h / ppp),
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(page.expand(3.0), 6.0, egui::Color32::from_black_alpha(70));
+                            painter.rect_filled(page, 4.0, egui::Color32::from_rgb(247, 246, 242));
+                            if t > 0.22 {
+                                if let Some((mn, mx)) = self.preview_bounds {
+                                    let avail = page.shrink(14.0);
+                                    let bw = (mx.x - mn.x).max(1.0);
+                                    let bh = (mx.y - mn.y).max(1.0);
+                                    let s = (avail.width() / bw).min(avail.height() / bh);
+                                    let bcx = (mn.x + mx.x) * 0.5;
+                                    let bcy = (mn.y + mx.y) * 0.5;
+                                    let rc = avail.center();
+                                    let pp = painter.with_clip_rect(page);
+                                    for (pts, col, w) in &self.preview_strokes {
+                                        if pts.len() < 2 {
+                                            continue;
+                                        }
+                                        let c = egui::Color32::from_rgba_unmultiplied(
+                                            (col[0] * 255.0) as u8,
+                                            (col[1] * 255.0) as u8,
+                                            (col[2] * 255.0) as u8,
+                                            (col[3] * 255.0) as u8,
+                                        );
+                                        let sw = (w * s).max(0.6);
+                                        let line: Vec<egui::Pos2> = pts
+                                            .iter()
+                                            .map(|p| egui::pos2(rc.x + (p.x - bcx) * s, rc.y + (p.y - bcy) * s))
+                                            .collect();
+                                        pp.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
+                                    }
+                                } else {
+                                    painter.text(
+                                        page.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "(página en blanco)",
+                                        egui::FontId::proportional(15.0),
+                                        egui::Color32::from_gray(160),
+                                    );
+                                }
+                            }
+                            painter.text(
+                                egui::pos2((vp.x * 0.5) / ppp, (top - 26.0) / ppp),
+                                egui::Align2::CENTER_CENTER,
+                                &self.preview_name,
+                                egui::FontId::proportional(20.0),
+                                egui::Color32::from_gray(235),
+                            );
+                            painter.text(
+                                egui::pos2((vp.x * 0.5) / ppp, (top + page_h + 18.0) / ppp),
+                                egui::Align2::CENTER_CENTER,
+                                "Esc o clic para cerrar",
+                                egui::FontId::proportional(13.0),
+                                egui::Color32::from_gray(150),
+                            );
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                lib_close_preview = true;
+                            }
+                            return;
+                        }
                         ui.add_space(18.0);
                         ui.label(egui::RichText::new("Mis cuadernos").size(26.0).strong().color(egui::Color32::from_gray(235)));
                         ui.label(
@@ -3594,6 +3775,9 @@ impl ApplicationHandler for App {
                 if lib_quick_note {
                     self.new_quick_note();
                 }
+                if lib_close_preview {
+                    self.close_preview();
+                }
                 if let Some((from, target)) = self.merge_prompt {
                     if lib_merge_save {
                         self.merge_note_into(from, target);
@@ -3838,6 +4022,8 @@ impl ApplicationHandler for App {
                 // la GPU (build_card_instances usa &self).
                 let cards = if !in_library {
                     Vec::new()
+                } else if self.preview_idx.is_some() {
+                    self.build_preview_book()
                 } else if self.creating_nb {
                     self.build_preview_card()
                 } else {
