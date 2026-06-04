@@ -305,11 +305,11 @@ struct App {
     card_rects: Vec<(f32, f32, f32, f32)>,
     /// Desplazamiento vertical de la cuadricula de cartas (rueda).
     card_scroll: f32,
-    /// Angulo de volteo ANIMADO (rad, 0=portada, PI=reverso) de cada cuaderno (se suaviza hacia
-    /// `card_flip_target`).
+    /// Angulo de volteo (rad, 0=portada, PI=reverso) de cada cuaderno. Se mueve con INERCIA
+    /// (gravedad cero): la rueda le da impulso y luego flota hasta frenarse por rozamiento.
     card_flip: Vec<f32>,
-    /// Objetivo de volteo de cada cuaderno (lo fija la rueda); el valor animado lo persigue suave.
-    card_flip_target: Vec<f32>,
+    /// Velocidad angular del volteo de cada cuaderno (para la inercia).
+    card_flip_vel: Vec<f32>,
     /// Arrastre de cartas en la biblioteca: indice agarrado, punto inicial y si ya se arrastra.
     drag_idx: Option<usize>,
     drag_start: Vec2,
@@ -421,7 +421,7 @@ impl App {
             card_rects: Vec::new(),
             card_scroll: 0.0,
             card_flip: Vec::new(),
-            card_flip_target: Vec::new(),
+            card_flip_vel: Vec::new(),
             drag_idx: None,
             drag_start: Vec2::ZERO,
             dragging: false,
@@ -921,7 +921,7 @@ impl App {
         self.card_scroll = 0.0;
         self.card_anim.clear();
         self.card_flip.clear();
-        self.card_flip_target.clear();
+        self.card_flip_vel.clear();
         self.creating_nb = false;
         self.editing_nb = None;
         self.drag_idx = None;
@@ -965,7 +965,7 @@ impl App {
     fn update_card_anim(&mut self, layout: &[(Vec2, Vec2)]) {
         self.card_anim.resize(layout.len(), [0.0, 0.0, 0.0]);
         self.card_flip.resize(layout.len(), 0.0);
-        self.card_flip_target.resize(layout.len(), 0.0);
+        self.card_flip_vel.resize(layout.len(), 0.0);
         let cur = self.cursor;
         // Inclinacion BASE (siempre, para que se note el grosor 3D del cuaderno) + un rango
         // mayor al pasar el cursor (la carta "se mueve mas").
@@ -1002,11 +1002,22 @@ impl App {
             a[0] += (t_hover - a[0]) * k;
             a[1] += (t_rotx - a[1]) * k;
             a[2] += (t_roty - a[2]) * k;
-            // Volteo MUY suave (sin "gravedad"): el angulo persigue su objetivo con un paso
-            // pequeño cada frame -> giro fluido (60/120 fps) en vez de a saltos.
-            let f = self.card_flip[i];
-            let ft = self.card_flip_target[i];
-            self.card_flip[i] = f + (ft - f) * 0.10;
+            // Volteo con INERCIA (gravedad cero): integra la velocidad y la amortigua por un
+            // rozamiento muy suave -> el cuaderno "flota" girando y frena despacio.
+            let mut nf = self.card_flip[i] + self.card_flip_vel[i];
+            self.card_flip_vel[i] *= 0.94;
+            if nf < 0.0 {
+                nf = 0.0;
+                self.card_flip_vel[i] = 0.0;
+            }
+            if nf > std::f32::consts::PI {
+                nf = std::f32::consts::PI;
+                self.card_flip_vel[i] = 0.0;
+            }
+            if self.card_flip_vel[i].abs() < 0.0004 {
+                self.card_flip_vel[i] = 0.0;
+            }
+            self.card_flip[i] = nf;
         }
         self.card_rects = layout.iter().map(|(c, h)| (c.x, c.y, h.x, h.y)).collect();
     }
@@ -1023,8 +1034,9 @@ impl App {
     /// cursor.
     fn library_name_at(&self) -> Option<usize> {
         let cur = self.cursor;
+        // Cubre los 3 renglones del nombre (desde justo bajo la carta hasta el hueco de fila).
         self.card_rects.iter().position(|&(cx, cy, hx, hy)| {
-            (cur.x - cx).abs() <= hx && cur.y >= cy + hy + 16.0 && cur.y <= cy + hy + 118.0
+            (cur.x - cx).abs() <= hx && cur.y >= cy + hy + 8.0 && cur.y <= cy + hy + 128.0
         })
     }
 
@@ -1069,7 +1081,7 @@ impl App {
         self.notebooks = notebook::list();
         self.card_anim.clear();
         self.card_flip.clear();
-        self.card_flip_target.clear();
+        self.card_flip_vel.clear();
     }
 
     /// Zona de la PAPELERA unica (centro y radio, en px): arrastra una carta aqui para borrarla.
@@ -1092,7 +1104,7 @@ impl App {
             self.notebooks = notebook::list();
             self.card_anim.clear();
             self.card_flip.clear();
-            self.card_flip_target.clear();
+            self.card_flip_vel.clear();
         }
     }
 
@@ -1130,7 +1142,7 @@ impl App {
         self.notebooks = notebook::list();
         self.card_anim.clear();
         self.card_flip.clear();
-        self.card_flip_target.clear();
+        self.card_flip_vel.clear();
     }
 
     /// Abre el panel para EDITAR la carátula del cuaderno `i` (clic derecho): carga sus
@@ -2485,11 +2497,10 @@ impl ApplicationHandler for App {
                     // Biblioteca: la rueda SOBRE un cuaderno lo VOLTEA (ver portada/reverso); en
                     // zona vacia desplaza la cuadricula. (Las cartas son wgpu, no widgets egui.)
                     if let Some(i) = self.library_card_at() {
-                        self.card_flip_target.resize(self.notebooks.len(), 0.0);
-                        if i < self.card_flip_target.len() {
-                            // Solo fijamos el OBJETIVO; el giro se anima suave hacia el.
-                            self.card_flip_target[i] =
-                                (self.card_flip_target[i] + amount * 0.6).clamp(0.0, std::f32::consts::PI);
+                        self.card_flip_vel.resize(self.notebooks.len(), 0.0);
+                        if i < self.card_flip_vel.len() {
+                            // La rueda da IMPULSO; luego el cuaderno flota girando (inercia).
+                            self.card_flip_vel[i] += amount * 0.05;
                         }
                     } else {
                         self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
