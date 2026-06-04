@@ -318,6 +318,9 @@ struct App {
     renaming: Option<usize>,
     rename_buf: String,
     rename_grace: i32,
+    /// Al soltar una HOJA (nota rapida) sobre un cuaderno: menu (origen, destino) para elegir
+    /// entre cambiar de posicion o guardar la nota dentro de ese cuaderno.
+    merge_prompt: Option<(usize, usize)>,
 }
 
 impl App {
@@ -428,6 +431,7 @@ impl App {
             renaming: None,
             rename_buf: String::new(),
             rename_grace: 0,
+            merge_prompt: None,
         }
     }
 
@@ -1171,6 +1175,59 @@ impl App {
         let f = files.remove(from);
         files.insert(target.min(files.len()), f);
         notebook::save_order(&files);
+        self.notebooks = notebook::list();
+        self.card_anim.clear();
+        self.card_flip.clear();
+        self.card_flip_vel.clear();
+    }
+
+    /// ¿La carta `i` es una nota rapida (hoja, finish >= 500)?
+    fn card_is_sheet(&self, i: usize) -> bool {
+        self.notebooks.get(i).map_or(false, |n| n.finish >= 500)
+    }
+
+    /// Intercambia la POSICION de dos cartas en el orden manual (persistente).
+    fn swap_cards(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        let mut files: Vec<String> = self
+            .notebooks
+            .iter()
+            .filter_map(|nb| nb.path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()))
+            .collect();
+        if a >= files.len() || b >= files.len() {
+            return;
+        }
+        files.swap(a, b);
+        notebook::save_order(&files);
+        self.notebooks = notebook::list();
+        self.card_anim.clear();
+        self.card_flip.clear();
+        self.card_flip_vel.clear();
+    }
+
+    /// Fusiona la nota `from` DENTRO del cuaderno `target`: anexa sus paginas al final de las del
+    /// cuaderno y borra la nota suelta (y su entrada del orden).
+    fn merge_note_into(&mut self, from: usize, target: usize) {
+        let (Some(fe), Some(te)) = (self.notebooks.get(from), self.notebooks.get(target)) else {
+            return;
+        };
+        let fpath = fe.path.clone();
+        let tpath = te.path.clone();
+        let (Some(fnb), Some(mut tnb)) = (notebook::load(&fpath), notebook::load(&tpath)) else {
+            return;
+        };
+        // Anexar las hojas de la nota al final del cuaderno destino.
+        tnb.pages.extend(fnb.pages);
+        let _ = notebook::save(&tnb, &tpath);
+        // Borrar la nota suelta y quitarla del orden.
+        notebook::delete(&fpath);
+        if let Some(fname) = fpath.file_name().and_then(|s| s.to_str()) {
+            let mut order = notebook::load_order();
+            order.retain(|o| o != fname);
+            notebook::save_order(&order);
+        }
         self.notebooks = notebook::list();
         self.card_anim.clear();
         self.card_flip.clear();
@@ -2474,7 +2531,16 @@ impl ApplicationHandler for App {
                                 if self.dragging && self.over_trash_zone() {
                                     self.delete_card(i);
                                 } else if self.dragging {
-                                    self.drop_card(i);
+                                    // Si arrastramos una HOJA (nota rapida) sobre un CUADERNO
+                                    // (no hoja), ofrecer el menu reordenar/guardar-dentro; si no,
+                                    // reordenar normal.
+                                    let target = self.library_card_at();
+                                    match (self.card_is_sheet(i), target) {
+                                        (true, Some(tg)) if tg != i && !self.card_is_sheet(tg) => {
+                                            self.merge_prompt = Some((i, tg));
+                                        }
+                                        _ => self.drop_card(i),
+                                    }
                                 } else if let Some(nb) = self.notebooks.get(i) {
                                     self.open_notebook(nb.path.clone());
                                 }
@@ -2873,6 +2939,9 @@ impl ApplicationHandler for App {
                 let mut lib_save_cover = false;
                 let mut lib_open_new = false;
                 let mut lib_quick_note = false;
+                let mut lib_merge_save = false;
+                let mut lib_merge_swap = false;
+                let mut lib_merge_cancel = false;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
@@ -3191,6 +3260,46 @@ impl ApplicationHandler for App {
                                         });
                                 }
                             }
+                            // MENU al soltar una HOJA sobre un cuaderno: cambiar posicion o guardar dentro.
+                            if let Some((from, target)) = self.merge_prompt {
+                                let note_name =
+                                    self.notebooks.get(from).map(|n| n.name.clone()).unwrap_or_default();
+                                let book_name =
+                                    self.notebooks.get(target).map(|n| n.name.clone()).unwrap_or_default();
+                                egui::Window::new(egui::RichText::new("¿Qué hago con la nota?").strong())
+                                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                                    .collapsible(false)
+                                    .resizable(false)
+                                    .show(ctx, |ui| {
+                                        ui.label(format!("Nota: «{note_name}»"));
+                                        ui.label(format!("Cuaderno: «{book_name}»"));
+                                        ui.add_space(8.0);
+                                        if ui
+                                            .button(egui::RichText::new("📒  Guardar dentro de este cuaderno").strong())
+                                            .clicked()
+                                        {
+                                            lib_merge_save = true;
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("La nota se añade al final de sus hojas.")
+                                                .small()
+                                                .color(egui::Color32::from_gray(150)),
+                                        );
+                                        ui.add_space(6.0);
+                                        if ui.button("🔀  Cambiar de posición").clicked() {
+                                            lib_merge_swap = true;
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("Intercambia su lugar con el del cuaderno.")
+                                                .small()
+                                                .color(egui::Color32::from_gray(150)),
+                                        );
+                                        ui.add_space(8.0);
+                                        if ui.button("Cancelar").clicked() {
+                                            lib_merge_cancel = true;
+                                        }
+                                    });
+                            }
                         } else {
                             ui.label(
                                 egui::RichText::new("Vista previa de la carátula a la izquierda; ajústala en el panel de la derecha.")
@@ -3408,6 +3517,17 @@ impl ApplicationHandler for App {
                 }
                 if lib_quick_note {
                     self.new_quick_note();
+                }
+                if let Some((from, target)) = self.merge_prompt {
+                    if lib_merge_save {
+                        self.merge_note_into(from, target);
+                        self.merge_prompt = None;
+                    } else if lib_merge_swap {
+                        self.swap_cards(from, target);
+                        self.merge_prompt = None;
+                    } else if lib_merge_cancel {
+                        self.merge_prompt = None;
+                    }
                 }
                 if lib_cancel_new {
                     self.creating_nb = false;
