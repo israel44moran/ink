@@ -1152,11 +1152,30 @@ fn cover_color(in: VsOut) -> vec3<f32> {
     return clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Fondo del Home: degradado vertical profundo + glow suave + viñeta + leve dither (anti-banding).
+fn bg_gradient(uv: vec2<f32>) -> vec3<f32> {
+    let top = vec3<f32>(0.072, 0.078, 0.110);
+    let bot = vec3<f32>(0.028, 0.032, 0.050);
+    var c = mix(bot, top, uv.y); // uv.y=1 (arriba en pantalla) -> tono mas claro
+    let gd = distance(uv, vec2<f32>(0.5, 0.72));
+    c = c + vec3<f32>(0.045, 0.052, 0.082) * smoothstep(0.72, 0.0, gd); // glow arriba-centro
+    let d = distance(uv, vec2<f32>(0.5, 0.5));
+    c = c * (1.0 - smoothstep(0.5, 1.05, d) * 0.45); // viñeta
+    return c + (hash21(uv * 997.0) - 0.5) * 0.005;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = i32(round(in.face));
     let shp = i32(round(in.shape));
     var col: vec3<f32>;
+    // FONDO del Home (finish >= 900): cuad plano a pantalla completa con degradado/viñeta.
+    if (i32(round(in.finish)) >= 900) {
+        if (face == 0) {
+            return vec4<f32>(bg_gradient(in.uv), 1.0);
+        }
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
     // NOTA RAPIDA (hoja, finish 500..599): la portada lleva el patron; el resto, papel claro.
     // (Las figuras 3D, >= 600, son cuadernos normales y NO entran aqui.)
     let fin_sc = i32(round(in.finish));

@@ -1331,6 +1331,16 @@ impl App {
         }
     }
 
+    /// Cuad de FONDO del Home a pantalla completa (finish 900 -> degradado/viñeta en el shader).
+    /// Se dibuja el primero (detras de las cartas) para dar profundidad.
+    fn bg_card(&self) -> renderer::CardInstance {
+        let vp = self.camera.viewport;
+        [
+            vp.x * 0.5, vp.y * 0.5, vp.x * 0.5 + 4.0, vp.y * 0.5 + 4.0, 0.0, 0.0, 0.5, 0.5, 0.0,
+            0.0, 0.0, 0.0, 900.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 4.0, 0.0,
+        ]
+    }
+
     /// Construye las instancias de carta para la GPU. La carta bajo el cursor se dibuja al
     /// final (encima de las demas, ya que se eleva en 3D).
     fn build_card_instances(&self, layout: &[(Vec2, Vec2)]) -> Vec<renderer::CardInstance> {
@@ -3291,7 +3301,9 @@ impl ApplicationHandler for App {
                   } else {
                     // ---------------- BIBLIOTECA de cuadernos (cartas hologr aficas) ----------------
                     // Panel SIN fondo: las cartas se dibujan con wgpu detras (fondo oscuro).
-                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(40, 26)))
+                        .show(ctx, |ui| {
                         // VISTA PREVIA (Alt+clic): el LIBRO grande lo dibuja wgpu (izquierda); aqui
                         // dibujamos la PAGINA con su contenido (a la derecha) que "se abre".
                         if self.preview_idx.is_some() {
@@ -3416,34 +3428,59 @@ impl ApplicationHandler for App {
                             });
                             return;
                         }
-                        ui.add_space(18.0);
-                        ui.label(egui::RichText::new("Mis cuadernos").size(26.0).strong().color(egui::Color32::from_gray(235)));
-                        ui.label(
-                            egui::RichText::new("Crea cuadernos infinitos o con hojas. Se guardan solos al volver aquí.")
-                                .color(egui::Color32::from_gray(170)),
-                        );
-                        ui.add_space(12.0);
+                        // --- Cabecera: barra de acento + titulo + subtitulo ---
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let (bar, _) = ui.allocate_exact_size(egui::vec2(5.0, 34.0), egui::Sense::hover());
+                            ui.painter().rect_filled(bar, egui::CornerRadius::same(2), egui::Color32::from_rgb(120, 112, 255));
+                            ui.add_space(12.0);
+                            ui.vertical(|ui| {
+                                ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").size(30.0).strong().color(egui::Color32::from_gray(242))).selectable(false));
+                                ui.add(egui::Label::new(egui::RichText::new("Tu biblioteca de cuadernos y notas").size(13.0).color(egui::Color32::from_gray(148))).selectable(false));
+                            });
+                        });
+                        ui.add_space(16.0);
                         if !self.creating_nb {
-                            // Botones: crear cuaderno + abrir el panel de Tweaks (ajustes globales).
+                            // Botones: primario (acento) + secundario + Ajustes (a la derecha, fantasma).
+                            let accent = egui::Color32::from_rgb(108, 99, 255);
+                            let r = egui::CornerRadius::same(10);
+                            let bh = egui::vec2(0.0, 36.0);
                             ui.horizontal(|ui| {
-                                if ui.button(egui::RichText::new("Nuevo cuaderno").strong()).clicked() {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                if ui
+                                    .add(egui::Button::new(egui::RichText::new("＋  Nuevo cuaderno").color(egui::Color32::WHITE).strong())
+                                        .fill(accent).corner_radius(r).min_size(bh))
+                                    .clicked()
+                                {
                                     lib_open_new = true;
                                 }
-                                // Nota rapida: icono de hoja rayada -> crea una hoja con la fecha/hora.
                                 if ui
-                                    .button(egui::RichText::new("🗒 Nota rápida").strong())
+                                    .add(egui::Button::new(egui::RichText::new("🗒  Nota rápida").color(egui::Color32::from_gray(228)))
+                                        .fill(egui::Color32::from_rgb(44, 46, 58)).corner_radius(r).min_size(bh))
                                     .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
                                     .clicked()
                                 {
                                     lib_quick_note = true;
                                 }
-                                if ui.button("Ajustes ⚙").clicked() {
-                                    lib_toggle_tweaks = true;
-                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .add(egui::Button::new(egui::RichText::new("⚙  Ajustes").color(egui::Color32::from_gray(195)))
+                                            .fill(egui::Color32::TRANSPARENT).corner_radius(r).min_size(bh))
+                                        .clicked()
+                                    {
+                                        lib_toggle_tweaks = true;
+                                    }
+                                });
                             });
+                            ui.add_space(16.0);
+                            // Separador sutil (linea fina de bajo contraste) en vez del duro.
+                            let sep = ui.available_rect_before_wrap();
+                            ui.painter().hline(
+                                sep.x_range(),
+                                sep.top(),
+                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+                            );
                             ui.add_space(10.0);
-                            ui.separator();
-                            ui.add_space(8.0);
                             if nb_list.is_empty() {
                                 ui.label(
                                     egui::RichText::new("Aún no tienes cuadernos. Pulsa «Nuevo cuaderno».")
@@ -4169,7 +4206,7 @@ impl ApplicationHandler for App {
 
                 // Cartas de la biblioteca (vacio en el lienzo). Se construye antes de prestar
                 // la GPU (build_card_instances usa &self).
-                let cards = if !in_library {
+                let mut cards = if !in_library {
                     Vec::new()
                 } else if self.preview_idx.is_some() {
                     // La VISTA PREVIA (libreta abierta) se dibuja entera con egui (abajo).
@@ -4179,6 +4216,10 @@ impl ApplicationHandler for App {
                 } else {
                     self.build_card_instances(&card_layout)
                 };
+                // Fondo del Home (degradado/viñeta) detras de todo, para dar profundidad.
+                if in_library {
+                    cards.insert(0, self.bg_card());
+                }
 
                 // --- Render (lienzo + UI encima) ---
                 if let Some(g) = self.gpu.as_mut() {
