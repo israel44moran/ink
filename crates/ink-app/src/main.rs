@@ -200,6 +200,8 @@ struct App {
     doc_snap_at: f32,
     /// Modo pantalla completa (enfoque de escritura).
     fullscreen: bool,
+    /// Texturas de las imagenes del documento, cacheadas por ruta.
+    doc_img_cache: std::collections::HashMap<String, egui::TextureHandle>,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -420,6 +422,7 @@ impl App {
             doc_snap: String::new(),
             doc_snap_at: 0.0,
             fullscreen: false,
+            doc_img_cache: std::collections::HashMap::new(),
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2780,16 +2783,27 @@ impl App {
             self.doc_snap = self.page_body.clone();
             self.doc_snap_at = self.clock;
         }
+        // Job + decoraciones FUERA del closure (markdown_job no necesita `ui`), para poder cargar
+        // las imagenes antes (necesitan `&mut self`).
+        let (mut job0, decos) = markdown_job(&self.page_body, size_pts, ls, fam.clone(), text_col, reveal_line, page_align);
+        job0.wrap.max_width = rect.width();
+        let mut imgs: std::collections::HashMap<String, egui::TextureHandle> = std::collections::HashMap::new();
+        for (_, d) in &decos {
+            if let Deco::Image(pth) = d {
+                if !imgs.contains_key(pth) {
+                    if let Some(h) = self.load_doc_image(ctx, pth) {
+                        imgs.insert(pth.clone(), h);
+                    }
+                }
+            }
+        }
         let body = &mut self.page_body;
         egui::Area::new(egui::Id::new("doc_editor"))
             .order(egui::Order::Middle)
             .fixed_pos(rect.min)
             .show(ctx, |ui| {
                 ui.set_clip_rect(rect);
-                // Job + decoraciones (mismas que usara el editor) para POSICIONAR los dibujos.
-                let (mut job, decos) = markdown_job(body, size_pts, ls, fam.clone(), text_col, reveal_line, page_align);
-                job.wrap.max_width = rect.width();
-                let galley = ui.painter().layout_job(job);
+                let galley = ui.painter().layout_job(job0);
                 if writing {
                     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
                         let (mut j, _) = markdown_job(buf.as_str(), size_pts, ls, fam.clone(), text_col, reveal_line, page_align);
@@ -2809,7 +2823,7 @@ impl App {
                 } else {
                     ui.painter().galley(rect.min, galley.clone(), text_col);
                 }
-                // Decoraciones (casilla de tarea, barra de cita, regla) sobre el texto renderizado.
+                // Decoraciones (casilla, cita, regla, imagen) sobre el texto renderizado.
                 let painter = ui.painter();
                 for (cidx, deco) in &decos {
                     let cr = galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
@@ -2834,9 +2848,36 @@ impl App {
                             let y = top.y + rowh * 0.5;
                             painter.line_segment([egui::pos2(rect.left() + 2.0, y), egui::pos2(rect.right() - 2.0, y)], egui::Stroke::new(1.4, egui::Color32::from_gray(170)));
                         }
+                        Deco::Image(pth) => {
+                            if let Some(tex) = imgs.get(pth) {
+                                let sz = tex.size_vec2();
+                                let avw = (rect.width() - 8.0).max(8.0);
+                                let avh = (rowh - 8.0).max(8.0);
+                                let scale = (avw / sz.x).min(avh / sz.y).max(0.001);
+                                let dsz = sz * scale;
+                                let r = egui::Rect::from_min_size(egui::pos2(top.x, top.y + 4.0), dsz);
+                                painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                            } else {
+                                painter.text(egui::pos2(top.x + 2.0, top.y + rowh * 0.5), egui::Align2::LEFT_CENTER, "[imagen no encontrada]", egui::FontId::proportional((size_pts * 0.8).max(8.0)), egui::Color32::from_gray(150));
+                            }
+                        }
                     }
                 }
             });
+    }
+
+    /// Carga (cacheada por ruta) la textura de una imagen del documento.
+    fn load_doc_image(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        if let Some(h) = self.doc_img_cache.get(path) {
+            return Some(h.clone());
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+        let handle = ctx.load_texture(format!("docimg_{path}"), color, egui::TextureOptions::LINEAR);
+        self.doc_img_cache.insert(path.to_string(), handle.clone());
+        Some(handle)
     }
 
     /// Panel "Diseño de página": margenes, interlineado, espaciado de parrafo, fuente y tamano.
@@ -2981,6 +3022,22 @@ impl App {
                 v.extend(chars[hi..].iter().copied());
                 chars = v;
                 new_cursor = lo + midlen;
+            }
+            // --- Imagen: plantilla ![imagen](ruta); el cursor cae en "ruta" para pegar la ruta ---
+            Md::Image => {
+                let ins: Vec<char> = "![imagen](ruta)".chars().collect();
+                for (k, &c) in ins.iter().enumerate() {
+                    chars.insert(hi + k, c);
+                }
+                new_cursor = hi + 10; // tras "![imagen]("
+            }
+            // --- Tabla: esqueleto Markdown en su propio bloque ---
+            Md::Table => {
+                let block: Vec<char> = "\n| Columna 1 | Columna 2 |\n| --- | --- |\n| a | b |\n".chars().collect();
+                for (k, &c) in block.iter().enumerate() {
+                    chars.insert(hi + k, c);
+                }
+                new_cursor = hi + block.len();
             }
             // --- Prefijo de linea (encabezado / lista / cita) ---
             _ => {
@@ -4054,6 +4111,8 @@ impl ApplicationHandler for App {
                                             ui.separator();
                                             // Estructura.
                                             if md_button(ui, Md::Link, "Enlace").clicked() { md_action = Some(Md::Link); }
+                                            if md_button(ui, Md::Image, "Imagen").clicked() { md_action = Some(Md::Image); }
+                                            if md_button(ui, Md::Table, "Tabla").clicked() { md_action = Some(Md::Table); }
                                             if md_button(ui, Md::Task, "Tarea").clicked() { md_action = Some(Md::Task); }
                                             if md_button(ui, Md::Quote, "Cita").clicked() { md_action = Some(Md::Quote); }
                                             if md_button(ui, Md::Callout, "Callout").clicked() { md_action = Some(Md::Callout); }
@@ -6034,6 +6093,8 @@ enum Md {
     Fullscreen,
     Hn,
     Align,
+    Image,
+    Table,
 }
 
 /// Boton de la toolbar de edicion: icono VECTORIAL (o letra de la fuente real, que SI existe).
@@ -6208,6 +6269,19 @@ fn md_button(ui: &mut egui::Ui, md: Md, tip: &str) -> egui::Response {
             p.line_segment([egui::pos2(c.x + 2.0, c.y + 5.0), egui::pos2(c.x + 5.0, c.y + 8.0)], st);
             p.line_segment([egui::pos2(c.x + 5.0, c.y + 8.0), egui::pos2(c.x + 8.0, c.y + 5.0)], st);
         }
+        Md::Image => {
+            // Marco + montaña + sol (imagen).
+            let r = egui::Rect::from_center_size(c, egui::vec2(16.0, 13.0));
+            p.rect_stroke(r, egui::CornerRadius::same(2), st, egui::StrokeKind::Inside);
+            p.circle_filled(egui::pos2(r.left() + 4.0, r.top() + 4.0), 1.6, col);
+            p.add(egui::Shape::line(vec![egui::pos2(r.left() + 1.0, r.bottom() - 2.0), egui::pos2(r.left() + 6.0, r.center().y), egui::pos2(r.right() - 1.0, r.bottom() - 2.0)], st));
+        }
+        Md::Table => {
+            let r = egui::Rect::from_center_size(c, egui::vec2(16.0, 13.0));
+            p.rect_stroke(r, egui::CornerRadius::same(2), st, egui::StrokeKind::Inside);
+            p.line_segment([egui::pos2(r.left(), r.center().y), egui::pos2(r.right(), r.center().y)], st);
+            p.line_segment([egui::pos2(r.center().x, r.top()), egui::pos2(r.center().x, r.bottom())], st);
+        }
     }
     resp.on_hover_text(tip)
 }
@@ -6312,11 +6386,13 @@ fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 }
 
 /// Decoracion DIBUJADA sobre una linea (lo que sustituye a la marca oculta).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Deco {
     Check(bool),
     Quote,
     Hr,
+    /// Imagen `![alt](ruta)`: se carga y dibuja la textura en una fila alta.
+    Image(String),
 }
 
 fn push_inline(
@@ -6528,6 +6604,23 @@ fn markdown_job(
         }
         if in_code {
             job.append(&full, 0.0, TextFormat { font_id: FontId::new(base, FontFamily::Monospace), color: col, background: code_bg, line_height: Some(lh), ..Default::default() });
+            continue;
+        }
+        // --- Imagen ![alt](ruta): fila alta + textura dibujada (salvo en la linea del cursor) ---
+        if !reveal && full.starts_with("![") && full.contains("](") && full.ends_with(')') {
+            if let Some(open) = full.find("](") {
+                let path = full[open + 2..full.len() - 1].to_string();
+                job.append(&full, 0.0, TextFormat { font_id: FontId::new(0.01, fam.clone()), color: Color32::TRANSPARENT, line_height: Some(base * 9.0), ..Default::default() });
+                decos.push((start, Deco::Image(path)));
+                continue;
+            }
+        }
+        // --- Fila de tabla (| ... |): monoespaciada; la fila separadora atenuada ---
+        let tl = full.trim_start();
+        if tl.starts_with('|') && tl.len() > 1 {
+            let is_sep = tl.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+            let color = if is_sep { dim } else { col };
+            job.append(&full, 0.0, TextFormat { font_id: FontId::new(base, FontFamily::Monospace), color, line_height: Some(lh), ..Default::default() });
             continue;
         }
         // --- Encabezado ---
