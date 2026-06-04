@@ -293,6 +293,8 @@ struct App {
     card_rects: Vec<(f32, f32, f32, f32)>,
     /// Desplazamiento vertical de la cuadricula de cartas (rueda).
     card_scroll: f32,
+    /// Angulo de volteo (rad, 0=portada, PI=reverso) de cada cuaderno (rueda sobre el).
+    card_flip: Vec<f32>,
     /// Arrastre de cartas en la biblioteca: indice agarrado, punto inicial y si ya se arrastra.
     drag_idx: Option<usize>,
     drag_start: Vec2,
@@ -391,6 +393,7 @@ impl App {
             card_anim: Vec::new(),
             card_rects: Vec::new(),
             card_scroll: 0.0,
+            card_flip: Vec::new(),
             drag_idx: None,
             drag_start: Vec2::ZERO,
             dragging: false,
@@ -877,10 +880,15 @@ impl App {
         self.notebooks = notebook::list();
         self.card_scroll = 0.0;
         self.card_anim.clear();
+        self.card_flip.clear();
         self.creating_nb = false;
         self.editing_nb = None;
         self.drag_idx = None;
         self.dragging = false;
+        // Limpiar la tinta del cuaderno que se cerro para que NO se vea en el Home.
+        if let Some(g) = self.gpu.as_mut() {
+            g.clear_ink();
+        }
     }
 
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
@@ -909,8 +917,13 @@ impl App {
     /// guarda los rects para el hit-test de los clics.
     fn update_card_anim(&mut self, layout: &[(Vec2, Vec2)]) {
         self.card_anim.resize(layout.len(), [0.0, 0.0, 0.0]);
+        self.card_flip.resize(layout.len(), 0.0);
         let cur = self.cursor;
-        let max_ang = 0.20;
+        // Inclinacion BASE (siempre, para que se note el grosor 3D del cuaderno) + un rango
+        // mayor al pasar el cursor (la carta "se mueve mas").
+        let base_rx = -0.07;
+        let base_ry = 0.17;
+        let max_ang = 0.40;
         for (i, (c, h)) in layout.iter().enumerate() {
             let inside = (cur.x - c.x).abs() <= h.x && (cur.y - c.y).abs() <= h.y;
             let (tx, ty) = if inside {
@@ -922,12 +935,12 @@ impl App {
                 (0.5, 0.5)
             };
             let (t_hover, t_rotx, t_roty) = if inside {
-                (1.0, (0.5 - ty) * 2.0 * max_ang, (tx - 0.5) * 2.0 * max_ang)
+                (1.0, base_rx + (0.5 - ty) * 2.0 * max_ang, base_ry + (tx - 0.5) * 2.0 * max_ang)
             } else {
-                (0.0, 0.0, 0.0)
+                (0.0, base_rx, base_ry)
             };
             let a = &mut self.card_anim[i];
-            let k = 0.28;
+            let k = 0.22;
             a[0] += (t_hover - a[0]) * k;
             a[1] += (t_rotx - a[1]) * k;
             a[2] += (t_roty - a[2]) * k;
@@ -962,6 +975,7 @@ impl App {
             notebook::delete(&path);
             self.notebooks = notebook::list();
             self.card_anim.clear();
+            self.card_flip.clear();
         }
     }
 
@@ -998,6 +1012,7 @@ impl App {
         notebook::save_order(&files);
         self.notebooks = notebook::list();
         self.card_anim.clear();
+        self.card_flip.clear();
     }
 
     /// Abre el panel para EDITAR la carátula del cuaderno `i` (clic derecho): carga sus
@@ -1044,7 +1059,8 @@ impl App {
             // La carta que se esta arrastrando SIGUE al cursor (elevada), para reordenar.
             let dragged = self.dragging && self.drag_idx == Some(i);
             let center = if dragged { cur } else { *c };
-            let (rotx, roty, hov) = if dragged { (0.0, 0.0, 1.0) } else { (a[1], a[2], a[0]) };
+            let flip = self.card_flip.get(i).copied().unwrap_or(0.0); // rueda = voltear (ver reverso)
+            let (rotx, roty, hov) = if dragged { (0.0, flip, 1.0) } else { (a[1], a[2] + flip, a[0]) };
             let ptr_x = ((cur.x - (center.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
             let ptr_y = ((cur.y - (center.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
             let nb = self.notebooks.get(i);
@@ -2321,9 +2337,18 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                 };
-                if !egui_consumed && self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
-                    // Biblioteca: la rueda desplaza la cuadricula de cartas.
-                    self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
+                if self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
+                    // Biblioteca: la rueda SOBRE un cuaderno lo VOLTEA (ver portada/reverso); en
+                    // zona vacia desplaza la cuadricula. (Las cartas son wgpu, no widgets egui.)
+                    if let Some(i) = self.library_card_at() {
+                        self.card_flip.resize(self.notebooks.len(), 0.0);
+                        if i < self.card_flip.len() {
+                            self.card_flip[i] =
+                                (self.card_flip[i] + amount * 0.6).clamp(0.0, std::f32::consts::PI);
+                        }
+                    } else {
+                        self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
+                    }
                 }
                 if !egui_consumed && self.app_mode == AppMode::Canvas {
                     if amount != 0.0 {
@@ -2777,13 +2802,25 @@ impl ApplicationHandler for App {
                                     continue;
                                 }
                                 let Some((c, h)) = card_layout.get(i) else { continue };
-                                lp.text(
-                                    egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
-                                    egui::Align2::CENTER_CENTER,
-                                    name,
-                                    egui::FontId::proportional(15.0),
-                                    egui::Color32::from_gray(230),
-                                );
+                                let flipped = self.card_flip.get(i).copied().unwrap_or(0.0) > 1.5708;
+                                if flipped {
+                                    // Reverso visible: el nombre va sobre la "cinta de masquin".
+                                    lp.text(
+                                        egui::pos2(c.x / ppp, c.y / ppp),
+                                        egui::Align2::CENTER_CENTER,
+                                        name,
+                                        egui::FontId::proportional(15.0),
+                                        egui::Color32::from_rgb(60, 50, 35),
+                                    );
+                                } else {
+                                    lp.text(
+                                        egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
+                                        egui::Align2::CENTER_CENTER,
+                                        name,
+                                        egui::FontId::proportional(15.0),
+                                        egui::Color32::from_gray(230),
+                                    );
+                                }
                             }
                             // PAPELERA unica: arrastra una carta aqui (y suelta) para borrarla.
                             let (tzx, tzy, tzr) = self.trash_zone();

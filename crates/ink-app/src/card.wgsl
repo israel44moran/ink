@@ -39,22 +39,38 @@ struct VsOut {
     @location(7) accent: vec3<f32>,
     @location(8) time: f32,
     @location(9) aspect: f32,
+    @location(10) face: f32,
+    @location(11) pz01: f32,
 };
 
+// El cuaderno es una CAJA (6 caras): 0=frente (portada animada), 1=reverso (cinta con el
+// nombre), 2-5=cantos (pila de hojas). Backface culling deja ver solo las caras visibles.
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+    let face = i32(in.vi) / 6;
+    let k = i32(in.vi) % 6;
+    var qp = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0)
     );
-    let q = corners[in.vi];
-    var p = vec3<f32>(q.x * in.half.x, q.y * in.half.y, 0.0);
+    let st = qp[k];
+    // Origen + aristas (en unidades -1..1) por cara, con bobinado CCW hacia afuera.
+    var origin: vec3<f32>; var du: vec3<f32>; var dv: vec3<f32>;
+    if (face == 0) { origin = vec3<f32>(-1.0, -1.0, 1.0); du = vec3<f32>(2.0, 0.0, 0.0); dv = vec3<f32>(0.0, 2.0, 0.0); }
+    else if (face == 1) { origin = vec3<f32>(1.0, -1.0, -1.0); du = vec3<f32>(-2.0, 0.0, 0.0); dv = vec3<f32>(0.0, 2.0, 0.0); }
+    else if (face == 2) { origin = vec3<f32>(1.0, -1.0, -1.0); du = vec3<f32>(0.0, 2.0, 0.0); dv = vec3<f32>(0.0, 0.0, 2.0); }
+    else if (face == 3) { origin = vec3<f32>(-1.0, -1.0, 1.0); du = vec3<f32>(0.0, 2.0, 0.0); dv = vec3<f32>(0.0, 0.0, -2.0); }
+    else if (face == 4) { origin = vec3<f32>(-1.0, 1.0, -1.0); du = vec3<f32>(0.0, 0.0, 2.0); dv = vec3<f32>(2.0, 0.0, 0.0); }
+    else { origin = vec3<f32>(-1.0, -1.0, -1.0); du = vec3<f32>(2.0, 0.0, 0.0); dv = vec3<f32>(0.0, 0.0, 2.0); }
+    let unit = origin + du * st.x + dv * st.y;          // posicion en el cubo unidad
+    let hz = in.half.x * 0.13;                          // grosor (pila de hojas)
+    var p = vec3<f32>(unit.x * in.half.x, unit.y * in.half.y, unit.z * hz);
 
     let cy = cos(in.rot.y); let sy = sin(in.rot.y);
     let p1 = vec3<f32>(p.x * cy + p.z * sy, p.y, -p.x * sy + p.z * cy);
     let cx = cos(in.rot.x); let sx = sin(in.rot.x);
     var p2 = vec3<f32>(p1.x, p1.y * cx - p1.z * sx, p1.y * sx + p1.z * cx);
-    p2.z = p2.z + in.hover * 60.0;
+    p2.z = p2.z + in.hover * 70.0;
 
     let factor = view.focal / max(view.focal - p2.z, 1.0);
     let sp = in.center + vec2<f32>(p2.x, p2.y) * factor;
@@ -62,7 +78,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip = vec4<f32>(clip, 0.0, 1.0);
-    out.uv = (q + vec2<f32>(1.0, 1.0)) * 0.5;
+    out.uv = st;
     out.pointer = in.pointer;
     out.hover = in.hover;
     out.base = in.base;
@@ -72,6 +88,8 @@ fn vs_main(in: VsIn) -> VsOut {
     out.accent = in.accent;
     out.time = view.time;
     out.aspect = in.half.y / max(in.half.x, 1.0);
+    out.face = f32(face);
+    out.pz01 = (unit.z + 1.0) * 0.5;
     return out;
 }
 
@@ -679,17 +697,8 @@ fn arcade(id: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, aspect: f32, accent: vec
     return fx_pacman(uv, t, aspect, accent);
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Esquinas redondeadas (SDF) con borde suave (alfa).
-    let uvc = in.uv * 2.0 - vec2<f32>(1.0, 1.0);
-    let rad = 0.12;
-    let dr = length(max(abs(uvc) - vec2<f32>(1.0 - rad, 1.0 - rad), vec2<f32>(0.0))) - rad;
-    let alpha = 1.0 - smoothstep(0.0, 0.012, dr);
-    if (alpha <= 0.001) {
-        discard;
-    }
-
+// Color de la PORTADA (cara frontal) del cuaderno: el diseño/animacion elegido + capas.
+fn cover_color(in: VsOut) -> vec3<f32> {
     let h = in.hover;
     let t = in.time;
     let inten = in.intensity;
@@ -809,8 +818,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     col = col + vec3<f32>(glare, glare, glare);
-    let edge = smoothstep(-0.05, 0.0, dr);
-    col = mix(col, vec3<f32>(1.0, 1.0, 1.0), edge * 0.35);
+    return clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
-    return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), alpha);
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let face = i32(round(in.face));
+    var col: vec3<f32>;
+    if (face == 0) {
+        // Portada: el diseño/animacion elegido.
+        col = cover_color(in);
+    } else if (face == 1) {
+        // Reverso: carton oscuro + una "cinta de masquin" beige (el NOMBRE lo dibuja la UI).
+        col = vec3<f32>(0.15, 0.13, 0.12);
+        let d = abs(in.uv - vec2<f32>(0.5, 0.5));
+        let tape = step(d.x, 0.40) * step(d.y, 0.15);
+        let tcol = vec3<f32>(0.86, 0.80, 0.62) * (0.96 + 0.04 * sin(in.uv.x * 70.0));
+        col = mix(col, tcol, tape);
+    } else {
+        // Cantos: pila de hojas (lineas finas a lo largo del grosor).
+        let paper = vec3<f32>(0.93, 0.91, 0.85);
+        let lines = grid_line(in.pz01 * 46.0, 0.25);
+        col = mix(paper, paper * 0.6, lines * 0.55);
+    }
+    // Sombreado por cara para dar sensacion de volumen 3D.
+    var shade = 1.0;
+    if (face == 1) { shade = 0.92; }
+    else if (face == 2) { shade = 0.82; }
+    else if (face == 3) { shade = 0.7; }
+    else if (face == 4) { shade = 1.08; }
+    else if (face == 5) { shade = 0.66; }
+    col = col * shade;
+    return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

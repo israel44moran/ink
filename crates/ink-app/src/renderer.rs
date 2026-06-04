@@ -645,7 +645,15 @@ impl GpuState {
                 targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            // El cuaderno es una caja 3D convexa: con backface culling solo se ven las caras
+            // frontales (sin necesidad de buffer de profundidad). El volteo de Y por la
+            // proyeccion hace que la cara frontal sea CW, por eso front_face = Cw.
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: SAMPLE_COUNT, mask: !0, alpha_to_coverage_enabled: false },
             multiview_mask: None,
@@ -739,6 +747,15 @@ impl GpuState {
     pub fn update_camera(&mut self, view_proj: [[f32; 4]; 4]) {
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&view_proj));
+    }
+
+    /// Vacia TODA la tinta (trazos procedurales y estampados PS) de la GPU. Se usa al volver a
+    /// la biblioteca para que el dibujo del cuaderno cerrado no se quede pintado en el Home.
+    pub fn clear_ink(&mut self) {
+        self.committed.len = 0;
+        self.active_stamps.len = 0;
+        self.active_stamp_tip = None;
+        self.committed_stamps.clear();
     }
 
     pub fn set_committed(&mut self, verts: &[Vertex]) {
@@ -1108,7 +1125,7 @@ impl GpuState {
                     rpass.set_pipeline(&self.card_pipeline);
                     rpass.set_bind_group(0, &self.card_view_bg, &[]);
                     rpass.set_vertex_buffer(0, b.slice(..));
-                    rpass.draw(0..6, 0..self.card_inst.len);
+                    rpass.draw(0..36, 0..self.card_inst.len); // 6 caras (cuaderno 3D)
                 }
             }
 
