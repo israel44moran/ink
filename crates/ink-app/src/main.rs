@@ -962,7 +962,7 @@ impl App {
 
     /// Suaviza la animacion (hover/tilt) de cada carta hacia su objetivo (segun el cursor) y
     /// guarda los rects para el hit-test de los clics.
-    fn update_card_anim(&mut self, layout: &[(Vec2, Vec2)]) {
+    fn update_card_anim(&mut self, layout: &[(Vec2, Vec2)], dt: f32) {
         self.card_anim.resize(layout.len(), [0.0, 0.0, 0.0]);
         self.card_flip.resize(layout.len(), 0.0);
         self.card_flip_vel.resize(layout.len(), 0.0);
@@ -974,7 +974,7 @@ impl App {
         let base_rx = self.lib_tweaks.inclinacion.to_radians();
         let base_ry = self.lib_tweaks.giro.to_radians();
         let hover_mode = self.lib_tweaks.hover;
-        let max_ang = 0.26; // seguimiento del cursor mas suave (no se inclina de golpe)
+        let max_ang = 0.20; // seguimiento del cursor MUY suave (apenas se ladea hacia el cursor)
         for (i, (c, h)) in layout.iter().enumerate() {
             let inside = (cur.x - c.x).abs() <= h.x && (cur.y - c.y).abs() <= h.y;
             let (tx, ty) = if inside {
@@ -998,15 +998,19 @@ impl App {
                 (0.0, base_rx, base_ry)
             };
             let a = &mut self.card_anim[i];
-            let k = 0.05; // muy suave: el hover/tilt llega lento y flotante (no brusco)
-            a[0] += (t_hover - a[0]) * k;
-            a[1] += (t_rotx - a[1]) * k;
-            a[2] += (t_roty - a[2]) * k;
+            // Suavizado INDEPENDIENTE DE LOS FPS: la app redibuja en Mailbox (muy rapido, 200+
+            // fps), asi que un factor por-fotograma iba rapidisimo. Se calcula desde dt con una
+            // "tasa" baja (1.6) -> el hover/tilt llega LENTO y flotante a cualquier tasa de fps.
+            let kr = 1.0 - (-1.6 * dt).exp();
+            a[0] += (t_hover - a[0]) * kr;
+            a[1] += (t_rotx - a[1]) * kr;
+            a[2] += (t_roty - a[2]) * kr;
             // Volteo: mientras el cursor ESTA encima, gira con INERCIA (gravedad cero) y se queda
             // donde lo dejes; al SALIR el cursor, vuelve suave a la portada (0).
+            let f60 = dt * 60.0; // escala "por-fotograma@60fps" -> tiempo real (independiente de fps)
             if inside {
-                let mut nf = self.card_flip[i] + self.card_flip_vel[i];
-                self.card_flip_vel[i] *= 0.94; // rozamiento muy suave -> flota y frena despacio
+                let mut nf = self.card_flip[i] + self.card_flip_vel[i] * f60;
+                self.card_flip_vel[i] *= (-3.7 * dt).exp(); // rozamiento suave (independiente de fps)
                 if nf < 0.0 {
                     nf = 0.0;
                     self.card_flip_vel[i] = 0.0;
@@ -1022,7 +1026,7 @@ impl App {
             } else {
                 // El cursor ya no esta encima: regresa LENTO y fluido a su posicion original.
                 self.card_flip_vel[i] = 0.0;
-                self.card_flip[i] += (0.0 - self.card_flip[i]) * 0.045;
+                self.card_flip[i] += (0.0 - self.card_flip[i]) * (1.0 - (-1.8 * dt).exp());
                 if self.card_flip[i].abs() < 0.002 {
                     self.card_flip[i] = 0.0;
                 }
@@ -1226,9 +1230,9 @@ impl App {
             // indice) para que no floten todos sincronizados. Se desvanece con `hov`.
             let t = self.clock;
             let ph = i as f32 * 1.7;
-            let rotx = rotx + (t * 0.55 + ph).sin() * 0.030 * hov;
-            let roty = roty + (t * 0.42 + ph * 1.3).cos() * 0.035 * hov;
-            let cy = center.y - (t * 0.50 + ph).sin() * 5.0 * hov;
+            let rotx = rotx + (t * 1.5 + ph).sin() * 0.055 * hov;
+            let roty = roty + (t * 1.2 + ph * 1.3).cos() * 0.065 * hov;
+            let cy = center.y - (t * 1.3 + ph).sin() * 11.0 * hov;
             cards.push([
                 center.x, cy, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
                 base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
@@ -2864,7 +2868,7 @@ impl ApplicationHandler for App {
                 let show_grid = in_library && !self.creating_nb;
                 let card_layout = if show_grid { self.library_card_layout() } else { Vec::new() };
                 if show_grid {
-                    self.update_card_anim(&card_layout);
+                    self.update_card_anim(&card_layout, dt.min(0.05));
                 } else {
                     self.card_rects.clear();
                 }
@@ -3001,9 +3005,9 @@ impl ApplicationHandler for App {
                                     // Misma flotacion que en build_card_instances (para no despegar).
                                     let t = self.clock;
                                     let ph = i as f32 * 1.7;
-                                    let rx = a[1] + (t * 0.55 + ph).sin() * 0.030 * hv;
-                                    let ry = a[2] + fl + (t * 0.42 + ph * 1.3).cos() * 0.035 * hv;
-                                    let cby = c.y - (t * 0.50 + ph).sin() * 5.0 * hv;
+                                    let rx = a[1] + (t * 1.5 + ph).sin() * 0.055 * hv;
+                                    let ry = a[2] + fl + (t * 1.2 + ph * 1.3).cos() * 0.065 * hv;
+                                    let cby = c.y - (t * 1.3 + ph).sin() * 11.0 * hv;
                                     let cc = vec2(c.x, cby);
                                     let (cxs, cys, fac) = project_card_point(cc, rx, ry, hv, 0.0, 0.0, -hz);
                                     // Extremos del eje horizontal de la cinta (~0.7 del semiancho).
