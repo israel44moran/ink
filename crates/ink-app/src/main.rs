@@ -927,9 +927,14 @@ impl App {
         let n = self.notebooks.len();
         let vp = self.camera.viewport;
         let (cw, ch, gap) = (188.0_f32, 263.0_f32, 36.0_f32);
-        let cols = (((vp.x - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
+        // Si el panel Tweaks esta abierto, reservar su franja (arriba-derecha) para que NINGUN
+        // cuaderno quede debajo (los que no caben pasan a la siguiente fila).
+        let ppp = self.egui_ctx.pixels_per_point().max(0.5);
+        let reserve = if self.show_tweaks { 300.0 * ppp } else { 0.0 };
+        let usable = (vp.x - reserve).max(cw + 80.0);
+        let cols = (((usable - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
         let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
-        let x0 = (vp.x - total_w) * 0.5 + cw * 0.5;
+        let x0 = (usable - total_w) * 0.5 + cw * 0.5;
         let top = 300.0; // bajo las cartas para no solaparse con la cabecera/separador
         let row_h = ch + gap + 26.0; // espacio extra para el nombre bajo cada carta
         (0..n)
@@ -2875,14 +2880,32 @@ impl ApplicationHandler for App {
                                     // centro del reverso (0,0,-grosor) con la misma rotacion que el
                                     // shader para que el texto siga a la cinta al inclinarse.
                                     let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
-                                    let hz = h.x * 0.13;
+                                    let nbk = self.notebooks.get(i);
+                                    let (df, _, _) = shape_params(nbk.map_or(0, |n| n.shape));
+                                    let hz = h.x * df * nbk.map_or(1.0, |n| n.thickness);
                                     let (sx, sy, fac) =
                                         project_card_point(*c, a[1], a[2] + fl, a[0], 0.0, 0.0, -hz);
+                                    // El nombre debe CABER en la cinta: se reduce el tamaño segun
+                                    // su longitud y, solo si al minimo aun no cabe, se recorta con
+                                    // elipsis. (Ancho de caracter aproximado ~0.55*tamaño.)
+                                    let tape_w = (1.5 * h.x * fac / ppp).max(20.0);
+                                    let len = name.chars().count().max(1) as f32;
+                                    let base = 15.0 * fac.clamp(0.85, 1.25);
+                                    let est_w = len * base * 0.55;
+                                    let size = if est_w > tape_w { (tape_w / (len * 0.55)).max(7.5) } else { base };
+                                    let max_chars = (tape_w / (size * 0.55)).floor() as usize;
+                                    let shown = if name.chars().count() > max_chars && max_chars >= 2 {
+                                        let mut s: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+                                        s.push('…');
+                                        s
+                                    } else {
+                                        name.clone()
+                                    };
                                     lp.text(
                                         egui::pos2(sx / ppp, sy / ppp),
                                         egui::Align2::CENTER_CENTER,
-                                        name,
-                                        egui::FontId::proportional(15.0 * fac.clamp(0.85, 1.25)),
+                                        shown,
+                                        egui::FontId::proportional(size),
                                         egui::Color32::from_rgb(55, 45, 30),
                                     );
                                 } else {
