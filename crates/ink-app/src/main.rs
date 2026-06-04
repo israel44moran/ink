@@ -27,8 +27,8 @@ use std::time::Instant;
 
 use ink_core::{
     point_in_polygon, push_stamp_quad, stamp_path, vec2, Aabb, Brush, BrushSettings, Camera,
-    Document, InputSample, StampVertex, Stroke, TextItem, TipKind, Tool, Vec2,
-    Vertex,
+    Document, InkConfig, InkSmoother, InputSample, StampVertex, Stroke, TextItem, TipKind, Tool,
+    Vec2, Vertex,
 };
 use renderer::{present_mode_name, GpuState};
 use settings::Settings;
@@ -152,12 +152,10 @@ struct App {
     last_touch: Option<Instant>,
 
     // Trazo activo
-    /// Suavizado "cuerda elastica" (como el Suavizado de Photoshop): posicion (en mundo) del
-    /// punto que se dibuja, que persigue al cursor manteniendose a `string_radius` de el.
-    string_pos: Vec2,
-    /// Radio de la "cuerda" en MUNDO (px de pantalla / zoom), fijado al empezar el trazo
-    /// segun la suavidad. 0 = sin suavizado (crudo).
-    string_radius: f32,
+    /// Suavizador de entrada (One-Euro + presion fluida + densificado por spline + taper):
+    /// convierte los eventos crudos en muestras densas y suaves. Da el trazo "de calidad
+    /// extrema" sin sacrificar latencia. Compartido por el camino normal y el de Photoshop.
+    smoother: InkSmoother,
     active: Option<Stroke>,
     active_mesh: Vec<Vertex>,
     last_sample_pos: Vec2,
@@ -183,6 +181,25 @@ struct App {
     last_poly_click: Option<Instant>,
     texts: Vec<TextItem>,
     active_text: Option<usize>,
+
+    // --- Modo DOCUMENTO (escritura con teclado en la hoja) ---
+    /// Texto (Markdown) de la hoja actual. Se guarda en `PageData.body`.
+    page_body: String,
+    /// Alineacion del texto de la hoja actual (0 izq, 1 centro, 2 der, 3 justif). En `PageData`.
+    page_align: u32,
+    /// Diseño de pagina del cuaderno (margenes, interlineado, fuente...). En `NotebookData`.
+    doc_layout: notebook::DocLayout,
+    /// `true` = modo escritura activo: el teclado escribe en la hoja (no atajos de dibujo).
+    write_mode: bool,
+    /// Panel de "Diseño de pagina" abierto.
+    show_page_setup: bool,
+    /// Historial del documento (deshacer/rehacer del texto), con snapshots del `page_body`.
+    doc_undo: Vec<String>,
+    doc_redo: Vec<String>,
+    doc_snap: String,
+    doc_snap_at: f32,
+    /// Modo pantalla completa (enfoque de escritura).
+    fullscreen: bool,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -377,8 +394,7 @@ impl App {
             zoom_anchor: Vec2::ZERO,
             last_move_time: now,
             last_touch: None,
-            string_pos: Vec2::ZERO,
-            string_radius: 0.0,
+            smoother: InkSmoother::new(InkConfig::default()),
             active: None,
             active_mesh: Vec::new(),
             last_sample_pos: Vec2::ZERO,
@@ -394,6 +410,16 @@ impl App {
             last_poly_click: None,
             texts: Vec::new(),
             active_text: None,
+            page_body: String::new(),
+            page_align: 0,
+            doc_layout: notebook::DocLayout::default(),
+            write_mode: false,
+            show_page_setup: false,
+            doc_undo: Vec::new(),
+            doc_redo: Vec::new(),
+            doc_snap: String::new(),
+            doc_snap_at: 0.0,
+            fullscreen: false,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -512,23 +538,20 @@ impl App {
         if !self.ui.drawing_enabled() {
             return;
         }
-        // Suavizado "cuerda elastica" (como el Suavizado de Photoshop), comun a todos los
-        // pinceles. El radio (en mundo) se fija al empezar el trazo segun la suavidad.
+        // Suavizador de entrada (One-Euro + presion fluida + spline + taper). Sustituye al
+        // viejo suavizado "cuerda": curvas de calidad extrema sin sacrificar latencia.
         self.last_sample_time = Instant::now();
         let world = self.camera.screen_to_world(self.cursor);
-        self.string_pos = world;
-        self.string_radius = smoothing_string_radius_px(self.brush.smoothing) / self.camera.zoom.max(1e-4);
-        let filtered = world;
+        let cfg = self.ink_config();
+        self.smoother.reset(cfg);
         // Opacidad -> alfa del color del trazo.
         let mut b = self.brush;
         b.color[3] = self.brush.opacity.clamp(0.0, 1.0);
         let mut s = Stroke::new(b);
-        s.push(InputSample {
-            pos: filtered,
-            pressure: initial_pressure.clamp(0.05, 1.0),
-            erosion: 0.0,
-        });
-        self.last_sample_pos = filtered;
+        for sm in self.smoother.push(world, initial_pressure.clamp(0.05, 1.0), 1.0 / 120.0) {
+            self.last_sample_pos = sm.pos;
+            s.push(sm);
+        }
         self.active = Some(s);
         self.active_mesh.clear();
         if let Some(st) = &self.active {
@@ -538,6 +561,49 @@ impl App {
             g.set_active(&self.active_mesh);
         }
         self.drawing = true;
+    }
+
+    /// Ajustes del suavizador de entrada para el pincel y zoom actuales. Las longitudes van en
+    /// MUNDO (escaladas por el zoom para sentirse constantes en pantalla). El taper solo se
+    /// aplica a la pluma (ancho por presion).
+    fn ink_config(&self) -> InkConfig {
+        let zoom = self.camera.zoom.max(1e-4);
+        let is_pen = matches!(self.brush.kind, ink_core::BrushKind::Pen);
+        InkConfig {
+            // Densificado fino: ~1.3 px de pantalla entre muestras -> curvas sin facetas.
+            max_step: (1.3 / zoom).max(0.05),
+            // Afilado de entrada ~1.6 anchos de pincel (solo pluma).
+            taper_in: if is_pen { (self.brush.width * 1.6).max(1.5 / zoom) } else { 0.0 },
+            pressure_smooth: 0.6,
+            smoothing: self.brush.smoothing,
+            use_pressure: is_pen,
+        }
+    }
+
+    /// Afilado de SALIDA: rampa (smoothstep) la presion de las ultimas unidades del trazo para
+    /// que la pluma termine en punta. Se aplica al cerrar (en vivo no se conoce el fin), asi el
+    /// trazo "se asienta" suavemente al levantar el lapiz, como en Concepts.
+    fn apply_exit_taper(&self, stroke: &mut Stroke) {
+        if !matches!(stroke.brush.kind, ink_core::BrushKind::Pen) {
+            return;
+        }
+        let taper = (stroke.brush.width * 1.6).max(1.5 / self.camera.zoom.max(1e-4));
+        if taper <= 1e-4 {
+            return;
+        }
+        let n = stroke.samples.len();
+        let mut dist = 0.0_f32;
+        for i in (0..n).rev() {
+            if i + 1 < n {
+                dist += (stroke.samples[i + 1].pos - stroke.samples[i].pos).length();
+            }
+            if dist >= taper {
+                break;
+            }
+            let t = (dist / taper).clamp(0.0, 1.0);
+            let f = t * t * (3.0 - 2.0 * t); // smoothstep: 0 en el extremo final, 1 a `taper`
+            stroke.samples[i].pressure *= f;
+        }
     }
 
     /// Si el cuentagotas esta activo, toma el color del trazo bajo el cursor y se
@@ -580,29 +646,17 @@ impl App {
         }
 
         let now = Instant::now();
-        // Suavizado "cuerda" (Photoshop): el punto dibujado persigue al cursor manteniendose
-        // a `string_radius`. Lag fijo (no crece con la velocidad).
-        let d = raw_world - self.string_pos;
-        let dist = d.length();
-        if dist > self.string_radius {
-            self.string_pos = raw_world - d / dist * self.string_radius;
-        }
-        let filtered = self.string_pos;
-
-        let mut changed = false;
-        if let Some(stroke) = self.active.as_mut() {
-            // Espaciado minimo ~0.6 px en pantalla: muestras mas densas -> curvas mas fieles
-            // (trazo de alta precision). El teselado incremental absorbe el coste extra.
-            let min_d = (0.6 / self.camera.zoom).max(1e-4);
-            if stroke.samples.is_empty() || (filtered - self.last_sample_pos).length() >= min_d {
-                stroke.push(InputSample { pos: filtered, pressure, erosion: 0.0 });
-                self.last_sample_pos = filtered;
-                self.last_sample_time = now;
-                changed = true;
+        let dt = (now - self.last_sample_time).as_secs_f32().clamp(1e-4, 0.1);
+        self.last_sample_time = now;
+        // El suavizador emite muestras DENSAS sobre una curva suave (puede ser 0..N por evento).
+        // Cada una se tesela de forma incremental (mantiene el invariante vivo == final).
+        let new = self.smoother.push(raw_world, pressure, dt);
+        for sm in new {
+            match self.active.as_mut() {
+                Some(stroke) => stroke.push(sm),
+                None => break,
             }
-        }
-
-        if changed {
+            self.last_sample_pos = sm.pos;
             self.upload_active_incremental();
         }
     }
@@ -638,8 +692,18 @@ impl App {
             return;
         }
         self.drawing = false;
+        // Cerrar la cola del suavizado: emite el ultimo tramo pendiente (~1 evento).
+        for sm in self.smoother.finish() {
+            match self.active.as_mut() {
+                Some(s) => s.push(sm),
+                None => break,
+            }
+            self.last_sample_pos = sm.pos;
+        }
         if let Some(mut stroke) = self.active.take() {
             if !stroke.samples.is_empty() {
+                // Afilado de salida (pluma): el trazo termina en punta al levantar.
+                self.apply_exit_taper(&mut stroke);
                 // Marcar el tiempo de creacion: por la goma por timestamps, este trazo se
                 // vera aunque pase por una zona borrada antes (su tiempo es mayor).
                 stroke.time = self.tick;
@@ -804,13 +868,18 @@ impl App {
 
     /// Aplica una PAGINA (su dibujo, texto y borrados) al estado vivo y la sube a la GPU.
     fn load_page(&mut self, i: usize) {
-        let Some((doc, texts, erase, tick)) = self
+        let Some((doc, texts, erase, tick, body, align)) = self
             .pages
             .get(i)
-            .map(|pg| (pg.doc.clone(), pg.texts.clone(), pg.erase_strokes.clone(), pg.tick.max(1.0)))
+            .map(|pg| (pg.doc.clone(), pg.texts.clone(), pg.erase_strokes.clone(), pg.tick.max(1.0), pg.body.clone(), pg.align))
         else {
             return;
         };
+        self.page_body = body;
+        self.page_align = align;
+        self.doc_undo.clear();
+        self.doc_redo.clear();
+        self.doc_snap = self.page_body.clone();
         // Limpiar los ESTAMPADOS de Photoshop dibujados (no se guardan por pagina en esta
         // fase). OJO: NO tocar `ps_settings` (la config del pincel activo): debe persistir
         // entre paginas para poder seguir dibujando con el mismo pincel en la hoja nueva.
@@ -857,11 +926,15 @@ impl App {
             .filter_map(|e| if let EraseStroke::Discs(d) = e { Some(d.clone()) } else { None })
             .collect();
         let tick = self.tick;
+        let body = self.page_body.clone();
+        let align = self.page_align;
         if let Some(pg) = self.pages.get_mut(self.current_page) {
             pg.doc = doc;
             pg.texts = texts;
             pg.erase_strokes = erase;
             pg.tick = tick;
+            pg.body = body;
+            pg.align = align;
         }
     }
 
@@ -917,6 +990,7 @@ impl App {
         self.current_cover_a = nb.cover_a;
         self.current_cover_b = nb.cover_b;
         self.current_archivero = nb.archivero.clone();
+        self.doc_layout = nb.doc_layout;
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -954,6 +1028,7 @@ impl App {
         nb.cover_a = self.current_cover_a;
         nb.cover_b = self.current_cover_b;
         nb.archivero = self.current_archivero.clone();
+        nb.doc_layout = self.doc_layout;
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -2092,6 +2167,20 @@ impl App {
         self.activate_ps_brush(i);
     }
 
+    /// Config del suavizador para un pincel de Photoshop (estampados): mismo densificado y
+    /// presion fluida; el taper rampa la presion (solo afecta si el pincel usa presion).
+    fn ink_config_ps(&self) -> InkConfig {
+        let zoom = self.camera.zoom.max(1e-4);
+        let size = self.ps_settings.as_ref().map_or(self.brush.width, |s| s.size);
+        InkConfig {
+            max_step: (1.3 / zoom).max(0.05),
+            taper_in: (size * 1.2).max(1.5 / zoom),
+            pressure_smooth: 0.6,
+            smoothing: self.brush.smoothing,
+            use_pressure: true,
+        }
+    }
+
     fn start_stroke_ps(&mut self, pressure: f32) {
         self.ps_drawing = true;
         self.ps_samples.clear();
@@ -2099,13 +2188,14 @@ impl App {
         self.ps_residual = 0.0;
         self.ps_active_verts.clear();
         let world = self.camera.screen_to_world(self.cursor);
-        // Suavizado "cuerda" (Photoshop), igual que los pinceles basicos.
+        // Mismo suavizador de entrada que los pinceles basicos (curvas suaves + presion fluida).
         self.last_sample_time = Instant::now();
-        self.string_pos = world;
-        self.string_radius = smoothing_string_radius_px(self.brush.smoothing) / self.camera.zoom.max(1e-4);
-        let f = world;
-        self.last_sample_pos = f;
-        self.ps_samples.push(InputSample { pos: f, pressure: pressure.clamp(0.05, 1.0), erosion: 0.0 });
+        let cfg = self.ink_config_ps();
+        self.smoother.reset(cfg);
+        for sm in self.smoother.push(world, pressure.clamp(0.05, 1.0), 1.0 / 120.0) {
+            self.last_sample_pos = sm.pos;
+            self.ps_samples.push(sm);
+        }
         if let Some(g) = self.gpu.as_mut() {
             g.clear_active_stamps();
         }
@@ -2293,44 +2383,40 @@ impl App {
             }
         }
         let now = Instant::now();
-        // Suavizado "cuerda" (Photoshop): el punto dibujado persigue al cursor a `string_radius`.
-        let d = raw_world - self.string_pos;
-        let dist = d.length();
-        if dist > self.string_radius {
-            self.string_pos = raw_world - d / dist * self.string_radius;
-        }
-        let f = self.string_pos;
-        let min_d = (1.0 / self.camera.zoom).max(1e-4);
-        if self.ps_samples.len() > 1 && (f - self.last_sample_pos).length() < min_d {
-            return;
-        }
-        self.last_sample_pos = f;
+        let dt = (now - self.last_sample_time).as_secs_f32().clamp(1e-4, 0.1);
         self.last_sample_time = now;
-        self.ps_samples.push(InputSample { pos: f, pressure, erosion: 0.0 });
-
         let Some(s) = self.ps_settings.clone() else { return };
-        let n = self.ps_samples.len();
-        let out = stamp_path(&self.ps_samples[n - 2..n], &s, self.ps_index, self.ps_residual);
-        self.ps_index = out.next_index;
-        self.ps_residual = out.residual;
-        if out.stamps.is_empty() {
-            return;
-        }
         let tip = match s.tip {
             TipKind::Sampled(id) => id,
             _ => 0,
         };
         let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
         let rgb = self.ps_brush_rgb();
-        let prev_len = self.ps_active_verts.len();
-        for st in &out.stamps {
-            push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
-        }
-        if let Some(g) = self.gpu.as_mut() {
-            if prev_len == 0 {
-                g.set_active_stamps(tip, &self.ps_active_verts);
-            } else if !g.append_active_stamps(&self.ps_active_verts[prev_len..]) {
-                g.set_active_stamps(tip, &self.ps_active_verts);
+        // El suavizador emite muestras densas y suaves; estampamos el tramo de cada una.
+        let new = self.smoother.push(raw_world, pressure, dt);
+        for sm in new {
+            self.ps_samples.push(sm);
+            self.last_sample_pos = sm.pos;
+            let n = self.ps_samples.len();
+            if n < 2 {
+                continue;
+            }
+            let out = stamp_path(&self.ps_samples[n - 2..n], &s, self.ps_index, self.ps_residual);
+            self.ps_index = out.next_index;
+            self.ps_residual = out.residual;
+            if out.stamps.is_empty() {
+                continue;
+            }
+            let prev_len = self.ps_active_verts.len();
+            for st in &out.stamps {
+                push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
+            }
+            if let Some(g) = self.gpu.as_mut() {
+                if prev_len == 0 {
+                    g.set_active_stamps(tip, &self.ps_active_verts);
+                } else if !g.append_active_stamps(&self.ps_active_verts[prev_len..]) {
+                    g.set_active_stamps(tip, &self.ps_active_verts);
+                }
             }
         }
     }
@@ -2345,6 +2431,26 @@ impl App {
             TipKind::Sampled(id) => id,
             _ => 0,
         };
+        // Cerrar la cola del suavizado: estampar el ultimo tramo pendiente.
+        let tail = self.smoother.finish();
+        if !tail.is_empty() {
+            let aspect = self.gpu.as_ref().map_or(1.0, |g| g.tip_aspect(tip));
+            let rgb = self.ps_brush_rgb();
+            for sm in tail {
+                self.ps_samples.push(sm);
+                self.last_sample_pos = sm.pos;
+                let n = self.ps_samples.len();
+                if n < 2 {
+                    continue;
+                }
+                let out = stamp_path(&self.ps_samples[n - 2..n], &s, self.ps_index, self.ps_residual);
+                self.ps_index = out.next_index;
+                self.ps_residual = out.residual;
+                for st in &out.stamps {
+                    push_stamp_quad(&mut self.ps_active_verts, st, aspect, rgb);
+                }
+            }
+        }
         // Un solo toque sin movimiento: estampar un punto.
         if self.ps_active_verts.is_empty() && self.ps_samples.len() == 1 {
             let out = stamp_path(&self.ps_samples, &s, 0, 0.0);
@@ -2612,6 +2718,393 @@ impl App {
     fn cancel_poly_lasso(&mut self) {
         self.poly_lasso.clear();
         self.last_poly_click = None;
+    }
+
+    /// MODO DOCUMENTO: dibuja/edita el cuerpo de texto de la hoja DENTRO de los margenes
+    /// (solo en cuadernos de hojas). En `write_mode` es un editor de teclado; si no, el texto
+    /// se ve fijo (la tinta del lapiz queda por encima en una fase posterior). El tamano de
+    /// fuente, el interlineado y la familia salen de `doc_layout`.
+    fn draw_document(&mut self, ctx: &egui::Context) {
+        let Some((w, h)) = self.settings.artboard_size() else { return };
+        let ppp = ctx.pixels_per_point().max(0.01);
+        let m = self.doc_layout.margins; // [arriba, derecha, abajo, izquierda]
+        let p0 = self.camera.world_to_screen(Vec2::new(-w * 0.5 + m[3], -h * 0.5 + m[0])) / ppp;
+        let p1 = self.camera.world_to_screen(Vec2::new(w * 0.5 - m[1], h * 0.5 - m[2])) / ppp;
+        let rect = egui::Rect::from_two_pos(egui::pos2(p0.x, p0.y), egui::pos2(p1.x, p1.y));
+        if rect.width() < 20.0 || rect.height() < 20.0 {
+            return;
+        }
+        // Si no hay texto y no estamos escribiendo, no dibujar nada (hoja en blanco para tinta).
+        if !self.write_mode && self.page_body.is_empty() {
+            return;
+        }
+        let size_pts = (self.doc_layout.font_size * self.camera.zoom / ppp).clamp(5.0, 400.0);
+        let fam = match self.doc_layout.font {
+            1 => egui::FontFamily::Name("serif".into()),       // Spectral
+            2 => egui::FontFamily::Monospace,                  // JetBrains Mono
+            3 => egui::FontFamily::Name("doc_lora".into()),
+            4 => egui::FontFamily::Name("doc_merri".into()),
+            5 => egui::FontFamily::Name("doc_garamond".into()),
+            6 => egui::FontFamily::Name("doc_atkinson".into()),
+            7 => egui::FontFamily::Name("doc_sourcesans".into()),
+            _ => egui::FontFamily::Proportional,               // 0 = Hanken (Sans)
+        };
+        let ls = self.doc_layout.line_spacing.max(0.5);
+        let text_col = egui::Color32::from_rgb(28, 26, 30);
+        let writing = self.write_mode;
+        let id_te = egui::Id::new("doc_te");
+        // Linea donde esta el cursor: en ella se MUESTRAN las marcas (para editarlas); en las
+        // demas se ocultan (vista renderizada). Solo en modo escritura.
+        let reveal_line = if writing {
+            egui::TextEdit::load_state(ctx, id_te)
+                .and_then(|st| st.cursor.char_range())
+                .map(|r| {
+                    let idx = r.primary.index.min(self.page_body.chars().count());
+                    self.page_body.chars().take(idx).filter(|&c| c == '\n').count()
+                })
+        } else {
+            None
+        };
+        let accent = egui::Color32::from_rgb(150, 120, 84);
+        let check_col = egui::Color32::from_rgb(60, 160, 90);
+        let page_align = self.page_align;
+        // Historial de deshacer: registra un punto al pausar el tecleo (~1 s).
+        if writing && self.page_body != self.doc_snap && (self.clock - self.doc_snap_at) > 1.0 {
+            if self.doc_undo.last().map(|s| s.as_str()) != Some(self.doc_snap.as_str()) {
+                self.doc_undo.push(self.doc_snap.clone());
+                if self.doc_undo.len() > 300 {
+                    self.doc_undo.remove(0);
+                }
+            }
+            self.doc_redo.clear();
+            self.doc_snap = self.page_body.clone();
+            self.doc_snap_at = self.clock;
+        }
+        let body = &mut self.page_body;
+        egui::Area::new(egui::Id::new("doc_editor"))
+            .order(egui::Order::Middle)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(rect);
+                // Job + decoraciones (mismas que usara el editor) para POSICIONAR los dibujos.
+                let (mut job, decos) = markdown_job(body, size_pts, ls, fam.clone(), text_col, reveal_line, page_align);
+                job.wrap.max_width = rect.width();
+                let galley = ui.painter().layout_job(job);
+                if writing {
+                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                        let (mut j, _) = markdown_job(buf.as_str(), size_pts, ls, fam.clone(), text_col, reveal_line, page_align);
+                        j.wrap.max_width = wrap;
+                        ui.painter().layout_job(j)
+                    };
+                    let te = egui::TextEdit::multiline(body)
+                        .id(id_te)
+                        .frame(egui::Frame::NONE)
+                        .desired_width(rect.width())
+                        .hint_text("Escribe aquí…")
+                        .layouter(&mut layouter);
+                    let r = ui.add_sized(rect.size(), te);
+                    if !r.has_focus() && ui.memory(|m| m.focused()).is_none() {
+                        r.request_focus();
+                    }
+                } else {
+                    ui.painter().galley(rect.min, galley.clone(), text_col);
+                }
+                // Decoraciones (casilla de tarea, barra de cita, regla) sobre el texto renderizado.
+                let painter = ui.painter();
+                for (cidx, deco) in &decos {
+                    let cr = galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
+                    let top = rect.min + cr.min.to_vec2();
+                    let rowh = cr.height().max(size_pts);
+                    match deco {
+                        Deco::Check(done) => {
+                            let s = (size_pts.min(rowh) * 0.82).max(8.0);
+                            let bx = egui::Rect::from_min_size(egui::pos2(top.x + 1.0, top.y + (rowh - s) * 0.5), egui::vec2(s, s));
+                            painter.rect_stroke(bx, egui::CornerRadius::same(3), egui::Stroke::new(1.6, if *done { check_col } else { accent }), egui::StrokeKind::Inside);
+                            if *done {
+                                let st = egui::Stroke::new(1.8, check_col);
+                                painter.line_segment([egui::pos2(bx.left() + s * 0.22, bx.center().y + s * 0.04), egui::pos2(bx.left() + s * 0.42, bx.bottom() - s * 0.24)], st);
+                                painter.line_segment([egui::pos2(bx.left() + s * 0.42, bx.bottom() - s * 0.24), egui::pos2(bx.right() - s * 0.18, bx.top() + s * 0.24)], st);
+                            }
+                        }
+                        Deco::Quote => {
+                            let x = top.x + 2.0;
+                            painter.line_segment([egui::pos2(x, top.y + 1.0), egui::pos2(x, top.y + rowh - 1.0)], egui::Stroke::new(3.0, accent));
+                        }
+                        Deco::Hr => {
+                            let y = top.y + rowh * 0.5;
+                            painter.line_segment([egui::pos2(rect.left() + 2.0, y), egui::pos2(rect.right() - 2.0, y)], egui::Stroke::new(1.4, egui::Color32::from_gray(170)));
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Panel "Diseño de página": margenes, interlineado, espaciado de parrafo, fuente y tamano.
+    fn page_setup_window(&mut self, ctx: &egui::Context) {
+        if !self.show_page_setup {
+            return;
+        }
+        let mut layout = self.doc_layout;
+        let mut open = true;
+        egui::Window::new("Diseño de página")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.spacing_mut().slider_width = 180.0;
+                ui.label(egui::RichText::new("MÁRGENES (pt)").size(11.0).color(egui::Color32::from_gray(140)));
+                ui.add(egui::Slider::new(&mut layout.margins[0], 0.0..=200.0).text("Arriba"));
+                ui.add(egui::Slider::new(&mut layout.margins[2], 0.0..=200.0).text("Abajo"));
+                ui.add(egui::Slider::new(&mut layout.margins[3], 0.0..=200.0).text("Izquierda"));
+                ui.add(egui::Slider::new(&mut layout.margins[1], 0.0..=200.0).text("Derecha"));
+                ui.separator();
+                ui.add(egui::Slider::new(&mut layout.font_size, 8.0..=48.0).text("Tamaño"));
+                ui.add(egui::Slider::new(&mut layout.line_spacing, 1.0..=3.0).text("Interlineado"));
+                ui.add(egui::Slider::new(&mut layout.para_spacing, 0.0..=40.0).text("Espacio párrafo"));
+                ui.label("Fuente:");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut layout.font, 0, "Sans");
+                    ui.selectable_value(&mut layout.font, 1, "Serif");
+                    ui.selectable_value(&mut layout.font, 2, "Mono");
+                    ui.selectable_value(&mut layout.font, 3, "Lora");
+                    ui.selectable_value(&mut layout.font, 4, "Merriweather");
+                    ui.selectable_value(&mut layout.font, 5, "Garamond");
+                    ui.selectable_value(&mut layout.font, 6, "Atkinson");
+                    ui.selectable_value(&mut layout.font, 7, "Source Sans");
+                });
+            });
+        self.doc_layout = layout;
+        if !open {
+            self.show_page_setup = false;
+        }
+    }
+
+    /// Aplica un comando Markdown de la toolbar al `page_body` segun la SELECCION del editor:
+    /// negrita/cursiva/tachado ENVUELVEN la seleccion; encabezados/listas/cita ponen un PREFIJO
+    /// al inicio de la linea. Actualiza el cursor del editor para que el foco no se pierda.
+    fn apply_md(&mut self, ctx: &egui::Context, md: Md) {
+        self.doc_snapshot();
+        let id = egui::Id::new("doc_te");
+        let mut chars: Vec<char> = self.page_body.chars().collect();
+        let n = chars.len();
+        let (mut lo, mut hi) = (n, n);
+        if let Some(state) = egui::TextEdit::load_state(ctx, id) {
+            if let Some(r) = state.cursor.char_range() {
+                lo = r.primary.index.min(r.secondary.index).min(n);
+                hi = r.primary.index.max(r.secondary.index).min(n);
+            }
+        }
+        let new_cursor: usize;
+        match md {
+            // --- Envolver la seleccion (formato en linea) ---
+            Md::Bold | Md::Italic | Md::Underline | Md::Strike | Md::Highlight | Md::Code => {
+                let mark: Vec<char> = match md {
+                    Md::Bold => "**",
+                    Md::Italic => "*",
+                    Md::Underline => "__",
+                    Md::Strike => "~~",
+                    Md::Highlight => "==",
+                    _ => "`",
+                }
+                .chars()
+                .collect();
+                let ml = mark.len();
+                for (k, &c) in mark.iter().enumerate() {
+                    chars.insert(hi + k, c);
+                }
+                for (k, &c) in mark.iter().enumerate() {
+                    chars.insert(lo + k, c);
+                }
+                new_cursor = if lo == hi { lo + ml } else { hi + 2 * ml };
+            }
+            // --- Enlace [texto](url): la seleccion es el texto; el cursor cae en "url" ---
+            Md::Link => {
+                let tail: Vec<char> = "](url)".chars().collect();
+                for (k, &c) in tail.iter().enumerate() {
+                    chars.insert(hi + k, c);
+                }
+                chars.insert(lo, '[');
+                // cursor sobre "url" (tras "[" + texto + "](")
+                new_cursor = hi + 1 + 3;
+            }
+            // --- Regla horizontal: bloque "---" en su propia linea ---
+            Md::Hr => {
+                let block: Vec<char> = "\n---\n".chars().collect();
+                for (k, &c) in block.iter().enumerate() {
+                    chars.insert(hi + k, c);
+                }
+                new_cursor = hi + block.len();
+            }
+            // --- Sangria: 2 espacios al inicio de la linea ---
+            Md::Indent => {
+                let mut start = lo.min(chars.len());
+                while start > 0 && chars[start - 1] != '\n' {
+                    start -= 1;
+                }
+                chars.insert(start, ' ');
+                chars.insert(start, ' ');
+                new_cursor = hi + 2;
+            }
+            // --- Quitar sangria: hasta 2 espacios del inicio de la linea ---
+            Md::Outdent => {
+                let mut start = lo.min(chars.len());
+                while start > 0 && chars[start - 1] != '\n' {
+                    start -= 1;
+                }
+                let mut removed = 0;
+                while removed < 2 && start < chars.len() && chars[start] == ' ' {
+                    chars.remove(start);
+                    removed += 1;
+                }
+                new_cursor = hi.saturating_sub(removed);
+            }
+            // --- Bloque de codigo: envolver en vallas ``` en lineas propias ---
+            Md::CodeBlock => {
+                let close: Vec<char> = "\n```".chars().collect();
+                for (k, &c) in close.iter().enumerate() {
+                    chars.insert(hi + k, c);
+                }
+                let open: Vec<char> = "```\n".chars().collect();
+                for (k, &c) in open.iter().enumerate() {
+                    chars.insert(lo + k, c);
+                }
+                new_cursor = hi + open.len();
+            }
+            // --- Limpiar formato: quita marcas Markdown/etiquetas de la seleccion ---
+            Md::Clear => {
+                let hi = hi.min(chars.len());
+                let sel: String = chars[lo..hi].iter().collect();
+                let cleaned = strip_md(&sel);
+                let midlen = cleaned.chars().count();
+                let mut v: Vec<char> = chars[..lo].to_vec();
+                v.extend(cleaned.chars());
+                v.extend(chars[hi..].iter().copied());
+                chars = v;
+                new_cursor = lo + midlen;
+            }
+            // --- Prefijo de linea (encabezado / lista / cita) ---
+            _ => {
+                let mut start = lo.min(chars.len());
+                while start > 0 && chars[start - 1] != '\n' {
+                    start -= 1;
+                }
+                let prefix: Vec<char> = match md {
+                    Md::H1 => "# ",
+                    Md::H2 => "## ",
+                    Md::H3 => "### ",
+                    Md::H4 => "#### ",
+                    Md::H5 => "##### ",
+                    Md::H6 => "###### ",
+                    Md::Bullet => "- ",
+                    Md::Number => "1. ",
+                    Md::Task => "- [ ] ",
+                    Md::Quote => "> ",
+                    Md::Callout => "> [!nota] ",
+                    _ => "",
+                }
+                .chars()
+                .collect();
+                for (k, &c) in prefix.iter().enumerate() {
+                    chars.insert(start + k, c);
+                }
+                new_cursor = hi + prefix.len();
+            }
+        }
+        self.page_body = chars.into_iter().collect();
+        let count = self.page_body.chars().count();
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let cc = egui::text::CCursor::new(new_cursor.min(count));
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
+        egui::TextEdit::store_state(ctx, id, state);
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.doc_snap = self.page_body.clone();
+        self.doc_snap_at = self.clock;
+    }
+
+    /// Aplica COLOR de texto (o de resaltado si `highlight`) a la seleccion, envolviendola con
+    /// una etiqueta `<span>`/`<mark>` que el render oculta y pinta.
+    fn apply_color(&mut self, ctx: &egui::Context, rgb: [u8; 3], highlight: bool) {
+        self.doc_snapshot();
+        let id = egui::Id::new("doc_te");
+        let mut chars: Vec<char> = self.page_body.chars().collect();
+        let n = chars.len();
+        let (mut lo, mut hi) = (n, n);
+        if let Some(state) = egui::TextEdit::load_state(ctx, id) {
+            if let Some(r) = state.cursor.char_range() {
+                lo = r.primary.index.min(r.secondary.index).min(n);
+                hi = r.primary.index.max(r.secondary.index).min(n);
+            }
+        }
+        let hex = format!("{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+        let (open, close) = if highlight {
+            (format!("<mark style=\"background:#{hex}\">"), "</mark>".to_string())
+        } else {
+            (format!("<span style=\"color:#{hex}\">"), "</span>".to_string())
+        };
+        let openv: Vec<char> = open.chars().collect();
+        let closev: Vec<char> = close.chars().collect();
+        for (k, &c) in closev.iter().enumerate() {
+            chars.insert(hi + k, c);
+        }
+        for (k, &c) in openv.iter().enumerate() {
+            chars.insert(lo + k, c);
+        }
+        let new_cursor = if lo == hi { lo + openv.len() } else { hi + openv.len() + closev.len() };
+        self.page_body = chars.into_iter().collect();
+        let count = self.page_body.chars().count();
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let cc = egui::text::CCursor::new(new_cursor.min(count));
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
+        egui::TextEdit::store_state(ctx, id, state);
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.doc_snap = self.page_body.clone();
+        self.doc_snap_at = self.clock;
+    }
+
+    /// Guarda un punto de historial (el `page_body` actual) para deshacer; limpia el rehacer.
+    fn doc_snapshot(&mut self) {
+        if self.doc_undo.last().map(|s| s.as_str()) != Some(self.page_body.as_str()) {
+            self.doc_undo.push(self.page_body.clone());
+            if self.doc_undo.len() > 300 {
+                self.doc_undo.remove(0);
+            }
+        }
+        self.doc_redo.clear();
+    }
+
+    /// Deshacer en el documento (texto).
+    fn doc_undo_op(&mut self, ctx: &egui::Context) {
+        if self.page_body != self.doc_snap {
+            self.doc_undo.push(self.doc_snap.clone());
+        }
+        if let Some(prev) = self.doc_undo.pop() {
+            self.doc_redo.push(self.page_body.clone());
+            self.page_body = prev.clone();
+            self.doc_snap = prev;
+            self.doc_snap_at = self.clock;
+            self.sync_doc_cursor_end(ctx);
+        }
+    }
+
+    /// Rehacer en el documento (texto).
+    fn doc_redo_op(&mut self, ctx: &egui::Context) {
+        if let Some(next) = self.doc_redo.pop() {
+            self.doc_undo.push(self.page_body.clone());
+            self.page_body = next.clone();
+            self.doc_snap = next;
+            self.doc_snap_at = self.clock;
+            self.sync_doc_cursor_end(ctx);
+        }
+    }
+
+    /// Coloca el cursor del editor al final del texto (tras deshacer/rehacer) y le da el foco.
+    fn sync_doc_cursor_end(&self, ctx: &egui::Context) {
+        let id = egui::Id::new("doc_te");
+        let count = self.page_body.chars().count();
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(count))));
+        egui::TextEdit::store_state(ctx, id, state);
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 
     /// Dibuja, encima del lienzo, lo propio de las herramientas: texto colocado,
@@ -3101,16 +3594,19 @@ impl ApplicationHandler for App {
                     // En VISTA PREVIA, la rueda PASA DE PAGINA (arriba = anterior, abajo = siguiente).
                     self.preview_flip(if amount > 0.0 { -1 } else { 1 });
                 } else if self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
-                    // Biblioteca: si hay DESBORDAMIENTO (no cabe todo), la rueda DESPLAZA la
-                    // cuadricula (con tope); si todo cabe, la rueda SOBRE un cuaderno lo VOLTEA.
-                    let max_scroll = self.library_max_scroll();
-                    if max_scroll > 0.0 {
-                        self.card_scroll = (self.card_scroll - amount * 90.0).clamp(0.0, max_scroll);
-                    } else if let Some(i) = self.library_card_at() {
+                    // Biblioteca: la rueda SOBRE un cuaderno/nota lo VOLTEA (gira con inercia),
+                    // este la ventana maximizada o no. Si el cursor NO esta sobre ninguna carta
+                    // y hay desbordamiento, la rueda DESPLAZA la cuadricula (con tope).
+                    if let Some(i) = self.library_card_at() {
                         self.card_flip_vel.resize(self.notebooks.len(), 0.0);
                         if i < self.card_flip_vel.len() {
                             // La rueda da IMPULSO; luego el cuaderno flota girando (inercia).
                             self.card_flip_vel[i] += amount * 0.05;
+                        }
+                    } else {
+                        let max_scroll = self.library_max_scroll();
+                        if max_scroll > 0.0 {
+                            self.card_scroll = (self.card_scroll - amount * 90.0).clamp(0.0, max_scroll);
                         }
                     }
                 }
@@ -3464,6 +3960,14 @@ impl ApplicationHandler for App {
                 let mut page_next = false;
                 let mut page_add = false;
                 let mut page_lock_toggle = false;
+                let mut toggle_write = false;
+                let mut toggle_setup = false;
+                let mut md_action: Option<Md> = None;
+                let mut md_color: Option<([u8; 3], bool)> = None;
+                let mut doc_undo_flag = false;
+                let mut doc_redo_flag = false;
+                let mut toggle_fullscreen = false;
+                let mut md_align: Option<u32> = None;
                 let in_library = self.app_mode == AppMode::Library;
                 let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
                     self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
@@ -3504,6 +4008,99 @@ impl ApplicationHandler for App {
                         ps_load_pack = self.ps_packs.get(idx).map(|(_, p, _)| p.clone());
                     }
                     self.draw_overlays(ctx);
+                    // MODO DOCUMENTO: editor de texto en la hoja (solo cuadernos de hojas).
+                    if !matches!(self.settings.artboard, settings::Artboard::Infinite) {
+                        self.draw_document(ctx);
+                        self.page_setup_window(ctx);
+                        // TOOLBAR de edicion (tipo Word): solo en modo escritura.
+                        if self.write_mode {
+                            egui::Area::new(egui::Id::new("md_toolbar"))
+                                .order(egui::Order::Foreground)
+                                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 1.0;
+                                            // Historial.
+                                            if md_button(ui, Md::Undo, "Deshacer").clicked() { doc_undo_flag = true; }
+                                            if md_button(ui, Md::Redo, "Rehacer").clicked() { doc_redo_flag = true; }
+                                            if md_button(ui, Md::Clear, "Limpiar formato").clicked() { md_action = Some(Md::Clear); }
+                                            ui.separator();
+                                            // Encabezados.
+                                            if md_button(ui, Md::H1, "Título 1").clicked() { md_action = Some(Md::H1); }
+                                            if md_button(ui, Md::H2, "Título 2").clicked() { md_action = Some(Md::H2); }
+                                            if md_button(ui, Md::H3, "Título 3").clicked() { md_action = Some(Md::H3); }
+                                            // Mas encabezados (H4-H6) en un desplegable.
+                                            let rhn = md_button(ui, Md::Hn, "Más títulos");
+                                            let phn = ui.make_persistent_id("md_hn_pop");
+                                            if rhn.clicked() { ui.memory_mut(|m| m.toggle_popup(phn)); }
+                                            #[allow(deprecated)]
+                                            egui::popup_below_widget(ui, phn, &rhn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    if md_button(ui, Md::H4, "Título 4").clicked() { md_action = Some(Md::H4); }
+                                                    if md_button(ui, Md::H5, "Título 5").clicked() { md_action = Some(Md::H5); }
+                                                    if md_button(ui, Md::H6, "Título 6").clicked() { md_action = Some(Md::H6); }
+                                                });
+                                            });
+                                            ui.separator();
+                                            // Estilo de texto.
+                                            if md_button(ui, Md::Bold, "Negrita").clicked() { md_action = Some(Md::Bold); }
+                                            if md_button(ui, Md::Italic, "Cursiva").clicked() { md_action = Some(Md::Italic); }
+                                            if md_button(ui, Md::Strike, "Tachado").clicked() { md_action = Some(Md::Strike); }
+                                            if md_button(ui, Md::Underline, "Subrayado").clicked() { md_action = Some(Md::Underline); }
+                                            if md_button(ui, Md::Highlight, "Resaltar").clicked() { md_action = Some(Md::Highlight); }
+                                            if md_button(ui, Md::Code, "Código").clicked() { md_action = Some(Md::Code); }
+                                            if md_button(ui, Md::CodeBlock, "Bloque de código").clicked() { md_action = Some(Md::CodeBlock); }
+                                            ui.separator();
+                                            // Estructura.
+                                            if md_button(ui, Md::Link, "Enlace").clicked() { md_action = Some(Md::Link); }
+                                            if md_button(ui, Md::Task, "Tarea").clicked() { md_action = Some(Md::Task); }
+                                            if md_button(ui, Md::Quote, "Cita").clicked() { md_action = Some(Md::Quote); }
+                                            if md_button(ui, Md::Callout, "Callout").clicked() { md_action = Some(Md::Callout); }
+                                            ui.separator();
+                                            // Listas y sangría.
+                                            if md_button(ui, Md::Bullet, "Lista").clicked() { md_action = Some(Md::Bullet); }
+                                            if md_button(ui, Md::Number, "Lista numerada").clicked() { md_action = Some(Md::Number); }
+                                            if md_button(ui, Md::Indent, "Sangrar").clicked() { md_action = Some(Md::Indent); }
+                                            if md_button(ui, Md::Outdent, "Quitar sangría").clicked() { md_action = Some(Md::Outdent); }
+                                            // Alineación (desplegable).
+                                            let ral = md_button(ui, Md::Align, "Alineación");
+                                            let pal = ui.make_persistent_id("md_align_pop");
+                                            if ral.clicked() { ui.memory_mut(|m| m.toggle_popup(pal)); }
+                                            #[allow(deprecated)]
+                                            egui::popup_below_widget(ui, pal, &ral, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    if md_button(ui, Md::AlignLeft, "Izquierda").clicked() { md_align = Some(0); }
+                                                    if md_button(ui, Md::AlignCenter, "Centro").clicked() { md_align = Some(1); }
+                                                    if md_button(ui, Md::AlignRight, "Derecha").clicked() { md_align = Some(2); }
+                                                    if md_button(ui, Md::AlignJustify, "Justificado").clicked() { md_align = Some(3); }
+                                                });
+                                            });
+                                            ui.separator();
+                                            // Color de texto (con paleta emergente).
+                                            let rc = md_button(ui, Md::FontColor, "Color de texto");
+                                            let pc = ui.make_persistent_id("md_fontcolor_pop");
+                                            if rc.clicked() { ui.memory_mut(|m| m.toggle_popup(pc)); }
+                                            #[allow(deprecated)]
+                                            egui::popup_below_widget(ui, pc, &rc, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                                if let Some(rgb) = color_palette(ui) { md_color = Some((rgb, false)); }
+                                            });
+                                            // Color de resaltado (con paleta emergente).
+                                            let rh = md_button(ui, Md::HighlightColor, "Color de resaltado");
+                                            let ph = ui.make_persistent_id("md_hicolor_pop");
+                                            if rh.clicked() { ui.memory_mut(|m| m.toggle_popup(ph)); }
+                                            #[allow(deprecated)]
+                                            egui::popup_below_widget(ui, ph, &rh, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                                if let Some(rgb) = color_palette(ui) { md_color = Some((rgb, true)); }
+                                            });
+                                            ui.separator();
+                                            if md_button(ui, Md::Hr, "Línea horizontal").clicked() { md_action = Some(Md::Hr); }
+                                            if md_button(ui, Md::Fullscreen, "Pantalla completa").clicked() { toggle_fullscreen = true; }
+                                        });
+                                    });
+                                });
+                        }
+                    }
                     // Boton para volver a la biblioteca de cuadernos.
                     egui::Area::new(egui::Id::new("lib_button"))
                         .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
@@ -3535,6 +4132,16 @@ impl ApplicationHandler for App {
                                         let lock_lbl = if self.lock_page { "🔒 Fijada" } else { "🔓 Fijar" };
                                         if ui.selectable_label(self.lock_page, lock_lbl).clicked() {
                                             page_lock_toggle = true;
+                                        }
+                                        ui.separator();
+                                        // Modo DOCUMENTO: escribir con teclado + diseño de pagina.
+                                        // Icono de lapiz VECTORIAL + texto (el glifo "✍" no existe
+                                        // en la fuente -> salia un cuadro).
+                                        if doc_pencil_button(ui, self.write_mode).clicked() {
+                                            toggle_write = true;
+                                        }
+                                        if ui.button("Página…").clicked() {
+                                            toggle_setup = true;
                                         }
                                     });
                                 });
@@ -4435,6 +5042,47 @@ impl ApplicationHandler for App {
                         self.center_on_page();
                     }
                 }
+                if toggle_write {
+                    self.write_mode = !self.write_mode;
+                    // Al escribir conviene fijar la hoja (que el pan/zoom no estorbe al teclear).
+                    if self.write_mode {
+                        self.lock_page = true;
+                        self.center_on_page();
+                    }
+                }
+                if toggle_setup {
+                    self.show_page_setup = !self.show_page_setup;
+                }
+                if let Some(md) = md_action {
+                    let c = self.egui_ctx.clone();
+                    self.apply_md(&c, md);
+                }
+                if let Some((rgb, hl)) = md_color {
+                    let c = self.egui_ctx.clone();
+                    self.apply_color(&c, rgb, hl);
+                }
+                if let Some(a) = md_align {
+                    self.page_align = a;
+                    self.egui_ctx.memory_mut(|m| m.request_focus(egui::Id::new("doc_te")));
+                }
+                if doc_undo_flag {
+                    let c = self.egui_ctx.clone();
+                    self.doc_undo_op(&c);
+                }
+                if doc_redo_flag {
+                    let c = self.egui_ctx.clone();
+                    self.doc_redo_op(&c);
+                }
+                if toggle_fullscreen {
+                    self.fullscreen = !self.fullscreen;
+                    if let Some(w) = &self.window {
+                        w.set_fullscreen(if self.fullscreen {
+                            Some(winit::window::Fullscreen::Borderless(None))
+                        } else {
+                            None
+                        });
+                    }
+                }
                 if let Some(p) = ps_load_pack {
                     self.load_ps_pack(&p);
                 }
@@ -4716,14 +5364,6 @@ fn dyn_combo(ui: &mut egui::Ui, id: &str, ctrl: &mut ink_core::DynControl) {
         });
 }
 
-/// Una fila "etiqueta + slider 0..100%" para un factor 0..1.
-/// Radio de la "cuerda" (en PIXELES de pantalla) del Suavizado estilo Photoshop, segun la
-/// suavidad (0..1). 0% = 0 px (trazo crudo, pegado a la punta); 100% = cuerda larga (linea
-/// muy suave). El punto dibujado persigue al cursor a esta distancia -> lag FIJO y pequeno
-/// (no crece con la velocidad como un filtro paso-bajo), igual que el Suavizado de Photoshop.
-fn smoothing_string_radius_px(smoothing: f32) -> f32 {
-    smoothing.clamp(0.0, 1.0) * 48.0
-}
 
 /// Carga una fuente profesional y legible (Segoe UI / alternativas del sistema) como fuente
 /// por defecto de TODA la interfaz; mantiene las de respaldo de egui para los iconos/emoji.
@@ -4747,6 +5387,13 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.font_data.insert("spectral".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Spectral-Regular.ttf"))));
     fonts.font_data.insert("spectral_sb".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Spectral-SemiBold.ttf"))));
     fonts.font_data.insert("spectral_it".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Spectral-Italic.ttf"))));
+    // Fuentes de ESCRITURA del modo documento (OFL): Lora, Merriweather, EB Garamond (serif),
+    // Atkinson Hyperlegible y Source Sans 3 (sans legibles).
+    fonts.font_data.insert("lora".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Lora-Regular.ttf"))));
+    fonts.font_data.insert("merri".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Merriweather-Regular.ttf"))));
+    fonts.font_data.insert("garamond".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/EBGaramond-Regular.ttf"))));
+    fonts.font_data.insert("atkinson".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/AtkinsonHyperlegible-Regular.ttf"))));
+    fonts.font_data.insert("sourcesans".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/SourceSans3-Regular.ttf"))));
     // Respaldo del sistema (acentos/glifos que falten): Segoe UI / Calibri / DejaVu.
     let fallback = ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/calibri.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
         .iter()
@@ -4770,6 +5417,16 @@ fn setup_fonts(ctx: &egui::Context) {
     // Familias serif (titulos/subtitulos Cuaderno): Spectral.
     fonts.families.insert(egui::FontFamily::Name("serif".into()), vec!["spectral_sb".to_owned(), "spectral".to_owned()]);
     fonts.families.insert(egui::FontFamily::Name("serif_it".into()), vec!["spectral_it".to_owned(), "spectral".to_owned()]);
+    // Familias de las fuentes de escritura (con respaldo "hanken" para glifos que falten).
+    for (name, data) in [
+        ("doc_lora", "lora"),
+        ("doc_merri", "merri"),
+        ("doc_garamond", "garamond"),
+        ("doc_atkinson", "atkinson"),
+        ("doc_sourcesans", "sourcesans"),
+    ] {
+        fonts.families.insert(egui::FontFamily::Name(name.into()), vec![data.to_owned(), "hanken".to_owned()]);
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -5304,6 +5961,663 @@ fn search_icon(ui: &mut egui::Ui, col: egui::Color32) {
     p.circle_stroke(c, 4.6, st);
     let d = 4.6 * std::f32::consts::FRAC_1_SQRT_2;
     p.line_segment([egui::pos2(c.x + d, c.y + d), egui::pos2(c.x + d + 3.6, c.y + d + 3.6)], st);
+}
+
+/// Boton "Escribir" (modo documento): lapiz VECTORIAL + texto. Resalta si esta activo.
+fn doc_pencil_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        "Escribir".to_string(),
+        egui::FontId::proportional(14.0),
+        egui::Color32::PLACEHOLDER,
+    );
+    let w = 22.0 + galley.size().x + 10.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
+    let p = ui.painter();
+    let bg = if active {
+        egui::Color32::from_rgb(120, 178, 235)
+    } else if resp.hovered() {
+        egui::Color32::from_gray(228)
+    } else {
+        egui::Color32::from_gray(238)
+    };
+    p.rect_filled(rect, egui::CornerRadius::same(5), bg);
+    let col = if active { egui::Color32::WHITE } else { egui::Color32::from_gray(60) };
+    // Teclado de PC: cuerpo + teclas + barra espaciadora.
+    let c = egui::pos2(rect.left() + 14.0, rect.center().y);
+    let st = egui::Stroke::new(1.4, col);
+    let body = egui::Rect::from_center_size(c, egui::vec2(17.0, 11.0));
+    p.rect_stroke(body, egui::CornerRadius::same(2), st, egui::StrokeKind::Inside);
+    for &ky in &[c.y - 2.5, c.y + 0.5] {
+        for dx in [-5.0_f32, -1.7, 1.7, 5.0] {
+            p.rect_filled(egui::Rect::from_center_size(egui::pos2(c.x + dx, ky), egui::vec2(1.6, 1.6)), egui::CornerRadius::same(0), col);
+        }
+    }
+    p.line_segment([egui::pos2(c.x - 4.0, c.y + 3.4), egui::pos2(c.x + 4.0, c.y + 3.4)], egui::Stroke::new(1.4, col));
+    p.text(egui::pos2(rect.left() + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, "Escribir", egui::FontId::proportional(14.0), col);
+    resp
+}
+
+/// Comando de formato Markdown de la toolbar de edicion.
+#[derive(Clone, Copy, PartialEq)]
+enum Md {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Highlight,
+    Code,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignJustify,
+    Bullet,
+    Number,
+    Task,
+    Quote,
+    Hr,
+    Link,
+    Indent,
+    Outdent,
+    Clear,
+    FontColor,
+    HighlightColor,
+    Undo,
+    Redo,
+    CodeBlock,
+    Callout,
+    Fullscreen,
+    Hn,
+    Align,
+}
+
+/// Boton de la toolbar de edicion: icono VECTORIAL (o letra de la fuente real, que SI existe).
+fn md_button(ui: &mut egui::Ui, md: Md, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, egui::CornerRadius::same(6), egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18));
+    }
+    let col = egui::Color32::from_gray(55);
+    let c = rect.center();
+    let head = egui::FontFamily::Name("head".into());
+    let st = egui::Stroke::new(1.5, col);
+    match md {
+        Md::Bold => { p.text(c, egui::Align2::CENTER_CENTER, "B", egui::FontId::new(16.0, head), col); }
+        Md::Italic => { p.text(c, egui::Align2::CENTER_CENTER, "I", egui::FontId::new(16.0, egui::FontFamily::Name("serif_it".into())), col); }
+        Md::Underline => {
+            p.text(egui::pos2(c.x, c.y - 1.0), egui::Align2::CENTER_CENTER, "U", egui::FontId::proportional(15.0), col);
+            p.line_segment([egui::pos2(c.x - 6.0, c.y + 8.0), egui::pos2(c.x + 6.0, c.y + 8.0)], egui::Stroke::new(1.5, col));
+        }
+        Md::Strike => {
+            p.text(c, egui::Align2::CENTER_CENTER, "S", egui::FontId::proportional(15.0), col);
+            p.line_segment([egui::pos2(c.x - 6.0, c.y), egui::pos2(c.x + 6.0, c.y)], egui::Stroke::new(1.4, col));
+        }
+        Md::Highlight => {
+            // Trazo de resaltador (rectangulo amarillo) + linea base.
+            let r = egui::Rect::from_center_size(egui::pos2(c.x, c.y - 1.0), egui::vec2(15.0, 9.0));
+            p.rect_filled(r, egui::CornerRadius::same(2), egui::Color32::from_rgb(250, 224, 90));
+            p.text(egui::pos2(c.x, c.y - 1.0), egui::Align2::CENTER_CENTER, "a", egui::FontId::new(12.0, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(40));
+            p.line_segment([egui::pos2(c.x - 8.0, c.y + 7.0), egui::pos2(c.x + 8.0, c.y + 7.0)], egui::Stroke::new(2.0, egui::Color32::from_rgb(230, 200, 70)));
+        }
+        Md::Code => {
+            let st2 = egui::Stroke::new(1.6, col);
+            // chevron "<"
+            p.line_segment([egui::pos2(c.x - 3.0, c.y - 4.0), egui::pos2(c.x - 8.0, c.y)], st2);
+            p.line_segment([egui::pos2(c.x - 8.0, c.y), egui::pos2(c.x - 3.0, c.y + 4.0)], st2);
+            // chevron ">"
+            p.line_segment([egui::pos2(c.x + 3.0, c.y - 4.0), egui::pos2(c.x + 8.0, c.y)], st2);
+            p.line_segment([egui::pos2(c.x + 8.0, c.y), egui::pos2(c.x + 3.0, c.y + 4.0)], st2);
+        }
+        Md::H1 => { p.text(c, egui::Align2::CENTER_CENTER, "H1", egui::FontId::new(12.5, head), col); }
+        Md::H2 => { p.text(c, egui::Align2::CENTER_CENTER, "H2", egui::FontId::new(11.5, head), col); }
+        Md::H3 => { p.text(c, egui::Align2::CENTER_CENTER, "H3", egui::FontId::new(10.5, head), col); }
+        Md::H4 => { p.text(c, egui::Align2::CENTER_CENTER, "H4", egui::FontId::new(10.0, head), col); }
+        Md::H5 => { p.text(c, egui::Align2::CENTER_CENTER, "H5", egui::FontId::new(9.5, head), col); }
+        Md::H6 => { p.text(c, egui::Align2::CENTER_CENTER, "H6", egui::FontId::new(9.0, head), col); }
+        Md::AlignLeft | Md::AlignCenter | Md::AlignRight | Md::AlignJustify => {
+            // 4 lineas; la 2a y 4a varian segun la alineacion.
+            let ys = [c.y - 4.5, c.y - 1.5, c.y + 1.5, c.y + 4.5];
+            for (i, &y) in ys.iter().enumerate() {
+                let (x0, x1) = match (md, i) {
+                    (Md::AlignCenter, 1) | (Md::AlignCenter, 3) => (c.x - 5.0, c.x + 5.0),
+                    (Md::AlignRight, 1) | (Md::AlignRight, 3) => (c.x - 2.0, c.x + 8.0),
+                    (Md::AlignJustify, _) => (c.x - 8.0, c.x + 8.0),
+                    (_, 1) | (_, 3) => (c.x - 8.0, c.x + 2.0), // left (filas cortas)
+                    _ => (c.x - 8.0, c.x + 8.0),               // filas largas
+                };
+                p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], egui::Stroke::new(1.4, col));
+            }
+        }
+        Md::Bullet => {
+            for dy in [-4.5_f32, 0.0, 4.5] {
+                p.circle_filled(egui::pos2(c.x - 7.0, c.y + dy), 1.3, col);
+                p.line_segment([egui::pos2(c.x - 3.0, c.y + dy), egui::pos2(c.x + 8.0, c.y + dy)], st);
+            }
+        }
+        Md::Number => { p.text(c, egui::Align2::CENTER_CENTER, "1.", egui::FontId::new(13.0, egui::FontFamily::Monospace), col); }
+        Md::Task => {
+            let r = egui::Rect::from_center_size(c, egui::vec2(13.0, 13.0));
+            p.rect_stroke(r, egui::CornerRadius::same(3), st, egui::StrokeKind::Inside);
+            p.line_segment([egui::pos2(c.x - 3.0, c.y + 0.5), egui::pos2(c.x - 1.0, c.y + 3.0)], egui::Stroke::new(1.7, col));
+            p.line_segment([egui::pos2(c.x - 1.0, c.y + 3.0), egui::pos2(c.x + 4.0, c.y - 3.0)], egui::Stroke::new(1.7, col));
+        }
+        Md::Quote => {
+            p.line_segment([egui::pos2(c.x - 7.0, c.y - 5.0), egui::pos2(c.x - 7.0, c.y + 5.0)], egui::Stroke::new(2.6, col));
+            p.line_segment([egui::pos2(c.x - 3.0, c.y - 3.0), egui::pos2(c.x + 8.0, c.y - 3.0)], st);
+            p.line_segment([egui::pos2(c.x - 3.0, c.y + 2.5), egui::pos2(c.x + 8.0, c.y + 2.5)], st);
+        }
+        Md::Hr => {
+            p.line_segment([egui::pos2(c.x - 8.0, c.y), egui::pos2(c.x + 8.0, c.y)], egui::Stroke::new(2.0, col));
+        }
+        Md::Link => {
+            // Dos eslabones (cadena) unidos por una diagonal.
+            let lk = egui::Stroke::new(1.6, col);
+            p.line_segment([egui::pos2(c.x - 2.0, c.y - 2.0), egui::pos2(c.x + 2.0, c.y + 2.0)], lk);
+            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, 1.0)] {
+                let cc = egui::pos2(c.x + sx * 4.5, c.y + sy * 4.5);
+                let r = egui::Rect::from_center_size(cc, egui::vec2(7.0, 5.0));
+                p.rect_stroke(r, egui::CornerRadius::same(2), lk, egui::StrokeKind::Inside);
+            }
+        }
+        Md::Indent | Md::Outdent => {
+            // Tres lineas + flecha (derecha = sangrar, izquierda = quitar sangria).
+            for dy in [-5.0_f32, 0.0, 5.0] {
+                p.line_segment([egui::pos2(c.x - 2.0, c.y + dy), egui::pos2(c.x + 8.0, c.y + dy)], st);
+            }
+            let dir = if matches!(md, Md::Indent) { 1.0 } else { -1.0 };
+            let tipx = c.x - 8.0 + if dir > 0.0 { 0.0 } else { 4.0 };
+            p.line_segment([egui::pos2(tipx, c.y - 3.0), egui::pos2(tipx + dir * 4.0, c.y)], st);
+            p.line_segment([egui::pos2(tipx + dir * 4.0, c.y), egui::pos2(tipx, c.y + 3.0)], st);
+        }
+        Md::Clear => {
+            // "A" con una diagonal (limpiar formato).
+            p.text(egui::pos2(c.x - 1.0, c.y), egui::Align2::CENTER_CENTER, "A", egui::FontId::new(14.0, egui::FontFamily::Name("head".into())), col);
+            p.line_segment([egui::pos2(c.x - 8.0, c.y + 7.0), egui::pos2(c.x + 8.0, c.y - 7.0)], egui::Stroke::new(1.6, egui::Color32::from_rgb(200, 90, 80)));
+        }
+        Md::FontColor => {
+            // "A" con barra de color debajo (color de letra).
+            p.text(egui::pos2(c.x, c.y - 2.0), egui::Align2::CENTER_CENTER, "A", egui::FontId::new(14.0, egui::FontFamily::Name("head".into())), col);
+            p.rect_filled(egui::Rect::from_min_max(egui::pos2(c.x - 8.0, c.y + 6.0), egui::pos2(c.x + 8.0, c.y + 9.0)), egui::CornerRadius::same(1), egui::Color32::from_rgb(210, 70, 60));
+        }
+        Md::HighlightColor => {
+            // Marcador con barra de color (color de resaltado).
+            let r = egui::Rect::from_center_size(egui::pos2(c.x, c.y - 2.0), egui::vec2(13.0, 9.0));
+            p.rect_stroke(r, egui::CornerRadius::same(2), st, egui::StrokeKind::Inside);
+            p.rect_filled(egui::Rect::from_min_max(egui::pos2(c.x - 8.0, c.y + 6.0), egui::pos2(c.x + 8.0, c.y + 9.0)), egui::CornerRadius::same(1), egui::Color32::from_rgb(245, 210, 70));
+        }
+        Md::Undo | Md::Redo => {
+            // Flecha curva (deshacer = izquierda, rehacer = derecha).
+            let dir = if matches!(md, Md::Undo) { -1.0_f32 } else { 1.0 };
+            let r = 5.5_f32;
+            let arc: Vec<egui::Pos2> = (0..=9)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (0.08 + 0.9 * i as f32 / 9.0);
+                    egui::pos2(c.x - dir * r * a.cos(), c.y - 1.0 - r * a.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(arc.clone(), st));
+            // punta de flecha en el extremo inferior.
+            if let Some(end) = arc.first() {
+                p.line_segment([*end, egui::pos2(end.x + dir * 4.0, end.y - 1.0)], st);
+                p.line_segment([*end, egui::pos2(end.x + dir * 1.0, end.y + 4.0)], st);
+            }
+        }
+        Md::CodeBlock => {
+            let r = egui::Rect::from_center_size(c, egui::vec2(17.0, 14.0));
+            p.rect_stroke(r, egui::CornerRadius::same(3), st, egui::StrokeKind::Inside);
+            let s2 = egui::Stroke::new(1.3, col);
+            p.line_segment([egui::pos2(c.x - 2.0, c.y - 3.0), egui::pos2(c.x - 5.0, c.y)], s2);
+            p.line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x - 2.0, c.y + 3.0)], s2);
+            p.line_segment([egui::pos2(c.x + 2.0, c.y - 3.0), egui::pos2(c.x + 5.0, c.y)], s2);
+            p.line_segment([egui::pos2(c.x + 5.0, c.y), egui::pos2(c.x + 2.0, c.y + 3.0)], s2);
+        }
+        Md::Callout => {
+            let r = egui::Rect::from_center_size(c, egui::vec2(16.0, 13.0));
+            p.rect_stroke(r, egui::CornerRadius::same(3), st, egui::StrokeKind::Inside);
+            p.line_segment([egui::pos2(r.left() + 3.0, r.top() + 2.0), egui::pos2(r.left() + 3.0, r.bottom() - 2.0)], egui::Stroke::new(2.4, egui::Color32::from_rgb(90, 150, 220)));
+            p.text(egui::pos2(c.x + 2.0, c.y), egui::Align2::CENTER_CENTER, "i", egui::FontId::new(11.0, egui::FontFamily::Name("serif_it".into())), col);
+        }
+        Md::Fullscreen => {
+            // Cuatro esquinas (entrar a pantalla completa).
+            let q = 6.0_f32;
+            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let cx = c.x + sx * q;
+                let cy = c.y + sy * q;
+                p.line_segment([egui::pos2(cx, cy), egui::pos2(cx - sx * 4.0, cy)], st);
+                p.line_segment([egui::pos2(cx, cy), egui::pos2(cx, cy - sy * 4.0)], st);
+            }
+        }
+        Md::Hn => {
+            // "H" + chevron (mas encabezados).
+            p.text(egui::pos2(c.x - 3.0, c.y), egui::Align2::CENTER_CENTER, "H", egui::FontId::new(13.0, head), col);
+            p.line_segment([egui::pos2(c.x + 3.0, c.y - 1.0), egui::pos2(c.x + 6.0, c.y + 2.0)], st);
+            p.line_segment([egui::pos2(c.x + 6.0, c.y + 2.0), egui::pos2(c.x + 9.0, c.y - 1.0)], st);
+        }
+        Md::Align => {
+            // Lineas de alineacion + chevron.
+            for (i, &y) in [c.y - 4.0, c.y - 1.0, c.y + 2.0].iter().enumerate() {
+                let x1 = if i == 1 { c.x + 1.0 } else { c.x + 5.0 };
+                p.line_segment([egui::pos2(c.x - 7.0, y), egui::pos2(x1, y)], st);
+            }
+            p.line_segment([egui::pos2(c.x + 2.0, c.y + 5.0), egui::pos2(c.x + 5.0, c.y + 8.0)], st);
+            p.line_segment([egui::pos2(c.x + 5.0, c.y + 8.0), egui::pos2(c.x + 8.0, c.y + 5.0)], st);
+        }
+    }
+    resp.on_hover_text(tip)
+}
+
+/// Paleta de colores para texto/resaltado de la toolbar (negro, grises, y colores).
+const MD_PALETTE: [[u8; 3]; 12] = [
+    [30, 30, 34],
+    [120, 120, 128],
+    [210, 70, 60],
+    [225, 130, 40],
+    [220, 180, 40],
+    [90, 170, 80],
+    [50, 150, 150],
+    [60, 120, 210],
+    [120, 90, 200],
+    [200, 90, 160],
+    [150, 110, 70],
+    [240, 240, 240],
+];
+
+/// Popup con una rejilla de swatches; devuelve el color elegido (si se pulso uno).
+fn color_palette(ui: &mut egui::Ui) -> Option<[u8; 3]> {
+    let mut chosen = None;
+    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+    egui::Grid::new("md_palette_grid").spacing(egui::vec2(4.0, 4.0)).show(ui, |ui| {
+        for (i, rgb) in MD_PALETTE.iter().enumerate() {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+            let c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(4), c);
+            if resp.hovered() {
+                ui.painter().rect_stroke(rect, egui::CornerRadius::same(4), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+            }
+            if resp.clicked() {
+                chosen = Some(*rgb);
+            }
+            if (i + 1) % 4 == 0 {
+                ui.end_row();
+            }
+        }
+    });
+    chosen
+}
+
+/// Nivel de encabezado de una linea Markdown (1..3) y el indice de CARACTER donde empieza el
+/// contenido (tras "# "). 0 = no es encabezado.
+fn heading_level(line: &str) -> (u32, usize) {
+    let mut hashes = 0usize;
+    for ch in line.chars() {
+        if ch == '#' {
+            hashes += 1;
+        } else {
+            break;
+        }
+    }
+    if (1..=6).contains(&hashes) && line.chars().nth(hashes) == Some(' ') {
+        (hashes as u32, hashes + 1)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Convierte texto Markdown en un `LayoutJob` con FORMATO en vivo (negrita/cursiva/tachado +
+/// encabezados). Conserva TODOS los caracteres (las marcas se ven atenuadas) para que el cursor
+/// del editor siga mapeando bien. `base` = tamano de fuente; `fam` = familia base.
+/// Parseo EN LINEA de Markdown: **negrita**, *cursiva*, __subrayado__, ~~tachado~~, ==resaltado==,
+/// `codigo` y enlaces [texto](url). Conserva todos los caracteres (marcas atenuadas) para que el
+/// cursor del editor siga mapeando bien. Anexa los tramos a `job` con su formato.
+/// Quita las marcas Markdown y etiquetas HTML de un texto (para "limpiar formato").
+fn strip_md(s: &str) -> String {
+    // 1) quitar etiquetas <...>
+    let mut no_tags = String::new();
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => no_tags.push(ch),
+            _ => {}
+        }
+    }
+    // 2) quitar marcas de formato.
+    no_tags
+        .replace("**", "")
+        .replace("__", "")
+        .replace("~~", "")
+        .replace("==", "")
+        .replace('*', "")
+        .replace('`', "")
+}
+
+/// Extrae un color `#RRGGBB` del primer `#` que aparezca en `s`.
+fn parse_hex_color(s: &str) -> Option<egui::Color32> {
+    let h = s.find('#')?;
+    let hex: String = s[h + 1..].chars().take(6).collect();
+    if hex.len() < 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
+/// Decoracion DIBUJADA sobre una linea (lo que sustituye a la marca oculta).
+#[derive(Clone, Copy)]
+enum Deco {
+    Check(bool),
+    Quote,
+    Hr,
+}
+
+fn push_inline(
+    job: &mut egui::text::LayoutJob,
+    chars: &[char],
+    size: f32,
+    lh: f32,
+    base_fam: &egui::FontFamily,
+    base_col: egui::Color32,
+    base_italic: bool,
+    reveal: bool,
+) {
+    use egui::{Color32, FontFamily, FontId, Stroke, TextFormat};
+    let head = FontFamily::Name("head".into());
+    let mono = FontFamily::Monospace;
+    let dim = Color32::from_rgba_unmultiplied(base_col.r(), base_col.g(), base_col.b(), 95);
+    let link_col = Color32::from_rgb(58, 120, 210);
+    let hi_bg = Color32::from_rgb(252, 232, 120);
+    let code_bg = Color32::from_rgba_unmultiplied(130, 130, 140, 46);
+    // Anexa una marca (los `*`, `_`, etc.): atenuada si `reveal` (linea del cursor); si no,
+    // OCULTA (tamano ~0 + transparente) conservando el caracter para no descolocar el cursor.
+    let mark = |job: &mut egui::text::LayoutJob, txt: &str| {
+        if reveal {
+            job.append(txt, 0.0, TextFormat { font_id: FontId::new(size, base_fam.clone()), color: dim, line_height: Some(lh), ..Default::default() });
+        } else {
+            job.append(txt, 0.0, TextFormat { font_id: FontId::new(0.01, base_fam.clone()), color: Color32::TRANSPARENT, line_height: Some(lh), ..Default::default() });
+        }
+    };
+    // Anexa el texto acumulado con el estilo actual (con override de color/fondo por <span>/<mark>).
+    let emit = |job: &mut egui::text::LayoutJob, run: &mut String, b: bool, it: bool, u: bool, s: bool, h: bool, c: bool, col_ovr: Option<Color32>, bg_ovr: Option<Color32>| {
+        if run.is_empty() {
+            return;
+        }
+        let fam = if c { &mono } else if b { &head } else { base_fam };
+        let color = col_ovr.unwrap_or(base_col);
+        let bg = bg_ovr.unwrap_or(if h { hi_bg } else if c { code_bg } else { Color32::TRANSPARENT });
+        job.append(
+            run,
+            0.0,
+            TextFormat {
+                font_id: FontId::new(size, fam.clone()),
+                color,
+                background: bg,
+                italics: it,
+                underline: if u { Stroke::new(1.0, color) } else { Stroke::NONE },
+                strikethrough: if s { Stroke::new((size * 0.06).max(1.0), color) } else { Stroke::NONE },
+                line_height: Some(lh),
+                ..Default::default()
+            },
+        );
+        run.clear();
+    };
+    let (mut b, mut it, mut u, mut s, mut h, mut c) = (false, base_italic, false, false, false, false);
+    let (mut cur_col, mut cur_bg): (Option<Color32>, Option<Color32>) = (None, None);
+    let two = |chars: &[char], i: usize, a: char| i + 1 < chars.len() && chars[i] == a && chars[i + 1] == a;
+    let mut i = 0;
+    let mut run = String::new();
+    while i < chars.len() {
+        if chars[i] == '`' {
+            emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+            mark(job, "`");
+            c = !c;
+            i += 1;
+        } else if !c && two(chars, i, '*') {
+            emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+            mark(job, "**");
+            b = !b;
+            i += 2;
+        } else if !c && two(chars, i, '=') {
+            emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+            mark(job, "==");
+            h = !h;
+            i += 2;
+        } else if !c && two(chars, i, '_') {
+            emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+            mark(job, "__");
+            u = !u;
+            i += 2;
+        } else if !c && two(chars, i, '~') {
+            emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+            mark(job, "~~");
+            s = !s;
+            i += 2;
+        } else if !c && chars[i] == '*' {
+            emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+            mark(job, "*");
+            it = !it;
+            i += 1;
+        } else if !c && chars[i] == '[' {
+            // Enlace [texto](url): buscar "](" y luego ")".
+            let mut rb = None;
+            let mut j = i + 1;
+            while j + 1 < chars.len() {
+                if chars[j] == ']' && chars[j + 1] == '(' {
+                    rb = Some(j);
+                    break;
+                }
+                if chars[j] == '[' {
+                    break;
+                }
+                j += 1;
+            }
+            let mut handled = false;
+            if let Some(rb) = rb {
+                let mut k = rb + 2;
+                while k < chars.len() && chars[k] != ')' {
+                    k += 1;
+                }
+                if k < chars.len() {
+                    emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+                    mark(job, "[");
+                    let label: String = chars[i + 1..rb].iter().collect();
+                    job.append(&label, 0.0, TextFormat { font_id: FontId::new(size, base_fam.clone()), color: link_col, underline: Stroke::new(1.0, link_col), line_height: Some(lh), ..Default::default() });
+                    let tail: String = chars[rb..=k].iter().collect(); // "](url)"
+                    mark(job, &tail);
+                    i = k + 1;
+                    handled = true;
+                }
+            }
+            if !handled {
+                run.push('[');
+                i += 1;
+            }
+        } else if !c && chars[i] == '<' {
+            // Etiqueta HTML: <span style="color:#hex"> / <mark style="background:#hex"> y cierres.
+            let mut k = i + 1;
+            while k < chars.len() && chars[k] != '>' {
+                k += 1;
+            }
+            if k < chars.len() {
+                emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+                let tag: String = chars[i..=k].iter().collect();
+                mark(job, &tag);
+                let tl = tag.to_ascii_lowercase();
+                if tl.starts_with("</span") {
+                    cur_col = None;
+                } else if tl.starts_with("</mark") {
+                    cur_bg = None;
+                } else if tl.starts_with("<span") {
+                    cur_col = parse_hex_color(&tag);
+                } else if tl.starts_with("<mark") {
+                    cur_bg = parse_hex_color(&tag);
+                }
+                i = k + 1;
+            } else {
+                run.push('<');
+                i += 1;
+            }
+        } else {
+            run.push(chars[i]);
+            i += 1;
+        }
+    }
+    emit(job, &mut run, b, it, u, s, h, c, cur_col, cur_bg);
+}
+
+/// Convierte Markdown en un `LayoutJob` con FORMATO en vivo estilo WYSIWYG: las marcas se
+/// OCULTAN salvo en `reveal_line` (la linea del cursor, para editarlas). Devuelve tambien las
+/// DECORACIONES a dibujar encima (casilla de tarea, barra de cita, regla) en el `char` indicado
+/// (indice del primer caracter de la linea, para posicionar con `galley.pos_from_cursor`).
+fn markdown_job(
+    text: &str,
+    base: f32,
+    line_spacing: f32,
+    fam: egui::FontFamily,
+    col: egui::Color32,
+    reveal_line: Option<usize>,
+    align: u32,
+) -> (egui::text::LayoutJob, Vec<(usize, Deco)>) {
+    use egui::text::LayoutJob;
+    use egui::{Color32, FontFamily, FontId, TextFormat};
+    let head = FontFamily::Name("head".into());
+    let dim = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 95);
+    let accent = Color32::from_rgb(150, 120, 84);
+    let quote_col = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 175);
+    let mut job = LayoutJob::default();
+    let mut decos: Vec<(usize, Deco)> = Vec::new();
+    let plain = |job: &mut LayoutJob, txt: &str, size: f32, lh: f32, color: Color32| {
+        job.append(txt, 0.0, TextFormat { font_id: FontId::new(size, fam.clone()), color, line_height: Some(lh), ..Default::default() });
+    };
+    // Reserva el ancho de un texto SIN mostrarlo (transparente, tamano normal): deja hueco
+    // para dibujar la decoracion (casilla/barra) encima.
+    let reserve = |job: &mut LayoutJob, txt: &str, size: f32, lh: f32| {
+        job.append(txt, 0.0, TextFormat { font_id: FontId::new(size, fam.clone()), color: Color32::TRANSPARENT, line_height: Some(lh), ..Default::default() });
+    };
+    let code_bg = Color32::from_rgba_unmultiplied(130, 130, 140, 40);
+    let mut in_code = false;
+    let mut char_pos = 0usize;
+    for (li, line) in text.split('\n').enumerate() {
+        let lh = base * line_spacing;
+        if li > 0 {
+            plain(&mut job, "\n", base, lh, col);
+            char_pos += 1;
+        }
+        let reveal = reveal_line == Some(li);
+        let start = char_pos;
+        let chars: Vec<char> = line.chars().collect();
+        char_pos += chars.len();
+        // --- Bloque de codigo: vallas ``` (estado entre lineas) ---
+        let full: String = chars.iter().collect();
+        if full.trim() == "```" {
+            if reveal {
+                plain(&mut job, &full, base, lh, dim);
+            } else {
+                reserve(&mut job, &full, base, lh);
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            job.append(&full, 0.0, TextFormat { font_id: FontId::new(base, FontFamily::Monospace), color: col, background: code_bg, line_height: Some(lh), ..Default::default() });
+            continue;
+        }
+        // --- Encabezado ---
+        let (hl, cstart) = heading_level(line);
+        if hl > 0 {
+            let lsize = match hl {
+                1 => base * 1.7,
+                2 => base * 1.4,
+                3 => base * 1.18,
+                4 => base * 1.06,
+                5 => base * 0.96,
+                _ => base * 0.9,
+            };
+            let lh2 = lsize * line_spacing;
+            let prefix: String = chars[..cstart].iter().collect();
+            if reveal {
+                plain(&mut job, &prefix, lsize, lh2, dim);
+            } else {
+                job.append(&prefix, 0.0, TextFormat { font_id: FontId::new(0.01, fam.clone()), color: Color32::TRANSPARENT, line_height: Some(lh2), ..Default::default() });
+            }
+            push_inline(&mut job, &chars[cstart..], lsize, lh2, &head, col, false, reveal);
+            continue;
+        }
+        // --- Regla horizontal (linea solo de '-', 3+) ---
+        if chars.len() >= 3 && chars.iter().all(|&c| c == '-') {
+            let bar: String = chars.iter().collect();
+            if reveal {
+                plain(&mut job, &bar, base, lh, dim);
+            } else {
+                reserve(&mut job, &bar, base, lh); // fila vacia; la linea se dibuja como decoracion
+                decos.push((start, Deco::Hr));
+            }
+            continue;
+        }
+        // --- Cita ("> ") ---
+        if chars.first() == Some(&'>') {
+            let cs = if chars.get(1) == Some(&' ') { 2 } else { 1 };
+            let prefix: String = chars[..cs].iter().collect();
+            if reveal {
+                plain(&mut job, &prefix, base, lh, accent);
+            } else {
+                reserve(&mut job, &prefix, base, lh); // hueco para la barra
+                decos.push((start, Deco::Quote));
+            }
+            push_inline(&mut job, &chars[cs..], base, lh, &fam, quote_col, true, reveal);
+            continue;
+        }
+        // --- Tarea ("- [ ] " / "- [x] ") ---
+        if chars.len() >= 6 && chars[0] == '-' && chars[1] == ' ' && chars[2] == '[' && chars[4] == ']' && chars[5] == ' ' && (chars[3] == ' ' || chars[3] == 'x' || chars[3] == 'X') {
+            let done = chars[3] != ' ';
+            let prefix: String = chars[..6].iter().collect();
+            if reveal {
+                plain(&mut job, &prefix, base, lh, dim);
+            } else {
+                reserve(&mut job, &prefix, base, lh); // hueco para la casilla
+                decos.push((start, Deco::Check(done)));
+            }
+            push_inline(&mut job, &chars[6..], base, lh, &fam, if done { quote_col } else { col }, false, reveal);
+            continue;
+        }
+        // --- Vineta ("- " / "* ") -> bullet ---
+        if (chars.first() == Some(&'-') || chars.first() == Some(&'*')) && chars.get(1) == Some(&' ') {
+            if reveal {
+                plain(&mut job, &chars[0].to_string(), base, lh, accent);
+            } else {
+                plain(&mut job, "•", base, lh, accent);
+            }
+            plain(&mut job, " ", base, lh, col);
+            push_inline(&mut job, &chars[2..], base, lh, &fam, col, false, reveal);
+            continue;
+        }
+        // --- Lista numerada ("N. ") ---
+        let digits = chars.iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && chars.get(digits) == Some(&'.') && chars.get(digits + 1) == Some(&' ') {
+            let num: String = chars[..=digits].iter().collect(); // "N."
+            plain(&mut job, &num, base, lh, accent);
+            plain(&mut job, " ", base, lh, col);
+            push_inline(&mut job, &chars[digits + 2..], base, lh, &fam, col, false, reveal);
+            continue;
+        }
+        // --- Linea normal ---
+        push_inline(&mut job, &chars, base, lh, &fam, col, false, reveal);
+    }
+    job.halign = match align {
+        1 => egui::Align::Center,
+        2 => egui::Align::RIGHT,
+        _ => egui::Align::LEFT,
+    };
+    job.justify = align == 3;
+    (job, decos)
 }
 
 fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {

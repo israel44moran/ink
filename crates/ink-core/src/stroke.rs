@@ -132,7 +132,10 @@ impl Stroke {
 fn half_width(brush: &Brush, pressure: f32, use_pressure: bool) -> f32 {
     if use_pressure {
         let p = pressure.clamp(0.0, 1.0);
-        brush.width * 0.5 * (0.25 + 0.75 * p)
+        // Curva de respuesta suave (un pelin convexa) + piso bajo: a presion baja la pluma
+        // adelgaza de verdad (taper afilado, tinta de calidad), sin llegar a desaparecer.
+        let shaped = p * (0.6 + 0.4 * p); // ~p^1.x suave: medios algo mas finos, picos plenos
+        brush.width * 0.5 * (0.12 + 0.88 * shaped)
     } else {
         brush.width * 0.5
     }

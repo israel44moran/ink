@@ -40,6 +40,13 @@ pub struct PageData {
     /// Reloj logico (para la goma por timestamps).
     #[serde(default = "default_tick")]
     pub tick: f32,
+    /// Cuerpo de TEXTO de la hoja (modo escritura/documento), en Markdown. La tinta se dibuja
+    /// encima. Vacio = hoja sin texto.
+    #[serde(default)]
+    pub body: String,
+    /// Alineacion del texto de la hoja: 0 izquierda, 1 centro, 2 derecha, 3 justificado.
+    #[serde(default)]
+    pub align: u32,
 }
 
 impl PageData {
@@ -49,8 +56,41 @@ impl PageData {
             texts: Vec::new(),
             erase_strokes: Vec::new(),
             tick: 1.0,
+            body: String::new(),
+            align: 0,
         }
     }
+}
+
+/// Ajustes de DISEÑO de pagina del modo escritura (documento): se aplican a todo el cuaderno.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct DocLayout {
+    /// Margenes en PUNTOS: [arriba, derecha, abajo, izquierda].
+    pub margins: [f32; 4],
+    /// Interlineado (multiplicador: 1.0, 1.15, 1.5, 2.0...).
+    pub line_spacing: f32,
+    /// Espacio despues de cada parrafo, en puntos.
+    pub para_spacing: f32,
+    /// Tamano de fuente base, en puntos.
+    pub font_size: f32,
+    /// Familia: 0 = Sans (Hanken), 1 = Serif (Spectral), 2 = Mono (JetBrains).
+    pub font: u32,
+}
+
+impl Default for DocLayout {
+    fn default() -> Self {
+        Self {
+            margins: [64.0, 56.0, 64.0, 56.0],
+            line_spacing: 1.5,
+            para_spacing: 8.0,
+            font_size: 16.0,
+            font: 0,
+        }
+    }
+}
+
+fn default_doc_layout() -> DocLayout {
+    DocLayout::default()
 }
 
 /// Contenido serializable de un cuaderno (lo que se guarda en disco).
@@ -98,6 +138,9 @@ pub struct NotebookData {
     /// Archivero (carpeta) al que pertenece; "" = sin archivero (aparece solo en "Todos").
     #[serde(default)]
     pub archivero: String,
+    /// Diseño de pagina del modo escritura (margenes, interlineado, fuente...). Todo el cuaderno.
+    #[serde(default = "default_doc_layout")]
+    pub doc_layout: DocLayout,
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -131,6 +174,7 @@ impl NotebookData {
             cover_a: [1.0, 1.0, 1.0],
             cover_b: [1.0, 1.0, 1.0],
             archivero: String::new(),
+            doc_layout: DocLayout::default(),
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -148,6 +192,8 @@ impl NotebookData {
                     texts: std::mem::take(&mut self.texts),
                     erase_strokes: std::mem::take(&mut self.erase_strokes),
                     tick: self.tick.unwrap_or(1.0),
+                    body: String::new(),
+                    align: 0,
                 });
             } else {
                 self.pages.push(PageData::empty());

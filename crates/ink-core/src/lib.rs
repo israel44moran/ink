@@ -15,6 +15,7 @@
 pub mod camera;
 pub mod document;
 pub mod grid;
+pub mod input;
 pub mod smoothing;
 pub mod stamping;
 pub mod stroke;
@@ -25,6 +26,7 @@ pub use glam::{vec2, Vec2};
 pub use camera::Camera;
 pub use document::{Document, Layer};
 pub use grid::{build_grid, GridKind};
+pub use input::{catmull_rom_centripetal, InkConfig, InkSmoother};
 pub use smoothing::OneEuroFilter;
 pub use stamping::{clip_stamp_by_polygon, push_stamp_quad, stamp_path, BlendMode, BrushSettings, DynControl, Stamp, StampOutput, StampVertex, TipKind};
 pub use stroke::{tessellate_incremental, tessellate_stroke, Brush, BrushKind, InputSample, Stroke, Vertex};
