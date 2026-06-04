@@ -1122,9 +1122,10 @@ impl App {
         let (ch, gap) = (263.0_f32, 36.0_f32);
         let cols = self.library_cols();
         let rows = nvis.div_ceil(cols);
-        let row_h = ch + gap + 96.0;
+        let row_h = ch + gap + 134.0;
         let lowest = self.library_top() + rows.saturating_sub(1) as f32 * row_h + ch + 100.0;
-        (lowest - vp.y + 20.0).max(0.0)
+        // +84: reserva inferior para que el conmutador de tema (abajo-centro) no tape la ultima fila.
+        (lowest - vp.y + 84.0).max(0.0)
     }
 
     /// Layout en cuadricula: posiciones (centro, medio-tamano) por cuaderno. SOLO los visibles
@@ -1141,7 +1142,7 @@ impl App {
         let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
         let x0 = left + (usable - total_w) * 0.5 + cw * 0.5;
         let top = self.library_top();
-        let row_h = ch + gap + 96.0;
+        let row_h = ch + gap + 134.0;
         let mut out = vec![(vec2(-9999.0, -9999.0), vec2(cw * 0.5, ch * 0.5)); n];
         for (slot, &i) in self.visible_notebooks().iter().enumerate() {
             let (col, row) = (slot % cols, slot / cols);
@@ -1318,6 +1319,63 @@ impl App {
         }
         if let Some(nb) = self.notebooks.get_mut(i) {
             nb.archivero = name;
+        }
+    }
+
+    /// Toque/lápiz en la BIBLIOTECA: abre, arrastra y suelta cuadernos igual que el clic
+    /// izquierdo del ratón. Las cartas son wgpu (no widgets egui), así que se decide por
+    /// hit-test sobre `self.cursor`. Esto permite usar la tableta/lápiz en el Home (antes el
+    /// manejador de `Touch` solo servía para dibujar en el lienzo).
+    fn touch_library(&mut self, phase: TouchPhase, loc: Vec2) {
+        self.cursor = loc;
+        self.last_cursor = loc;
+        match phase {
+            TouchPhase::Started => {
+                if self.preview_idx.is_some() {
+                    // Tocar durante la vista previa la cierra.
+                    self.close_preview();
+                } else if !self.creating_nb && self.renaming.is_none() {
+                    if let Some(i) = self.library_card_at() {
+                        if self.alt_down {
+                            self.open_preview(i);
+                        } else {
+                            self.drag_idx = Some(i);
+                            self.drag_start = loc;
+                            self.dragging = false;
+                        }
+                    }
+                }
+            }
+            TouchPhase::Moved => {
+                if self.drag_idx.is_some()
+                    && !self.dragging
+                    && (loc - self.drag_start).length() > 8.0
+                {
+                    self.dragging = true;
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if let Some(i) = self.drag_idx.take() {
+                    if self.dragging && self.over_trash_zone() {
+                        self.delete_card(i);
+                    } else if self.dragging && self.archivero_at_cursor().is_some() {
+                        if let Some(name) = self.archivero_at_cursor() {
+                            self.assign_archivero(i, name);
+                        }
+                    } else if self.dragging {
+                        let target = self.library_card_at();
+                        match (self.card_is_sheet(i), target) {
+                            (true, Some(tg)) if tg != i && !self.card_is_sheet(tg) => {
+                                self.merge_prompt = Some((i, tg));
+                            }
+                            _ => self.drop_card(i),
+                        }
+                    } else if let Some(nb) = self.notebooks.get(i) {
+                        self.open_notebook(nb.path.clone());
+                    }
+                }
+                self.dragging = false;
+            }
         }
     }
 
@@ -3089,6 +3147,12 @@ impl ApplicationHandler for App {
                 // Marca el instante del tacto/lapiz para suprimir el eco de raton sintetico.
                 self.last_touch = Some(Instant::now());
                 let loc = vec2(t.location.x as f32, t.location.y as f32);
+                // En la BIBLIOTECA el lapiz/tacto navega las cartas (abrir/arrastrar/soltar),
+                // no dibuja. (Con Poll el redibujo es continuo, asi que el `return` es seguro.)
+                if self.app_mode == AppMode::Library {
+                    self.touch_library(t.phase, loc);
+                    return;
+                }
                 let pressure = match t.force {
                     Some(Force::Normalized(n)) => n as f32,
                     Some(Force::Calibrated { force, max_possible_force, .. }) => {
@@ -3523,11 +3587,15 @@ impl ApplicationHandler for App {
                                 // Registrar las zonas de soltar (px fisicos) para asignar cuadernos por arrastre.
                                 self.archivero_drop.clear();
                                 let ppp_s = ui.ctx().pixels_per_point();
-                                let r0 = archivero_row(ui, "Todos", self.archivero_count(""), self.active_archivero.is_empty(), &th);
+                                // Estado de arrastre de un cuaderno: para iluminar el archivero destino.
+                                let nb_dragging = self.dragging && self.drag_idx.is_some();
+                                let cursor_pts = egui::pos2(self.cursor.x / ppp_s, self.cursor.y / ppp_s);
+                                let pulse = (self.clock * 4.0).sin() * 0.5 + 0.5;
+                                let r0 = archivero_row(ui, "Todos", self.archivero_count(""), self.active_archivero.is_empty(), &th, nb_dragging, cursor_pts, pulse);
                                 self.archivero_drop.push((r0.rect.min.x * ppp_s, r0.rect.min.y * ppp_s, r0.rect.max.x * ppp_s, r0.rect.max.y * ppp_s, String::new()));
                                 if r0.clicked() { lib_set_archivero = Some(String::new()); }
                                 for a in self.archiveros.clone() {
-                                    let r = archivero_row(ui, &a, self.archivero_count(&a), self.active_archivero == a, &th);
+                                    let r = archivero_row(ui, &a, self.archivero_count(&a), self.active_archivero == a, &th, nb_dragging, cursor_pts, pulse);
                                     self.archivero_drop.push((r.rect.min.x * ppp_s, r.rect.min.y * ppp_s, r.rect.max.x * ppp_s, r.rect.max.y * ppp_s, a.clone()));
                                     if r.clicked() { lib_set_archivero = Some(a.clone()); }
                                 }
@@ -3537,7 +3605,7 @@ impl ApplicationHandler for App {
                                     r.request_focus();
                                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) { lib_create_archivero = true; }
                                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) { self.creating_archivero = false; self.new_archivero_buf.clear(); }
-                                } else if ui.add(egui::Label::new(egui::RichText::new("＋  Nuevo archivero").size(13.5).color(th.sub)).sense(egui::Sense::click())).clicked() {
+                                } else if add_action_row(ui, "Nuevo archivero", &th).clicked() {
                                     lib_new_archivero = true;
                                 }
                             });
@@ -3693,7 +3761,7 @@ impl ApplicationHandler for App {
                                         .inner_margin(egui::Margin::symmetric(12, 7))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
-                                                ui.add(egui::Label::new(egui::RichText::new("⌕").size(16.0).color(th.sub)).selectable(false));
+                                                search_icon(ui, th.sub);
                                                 ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Buscar…").frame(egui::Frame::NONE).desired_width(190.0).text_color(th.title));
                                             });
                                         });
@@ -4792,7 +4860,7 @@ const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4
 const ACCENTS: [&str; 8] = ["Blanco", "Cian", "Magenta", "Ámbar", "Verde", "Rojo", "Violeta", "Azul"];
 
 /// FORMAS de cuaderno (idx = shape): geometria, no portada.
-const SHAPE_NAMES: [&str; 5] = ["Actual", "Tapa dura", "Moleskine", "Espiral", "Minimalista"];
+const SHAPE_NAMES: [&str; 5] = ["Cuaderno", "Tapa dura", "Moleskine", "Espiral", "Minimalista"];
 
 /// Parametros de geometria de cada forma: (grosor relativo, ceja [fraccion], tabla de tapa
 /// en el canto [fraccion del grosor]). El cuaderno es la caja 3D del shader.
@@ -5157,16 +5225,36 @@ fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, st: BtnStyle, min_w
 }
 
 /// Fila de un ARCHIVERO en la barra lateral: icono + nombre + contador; resalta el activo.
-fn archivero_row(ui: &mut egui::Ui, label: &str, count: usize, active: bool, th: &HomeTheme) -> egui::Response {
+/// Si `dragging` y el cursor (`cursor_pts`, en PUNTOS) cae sobre la fila, se ilumina con un
+/// latido (`pulse` 0..1) para dejar claro a qué archivero se va a guardar el cuaderno arrastrado.
+fn archivero_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: usize,
+    active: bool,
+    th: &HomeTheme,
+    dragging: bool,
+    cursor_pts: egui::Pos2,
+    pulse: f32,
+) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
     let p = ui.painter();
-    if active {
+    // Destino de arrastre: el cuaderno se guardará en este archivero (o "Todos" = sin archivero).
+    let drop_target = dragging && rect.contains(cursor_pts);
+    let mut col = if active { th.title } else { th.sub };
+    if drop_target {
+        // Halo + relleno crema PULSANTE + borde, para señalar el destino con claridad.
+        let halo = rect.expand(2.0 + pulse * 3.0);
+        p.rect_filled(halo, egui::CornerRadius::same(10), egui::Color32::from_rgba_unmultiplied(202, 191, 167, (26.0 + pulse * 34.0) as u8));
+        p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(202, 191, 167, (120.0 + pulse * 80.0) as u8));
+        p.rect_stroke(rect, egui::CornerRadius::same(8), egui::Stroke::new(1.5, egui::Color32::from_rgb(202, 191, 167)), egui::StrokeKind::Inside);
+        col = egui::Color32::from_rgb(26, 22, 30); // texto/icono oscuro para contraste sobre la crema
+    } else if active {
         p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(202, 191, 167, 22));
     } else if resp.hovered() {
         p.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10));
     }
-    let col = if active { th.title } else { th.sub };
     let ic = egui::pos2(rect.left() + 15.0, rect.center().y);
     let st = egui::Stroke::new(1.4, col);
     if label == "Todos" {
@@ -5185,8 +5273,37 @@ fn archivero_row(ui: &mut egui::Ui, label: &str, count: usize, active: bool, th:
         p.line_segment([egui::pos2(ic.x - 2.6, ic.y + 2.2), egui::pos2(ic.x + 2.6, ic.y + 2.2)], st);
     }
     p.text(egui::pos2(rect.left() + 34.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), col);
-    p.text(egui::pos2(rect.right() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::new(11.5, egui::FontFamily::Monospace), th.sub);
+    let count_col = if drop_target { col } else { th.sub };
+    p.text(egui::pos2(rect.right() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::new(11.5, egui::FontFamily::Monospace), count_col);
     resp
+}
+
+/// Fila de accion de la barra lateral (p.ej. "Nuevo archivero"): "+" VECTORIAL + texto, alineada
+/// con las filas de archivero. (Evita el carácter "＋" que la fuente no dibuja → salia un cuadro.)
+fn add_action_row(ui: &mut egui::Ui, label: &str, th: &HomeTheme) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 32.0), egui::Sense::click());
+    let p = ui.painter();
+    let col = if resp.hovered() { th.title } else { th.sub };
+    let ic = egui::pos2(rect.left() + 15.0, rect.center().y);
+    let st = egui::Stroke::new(1.7, col);
+    let r = 5.5;
+    p.line_segment([egui::pos2(ic.x - r, ic.y), egui::pos2(ic.x + r, ic.y)], st);
+    p.line_segment([egui::pos2(ic.x, ic.y - r), egui::pos2(ic.x, ic.y + r)], st);
+    p.text(egui::pos2(rect.left() + 34.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.0), col);
+    resp
+}
+
+/// Lupa VECTORIAL para el buscador (anillo + mango). Evita el glifo "⌕", que la fuente no dibuja
+/// (salía como un cuadro). Reserva su espacio con `allocate_exact_size` y la pinta encima.
+fn search_icon(ui: &mut egui::Ui, col: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let p = ui.painter();
+    let c = egui::pos2(rect.left() + 6.5, rect.center().y - 1.0);
+    let st = egui::Stroke::new(1.6, col);
+    p.circle_stroke(c, 4.6, st);
+    let d = 4.6 * std::f32::consts::FRAC_1_SQRT_2;
+    p.line_segment([egui::pos2(c.x + d, c.y + d), egui::pos2(c.x + d + 3.6, c.y + d + 3.6)], st);
 }
 
 fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
