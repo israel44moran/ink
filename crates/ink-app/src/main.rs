@@ -886,6 +886,11 @@ impl App {
         self.stash_current_page();
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cuaderno").to_string();
         let infinite = matches!(self.settings.artboard, settings::Artboard::Infinite);
+        // Si es una nota rapida (hoja, finish 500..599), su carátula sigue el papel/cuadricula
+        // ACTUAL: si cambiaste la cuadricula dentro de la nota, la carátula cambia al volver.
+        if self.current_finish >= 500 && self.current_finish < 600 {
+            self.current_finish = sheet_finish_for_grid(self.settings.grid);
+        }
         let mut nb = notebook::NotebookData::new(&name, infinite, self.current_finish);
         nb.fx = self.current_fx;
         nb.fx_intensity = self.current_intensity;
@@ -930,17 +935,8 @@ impl App {
     /// abre al momento para escribir. En la biblioteca, su `finish` >= 500 la dibuja como hoja.
     fn new_quick_note(&mut self) {
         let name = quick_note_name();
-        // La carátula refleja el papel REAL de la nota (la cuadrícula activa):
-        // 500=rayas, 501=milimetrado, 502=puntos, 503=blanca (sin cuadrícula), 504=iso, 505=triángulo.
-        let finish = match self.settings.grid {
-            ink_core::GridKind::Lines => 500,
-            ink_core::GridKind::Squares => 501,
-            ink_core::GridKind::Dots => 502,
-            ink_core::GridKind::None => 503,
-            ink_core::GridKind::Iso => 504,
-            ink_core::GridKind::Triangle => 505,
-            _ => 503, // P1/P2/P3 (guías de perspectiva): hoja blanca
-        };
+        // La carátula refleja el papel REAL de la nota (la cuadrícula activa).
+        let finish = sheet_finish_for_grid(self.settings.grid);
         let mut nb = notebook::NotebookData::new(&name, false, finish);
         nb.fx = 0;
         nb.fx_intensity = 1.0;
@@ -1151,10 +1147,13 @@ impl App {
         if let Some(nb) = self.notebooks.get(i) {
             let path = nb.path.clone();
             notebook::delete(&path);
+            // Quitar SOLO la animacion de la carta borrada (las demas siguen igual, sin salto).
+            if i < self.card_anim.len() {
+                self.card_anim.remove(i);
+                self.card_flip.remove(i);
+                self.card_flip_vel.remove(i);
+            }
             self.notebooks = notebook::list();
-            self.card_anim.clear();
-            self.card_flip.clear();
-            self.card_flip_vel.clear();
         }
     }
 
@@ -1187,17 +1186,28 @@ impl App {
             return;
         }
         let f = files.remove(from);
-        files.insert(target.min(files.len()), f);
+        let ins = target.min(files.len());
+        files.insert(ins, f);
         notebook::save_order(&files);
+        // Reordenar TAMBIEN las animaciones para que SIGAN a su cuaderno: asi no hay "salto" ni
+        // reinicio de los demas cuadernos al soltar (no se limpian, solo se mueven con su carta).
+        Self::reorder_vec(&mut self.card_anim, from, ins);
+        Self::reorder_vec(&mut self.card_flip, from, ins);
+        Self::reorder_vec(&mut self.card_flip_vel, from, ins);
         self.notebooks = notebook::list();
-        self.card_anim.clear();
-        self.card_flip.clear();
-        self.card_flip_vel.clear();
     }
 
-    /// ¿La carta `i` es una nota rapida (hoja, finish >= 500)?
+    /// Mueve el elemento `from` a la posicion `to` dentro del vector (remove + insert).
+    fn reorder_vec<T>(v: &mut Vec<T>, from: usize, to: usize) {
+        if from < v.len() {
+            let x = v.remove(from);
+            v.insert(to.min(v.len()), x);
+        }
+    }
+
+    /// ¿La carta `i` es una nota rapida (hoja, finish 500..599)? (Las figuras 3D, >=600, NO.)
     fn card_is_sheet(&self, i: usize) -> bool {
-        self.notebooks.get(i).map_or(false, |n| n.finish >= 500)
+        self.notebooks.get(i).map_or(false, |n| n.finish >= 500 && n.finish < 600)
     }
 
     /// Intercambia la POSICION de dos cartas en el orden manual (persistente).
@@ -1215,10 +1225,13 @@ impl App {
         }
         files.swap(a, b);
         notebook::save_order(&files);
+        // Intercambiar tambien sus animaciones (sin reiniciar las demas -> sin salto).
+        if a < self.card_anim.len() && b < self.card_anim.len() {
+            self.card_anim.swap(a, b);
+            self.card_flip.swap(a, b);
+            self.card_flip_vel.swap(a, b);
+        }
         self.notebooks = notebook::list();
-        self.card_anim.clear();
-        self.card_flip.clear();
-        self.card_flip_vel.clear();
     }
 
     /// Fusiona la nota `from` DENTRO del cuaderno `target`: anexa sus paginas al final de las del
@@ -1242,10 +1255,13 @@ impl App {
             order.retain(|o| o != fname);
             notebook::save_order(&order);
         }
+        // Quitar SOLO la animacion de la nota fusionada (las demas siguen igual, sin salto).
+        if from < self.card_anim.len() {
+            self.card_anim.remove(from);
+            self.card_flip.remove(from);
+            self.card_flip_vel.remove(from);
+        }
         self.notebooks = notebook::list();
-        self.card_anim.clear();
-        self.card_flip.clear();
-        self.card_flip_vel.clear();
     }
 
     /// Abre el panel para EDITAR la carátula del cuaderno `i` (clic derecho): carga sus
@@ -4094,6 +4110,19 @@ fn local_now() -> (u16, u16, u16, u16, u16, u16) {
 fn quick_note_name() -> String {
     let (y, mo, d, h, mi, s) = local_now();
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)
+}
+
+/// Carátula (finish) de una hoja segun el papel/cuadricula activa: 500 rayas, 501 milimetrado,
+/// 502 puntos, 503 blanca, 504 iso, 505 triangular. (P1/P2/P3 -> blanca.)
+fn sheet_finish_for_grid(grid: ink_core::GridKind) -> u32 {
+    match grid {
+        ink_core::GridKind::Lines => 500,
+        ink_core::GridKind::Squares => 501,
+        ink_core::GridKind::Dots => 502,
+        ink_core::GridKind::Iso => 504,
+        ink_core::GridKind::Triangle => 505,
+        _ => 503,
+    }
 }
 
 /// Color base de cada diseño (el shader de cartas anade el efecto encima).
