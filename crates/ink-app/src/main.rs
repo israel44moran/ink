@@ -921,8 +921,8 @@ impl App {
         let cur = self.cursor;
         // Inclinacion BASE (siempre, para que se note el grosor 3D del cuaderno) + un rango
         // mayor al pasar el cursor (la carta "se mueve mas").
-        let base_rx = -0.07;
-        let base_ry = 0.17;
+        let base_rx = 0.08; // mirar un poco desde arriba (canto de hojas superior)
+        let base_ry = 0.20; // girar un poco para ver el LOMO en el lado izquierdo
         let max_ang = 0.40;
         for (i, (c, h)) in layout.iter().enumerate() {
             let inside = (cur.x - c.x).abs() <= h.x && (cur.y - c.y).abs() <= h.y;
@@ -2109,6 +2109,8 @@ impl ApplicationHandler for App {
             None,
         );
 
+        setup_fonts(&self.egui_ctx);
+
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.egui_state = Some(egui_state);
@@ -2802,15 +2804,21 @@ impl ApplicationHandler for App {
                                     continue;
                                 }
                                 let Some((c, h)) = card_layout.get(i) else { continue };
-                                let flipped = self.card_flip.get(i).copied().unwrap_or(0.0) > 1.5708;
-                                if flipped {
-                                    // Reverso visible: el nombre va sobre la "cinta de masquin".
+                                let fl = self.card_flip.get(i).copied().unwrap_or(0.0);
+                                if fl > 1.5708 {
+                                    // Reverso visible: el nombre va PEGADO a la cinta. Proyecto el
+                                    // centro del reverso (0,0,-grosor) con la misma rotacion que el
+                                    // shader para que el texto siga a la cinta al inclinarse.
+                                    let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
+                                    let hz = h.x * 0.13;
+                                    let (sx, sy, fac) =
+                                        project_card_point(*c, a[1], a[2] + fl, a[0], 0.0, 0.0, -hz);
                                     lp.text(
-                                        egui::pos2(c.x / ppp, c.y / ppp),
+                                        egui::pos2(sx / ppp, sy / ppp),
                                         egui::Align2::CENTER_CENTER,
                                         name,
-                                        egui::FontId::proportional(15.0),
-                                        egui::Color32::from_rgb(60, 50, 35),
+                                        egui::FontId::proportional(15.0 * fac.clamp(0.85, 1.25)),
+                                        egui::Color32::from_rgb(55, 45, 30),
                                     );
                                 } else {
                                     lp.text(
@@ -3310,6 +3318,35 @@ fn smoothing_string_radius_px(smoothing: f32) -> f32 {
     smoothing.clamp(0.0, 1.0) * 48.0
 }
 
+/// Carga una fuente profesional y legible (Segoe UI / alternativas del sistema) como fuente
+/// por defecto de TODA la interfaz; mantiene las de respaldo de egui para los iconos/emoji.
+fn setup_fonts(ctx: &egui::Context) {
+    let candidates = [
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/SegoeUI-VF.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "/Library/Fonts/SF-Pro.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("ui".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                fam.insert(0, "ui".to_owned());
+            }
+            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                fam.insert(0, "ui".to_owned());
+            }
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
 /// Diseños FOIL (id, nombre) que se eligen como carátula base.
 const FOIL_DESIGNS: [(u32, &str); 12] = [
     (0, "Mate"), (1, "Holográfico"), (2, "Galaxia"), (3, "Oro"), (4, "Prisma"), (5, "Destellos"),
@@ -3337,9 +3374,9 @@ const LOADER3D_DESIGNS: [(u32, &str); 6] = [
 ];
 
 /// Animaciones tipo retrowave / arcade clasico / generativas (id >= 400). Usan el Acento.
-const ARCADE_DESIGNS: [(u32, &str); 8] = [
+const ARCADE_DESIGNS: [(u32, &str); 9] = [
     (400, "Retrowave"), (401, "Hiperespacio"), (402, "Vórtice"), (403, "Invaders"),
-    (404, "Tetris"), (405, "Vida"), (406, "Flores"), (407, "Pac-Man"),
+    (404, "Tetris"), (405, "Vida"), (406, "Flores"), (407, "Pac-Man"), (408, "Relámpagos"),
 ];
 
 /// Capas COMBINABLES (bit, nombre).
@@ -3347,6 +3384,22 @@ const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4
 
 /// Paleta de ACENTO (idx, nombre). El 0 es blanco (B&N en los cargadores).
 const ACCENTS: [&str; 8] = ["Blanco", "Cian", "Magenta", "Ámbar", "Verde", "Rojo", "Violeta", "Azul"];
+
+/// Proyecta un punto LOCAL del cuaderno (caja) a pantalla, replicando la transformacion del
+/// vertex shader (rotacion Y, rotacion X, elevacion por hover y perspectiva). Devuelve
+/// (x_px, y_px, factor) para colocar el nombre EXACTAMENTE sobre la cinta del reverso.
+fn project_card_point(c: Vec2, rotx: f32, roty: f32, hover: f32, lx: f32, ly: f32, lz: f32) -> (f32, f32, f32) {
+    let focal = 900.0_f32;
+    let (cyr, syr) = (roty.cos(), roty.sin());
+    let p1x = lx * cyr + lz * syr;
+    let p1z = -lx * syr + lz * cyr;
+    let (cxr, sxr) = (rotx.cos(), rotx.sin());
+    let p2x = p1x;
+    let p2y = ly * cxr - p1z * sxr;
+    let p2z = ly * sxr + p1z * cxr + hover * 70.0;
+    let factor = focal / (focal - p2z).max(1.0);
+    (c.x + p2x * factor, c.y + p2y * factor, factor)
+}
 
 /// Color base de cada diseño (el shader de cartas anade el efecto encima).
 fn finish_base_color(finish: u32) -> [f32; 3] {

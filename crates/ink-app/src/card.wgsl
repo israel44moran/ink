@@ -686,6 +686,43 @@ fn fx_pacman(uv: vec2<f32>, t: f32, aspect: f32, accent: vec3<f32>) -> vec3<f32>
     return col;
 }
 
+// Relampagos realistas: rayos ramificados que caen y destellan iluminando el cielo tormentoso.
+fn fx_lightning(uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = mix(vec3<f32>(0.02, 0.02, 0.05), vec3<f32>(0.06, 0.06, 0.11), uv.y);
+    // Nubes oscuras arremolinadas arriba.
+    col = col + vec3<f32>(0.04, 0.04, 0.07) * smoothstep(0.45, 0.0, uv.y) * (0.5 + 0.5 * sin(uv.x * 8.0 + t * 0.6));
+    let cyc = 1.1;
+    let strike = floor(t / cyc);
+    let lt = fract(t / cyc) * cyc;
+    let seed = hash21(vec2<f32>(strike, 1.0));
+    let seed2 = hash21(vec2<f32>(strike, 7.0));
+    let flash = exp(-lt * 7.0); // destello: aparece de golpe y decae rapido
+    let bx = 0.2 + 0.6 * seed;
+    let lightcol = mix(vec3<f32>(0.75, 0.85, 1.0), accent, 0.25);
+    var core = 0.0;
+    var glow = 0.0;
+    // Canal principal (zigzag), se ensancha al bajar.
+    let n = sin(uv.y * 23.0 + seed * 50.0) + 0.5 * sin(uv.y * 57.0 + seed2 * 20.0) + 0.7 * sin(uv.y * 11.0);
+    let px = bx + n * 0.035 * (0.3 + uv.y);
+    let d = abs(uv.x - px);
+    let on = step(uv.y, 0.98);
+    core = core + smoothstep(0.012, 0.0, d) * on;
+    glow = glow + smoothstep(0.10, 0.0, d) * on;
+    // Rama secundaria desde un punto medio.
+    let yb = 0.35 + 0.25 * seed2;
+    if (uv.y > yb) {
+        let nn = sin(uv.y * 40.0 + seed * 30.0) + 0.6 * sin(uv.y * 19.0);
+        let px2 = bx + (uv.y - yb) * (0.5 * (seed - 0.5)) + nn * 0.03 * (uv.y - yb);
+        let d2 = abs(uv.x - px2);
+        core = core + smoothstep(0.009, 0.0, d2) * step(uv.y, 0.9) * 0.85;
+        glow = glow + smoothstep(0.07, 0.0, d2) * 0.7;
+    }
+    col = col + lightcol * core * (0.4 + flash);
+    col = col + lightcol * glow * (0.12 + 0.6 * flash);
+    col = col + lightcol * flash * 0.18; // el cielo se ilumina con el destello
+    return col;
+}
+
 fn arcade(id: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, aspect: f32, accent: vec3<f32>) -> vec3<f32> {
     if (id == 0) { return fx_retrowave(uv, t, accent); }
     else if (id == 1) { return fx_warp(p, t, accent); }
@@ -694,7 +731,8 @@ fn arcade(id: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, aspect: f32, accent: vec
     else if (id == 4) { return fx_tetris(uv, t, accent); }
     else if (id == 5) { return fx_life(uv, t, accent); }
     else if (id == 6) { return fx_flowers(p, t, accent); }
-    return fx_pacman(uv, t, aspect, accent);
+    else if (id == 7) { return fx_pacman(uv, t, aspect, accent); }
+    return fx_lightning(uv, t, accent);
 }
 
 // Color de la PORTADA (cara frontal) del cuaderno: el diseño/animacion elegido + capas.
@@ -835,8 +873,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let tape = step(d.x, 0.40) * step(d.y, 0.15);
         let tcol = vec3<f32>(0.86, 0.80, 0.62) * (0.96 + 0.04 * sin(in.uv.x * 70.0));
         col = mix(col, tcol, tape);
+    } else if (face == 3) {
+        // LOMO (encuadernacion) en UN solo lado: sin hojas, con un brillo central a lo largo.
+        let sheen = smoothstep(0.55, 0.0, abs(in.pz01 - 0.5));
+        col = mix(vec3<f32>(0.10, 0.09, 0.12), vec3<f32>(0.27, 0.25, 0.30), sheen * 0.85);
     } else {
-        // Cantos: pila de hojas (lineas finas a lo largo del grosor).
+        // Cantos (lados sin lomo): pila de hojas (lineas finas a lo largo del grosor).
         let paper = vec3<f32>(0.93, 0.91, 0.85);
         let lines = grid_line(in.pz01 * 46.0, 0.25);
         col = mix(paper, paper * 0.6, lines * 0.55);
@@ -844,8 +886,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Sombreado por cara para dar sensacion de volumen 3D.
     var shade = 1.0;
     if (face == 1) { shade = 0.92; }
-    else if (face == 2) { shade = 0.82; }
-    else if (face == 3) { shade = 0.7; }
+    else if (face == 2) { shade = 0.84; }
+    else if (face == 3) { shade = 1.0; }   // lomo (color propio)
     else if (face == 4) { shade = 1.08; }
     else if (face == 5) { shade = 0.66; }
     col = col * shade;
