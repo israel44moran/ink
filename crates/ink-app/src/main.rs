@@ -974,7 +974,7 @@ impl App {
         let base_rx = self.lib_tweaks.inclinacion.to_radians();
         let base_ry = self.lib_tweaks.giro.to_radians();
         let hover_mode = self.lib_tweaks.hover;
-        let max_ang = 0.40;
+        let max_ang = 0.26; // seguimiento del cursor mas suave (no se inclina de golpe)
         for (i, (c, h)) in layout.iter().enumerate() {
             let inside = (cur.x - c.x).abs() <= h.x && (cur.y - c.y).abs() <= h.y;
             let (tx, ty) = if inside {
@@ -998,7 +998,7 @@ impl App {
                 (0.0, base_rx, base_ry)
             };
             let a = &mut self.card_anim[i];
-            let k = 0.07; // muy suave: el hover/tilt llega despacio (movimiento lento, no brusco)
+            let k = 0.05; // muy suave: el hover/tilt llega lento y flotante (no brusco)
             a[0] += (t_hover - a[0]) * k;
             a[1] += (t_rotx - a[1]) * k;
             a[2] += (t_roty - a[2]) * k;
@@ -1022,7 +1022,7 @@ impl App {
             } else {
                 // El cursor ya no esta encima: regresa LENTO y fluido a su posicion original.
                 self.card_flip_vel[i] = 0.0;
-                self.card_flip[i] += (0.0 - self.card_flip[i]) * 0.06;
+                self.card_flip[i] += (0.0 - self.card_flip[i]) * 0.045;
                 if self.card_flip[i].abs() < 0.002 {
                     self.card_flip[i] = 0.0;
                 }
@@ -1221,8 +1221,16 @@ impl App {
             let overh = ohf * nb.map_or(1.0, |n| n.overhang);
             let base = finish_base_color(finish);
             let ac = accent_color(accent);
+            // FLOTACION: cuando el cursor esta encima (hov>0), el libro flota lentamente -como
+            // gravedad cero-: vaiven sutil en rotacion + leve sube/baja. Fase por carta (segun el
+            // indice) para que no floten todos sincronizados. Se desvanece con `hov`.
+            let t = self.clock;
+            let ph = i as f32 * 1.7;
+            let rotx = rotx + (t * 0.55 + ph).sin() * 0.030 * hov;
+            let roty = roty + (t * 0.42 + ph * 1.3).cos() * 0.035 * hov;
+            let cy = center.y - (t * 0.50 + ph).sin() * 5.0 * hov;
             cards.push([
-                center.x, center.y, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
+                center.x, cy, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
                 base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
                 depth, overh, bf, shape as f32,
             ]);
@@ -2980,19 +2988,38 @@ impl ApplicationHandler for App {
                                 let Some((c, h)) = card_layout.get(i) else { continue };
                                 let fl = self.card_flip.get(i).copied().unwrap_or(0.0);
                                 if fl > 1.5708 {
-                                    // Reverso visible: el nombre va PEGADO a la cinta. Proyecto el
-                                    // centro del reverso (0,0,-grosor) con la misma rotacion que el
-                                    // shader para que el texto siga a la cinta al inclinarse.
+                                    // Reverso visible: el nombre va PEGADO a la cinta y ROTADO CON
+                                    // ELLA (sigue su inclinacion/giro/flotacion con precision).
+                                    // Proyecto el centro y los dos extremos del eje horizontal del
+                                    // reverso con la MISMA pose que el shader (incluida la flotacion)
+                                    // y dibujo el texto rotado al angulo de la cinta en pantalla.
                                     let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
                                     let nbk = self.notebooks.get(i);
                                     let (df, _, _) = shape_params(nbk.map_or(0, |n| n.shape));
                                     let hz = h.x * df * nbk.map_or(1.0, |n| n.thickness);
-                                    let (sx, sy, fac) =
-                                        project_card_point(*c, a[1], a[2] + fl, a[0], 0.0, 0.0, -hz);
-                                    // El nombre debe CABER en la cinta: se reduce el tamaño segun
-                                    // su longitud y, solo si al minimo aun no cabe, se recorta con
-                                    // elipsis. (Ancho de caracter aproximado ~0.55*tamaño.)
-                                    let tape_w = (1.5 * h.x * fac / ppp).max(20.0);
+                                    let hv = a[0];
+                                    // Misma flotacion que en build_card_instances (para no despegar).
+                                    let t = self.clock;
+                                    let ph = i as f32 * 1.7;
+                                    let rx = a[1] + (t * 0.55 + ph).sin() * 0.030 * hv;
+                                    let ry = a[2] + fl + (t * 0.42 + ph * 1.3).cos() * 0.035 * hv;
+                                    let cby = c.y - (t * 0.50 + ph).sin() * 5.0 * hv;
+                                    let cc = vec2(c.x, cby);
+                                    let (cxs, cys, fac) = project_card_point(cc, rx, ry, hv, 0.0, 0.0, -hz);
+                                    // Extremos del eje horizontal de la cinta (~0.7 del semiancho).
+                                    let (pax, pay, _) = project_card_point(cc, rx, ry, hv, 0.7 * h.x, 0.0, -hz);
+                                    let (pbx, pby, _) = project_card_point(cc, rx, ry, hv, -0.7 * h.x, 0.0, -hz);
+                                    // Izquierda/derecha EN PANTALLA (para que el texto se lea bien
+                                    // aunque el reverso quede espejado al voltear).
+                                    let (lx_, ly_, rx2, ry2) = if pax <= pbx {
+                                        (pax, pay, pbx, pby)
+                                    } else {
+                                        (pbx, pby, pax, pay)
+                                    };
+                                    let angle = (ry2 - ly_).atan2(rx2 - lx_);
+                                    let tape_px = (rx2 - lx_).hypot(ry2 - ly_).max(20.0);
+                                    let tape_w = tape_px / ppp;
+                                    // Tamaño que CABE en la cinta; si al minimo no cabe, recorta.
                                     let len = name.chars().count().max(1) as f32;
                                     let base = 15.0 * fac.clamp(0.85, 1.25);
                                     let est_w = len * base * 0.55;
@@ -3005,13 +3032,15 @@ impl ApplicationHandler for App {
                                     } else {
                                         name.clone()
                                     };
-                                    lp.text(
-                                        egui::pos2(sx / ppp, sy / ppp),
-                                        egui::Align2::CENTER_CENTER,
-                                        shown,
-                                        egui::FontId::proportional(size),
-                                        egui::Color32::from_rgb(55, 45, 30),
-                                    );
+                                    // Galley + TextShape ROTADO, centrado en el centro de la cinta.
+                                    let col = egui::Color32::from_rgb(55, 45, 30);
+                                    let galley =
+                                        lp.layout_no_wrap(shown, egui::FontId::proportional(size), col);
+                                    let sz = galley.size();
+                                    let rot = egui::emath::Rot2::from_angle(angle);
+                                    let center_pt = egui::pos2(cxs / ppp, cys / ppp);
+                                    let pos = center_pt - rot * egui::vec2(sz.x * 0.5, sz.y * 0.5);
+                                    lp.add(egui::epaint::TextShape::new(pos, galley, col).with_angle(angle));
                                 } else {
                                     // Nombre BAJO la carta: hasta 3 renglones (ajustados), un poco
                                     // mas abajo para que no lo tape el cuaderno al girar/levantar.
