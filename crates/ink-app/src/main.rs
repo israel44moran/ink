@@ -996,6 +996,38 @@ impl App {
 
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
 
+    /// Linea (px fisicos) justo BAJO la cabecera (titulo + botones): donde se recortan las cartas
+    /// al desplazar, para que no tapen el titulo. La cabecera mide ~130 pt de alto.
+    fn library_header_px(&self) -> f32 {
+        let ppp = self.egui_ctx.pixels_per_point().max(0.5);
+        130.0 * ppp
+    }
+
+    /// Borde superior (px fisicos) donde empieza la primera fila de cartas (un poco bajo la cabecera).
+    fn library_top(&self) -> f32 {
+        self.library_header_px() + 22.0
+    }
+
+    /// Cuanto se puede desplazar la cuadricula hacia arriba (px). 0 si todo cabe en pantalla.
+    fn library_max_scroll(&self) -> f32 {
+        let n = self.notebooks.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let vp = self.camera.viewport;
+        let (cw, ch, gap) = (188.0_f32, 263.0_f32, 36.0_f32);
+        let ppp = self.egui_ctx.pixels_per_point().max(0.5);
+        let reserve = if self.show_tweaks { 300.0 * ppp } else { 0.0 };
+        let usable = (vp.x - reserve).max(cw + 80.0);
+        let cols = (((usable - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
+        let rows = n.div_ceil(cols);
+        let row_h = ch + gap + 96.0;
+        let top = self.library_top();
+        // Borde inferior del contenido (ultima fila + su nombre) a scroll 0.
+        let lowest = top + rows.saturating_sub(1) as f32 * row_h + ch + 100.0;
+        (lowest - vp.y + 20.0).max(0.0)
+    }
+
     /// Layout en cuadricula de las cartas: (centro, medio-tamano) en px, por cuaderno.
     fn library_card_layout(&self) -> Vec<(Vec2, Vec2)> {
         let n = self.notebooks.len();
@@ -1009,7 +1041,7 @@ impl App {
         let cols = (((usable - 80.0) / (cw + gap)).floor() as usize).clamp(1, n.max(1));
         let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
         let x0 = (usable - total_w) * 0.5 + cw * 0.5;
-        let top = 300.0; // bajo las cartas para no solaparse con la cabecera/separador
+        let top = self.library_top(); // justo bajo la cabecera (titulo + botones)
         let row_h = ch + gap + 96.0; // espacio para el nombre (hasta 3 renglones) bajo la carta
         (0..n)
             .map(|i| {
@@ -2855,16 +2887,17 @@ impl ApplicationHandler for App {
                     // En VISTA PREVIA, la rueda PASA DE PAGINA (arriba = anterior, abajo = siguiente).
                     self.preview_flip(if amount > 0.0 { -1 } else { 1 });
                 } else if self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
-                    // Biblioteca: la rueda SOBRE un cuaderno lo VOLTEA (ver portada/reverso); en
-                    // zona vacia desplaza la cuadricula. (Las cartas son wgpu, no widgets egui.)
-                    if let Some(i) = self.library_card_at() {
+                    // Biblioteca: si hay DESBORDAMIENTO (no cabe todo), la rueda DESPLAZA la
+                    // cuadricula (con tope); si todo cabe, la rueda SOBRE un cuaderno lo VOLTEA.
+                    let max_scroll = self.library_max_scroll();
+                    if max_scroll > 0.0 {
+                        self.card_scroll = (self.card_scroll - amount * 90.0).clamp(0.0, max_scroll);
+                    } else if let Some(i) = self.library_card_at() {
                         self.card_flip_vel.resize(self.notebooks.len(), 0.0);
                         if i < self.card_flip_vel.len() {
                             // La rueda da IMPULSO; luego el cuaderno flota girando (inercia).
                             self.card_flip_vel[i] += amount * 0.05;
                         }
-                    } else {
-                        self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
                     }
                 }
                 if !egui_consumed && self.app_mode == AppMode::Canvas {
@@ -3472,14 +3505,6 @@ impl ApplicationHandler for App {
                                     }
                                 });
                             });
-                            ui.add_space(16.0);
-                            // Separador sutil (linea fina de bajo contraste) en vez del duro.
-                            let sep = ui.available_rect_before_wrap();
-                            ui.painter().hline(
-                                sep.x_range(),
-                                sep.top(),
-                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
-                            );
                             ui.add_space(10.0);
                             if nb_list.is_empty() {
                                 ui.label(
@@ -4222,6 +4247,13 @@ impl ApplicationHandler for App {
                 }
 
                 // --- Render (lienzo + UI encima) ---
+                // Recorte superior de las cartas (solo en la cuadricula del Home): al desplazar,
+                // los cuadernos que suban se recortan justo bajo la cabecera (sin tapar el titulo).
+                let card_clip = if in_library && !self.creating_nb && self.preview_idx.is_none() {
+                    self.library_header_px() as u32
+                } else {
+                    0
+                };
                 if let Some(g) = self.gpu.as_mut() {
                     let screen = egui_wgpu::ScreenDescriptor {
                         size_in_pixels: [g.width(), g.height()],
@@ -4229,6 +4261,7 @@ impl ApplicationHandler for App {
                     };
                     g.set_bg(bg);
                     g.set_content_clip(content_clip);
+                    g.set_card_clip_top(card_clip);
                     g.set_grid(&self.grid_mesh);
                     let card_time = if self.lib_tweaks.animate { self.clock } else { 0.0 };
                     g.set_cards(&cards, self.camera.viewport.x, self.camera.viewport.y, card_time);

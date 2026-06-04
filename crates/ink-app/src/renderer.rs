@@ -233,6 +233,10 @@ pub struct GpuState {
     /// Recorte (scissor) del CONTENIDO en pixeles fisicos: cuando el cuaderno es de hojas,
     /// limita el dibujo/rejilla a la hoja. `None` = sin recorte (lienzo infinito).
     content_clip: Option<(u32, u32, u32, u32)>,
+    /// Recorte superior (px fisicos) para las CARTAS de la biblioteca: al desplazar, los cuadernos
+    /// que suban por encima de esta linea (justo bajo la cabecera) se recortan. 0 = sin recorte.
+    /// El fondo (instancia 0) se dibuja SIEMPRE a pantalla completa (sin recorte).
+    card_clip_top: u32,
     pub supported_present_modes: Vec<wgpu::PresentMode>,
     egui_renderer: egui_wgpu::Renderer,
 
@@ -796,6 +800,7 @@ impl GpuState {
             active: DynBuffer::new(),
             bg: BG,
             content_clip: None,
+            card_clip_top: 0,
             supported_present_modes,
             egui_renderer,
             stamp_pipeline,
@@ -901,6 +906,11 @@ impl GpuState {
     /// cuaderno). `None` quita el recorte (lienzo infinito).
     pub fn set_content_clip(&mut self, rect: Option<(u32, u32, u32, u32)>) {
         self.content_clip = rect;
+    }
+
+    /// Linea superior (px fisicos) bajo la cual se recortan las cartas de la biblioteca (0 = no).
+    pub fn set_card_clip_top(&mut self, top: u32) {
+        self.card_clip_top = top;
     }
 
     pub fn set_active(&mut self, verts: &[Vertex]) {
@@ -1234,7 +1244,17 @@ impl GpuState {
                     rpass.set_pipeline(&self.card_pipeline);
                     rpass.set_bind_group(0, &self.card_view_bg, &[]);
                     rpass.set_vertex_buffer(0, b.slice(..));
-                    rpass.draw(0..36, 0..self.card_inst.len); // 6 caras (cuaderno 3D)
+                    if self.card_clip_top > 0 && self.card_inst.len > 1 {
+                        // Fondo (instancia 0) a pantalla completa; cuadernos (1..) recortados bajo
+                        // la cabecera para que al desplazar no tapen el titulo.
+                        rpass.draw(0..36, 0..1);
+                        let h = self.config.height.saturating_sub(self.card_clip_top).max(1);
+                        rpass.set_scissor_rect(0, self.card_clip_top, self.config.width, h);
+                        rpass.draw(0..36, 1..self.card_inst.len);
+                        rpass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                    } else {
+                        rpass.draw(0..36, 0..self.card_inst.len); // 6 caras (cuaderno 3D)
+                    }
                 }
             }
 
