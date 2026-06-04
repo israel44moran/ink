@@ -59,17 +59,17 @@ fn erase_inst_layout() -> wgpu::VertexBufferLayout<'static> {
 /// Instancia de una "carta"/cuaderno de la biblioteca (22 floats = 88 bytes):
 /// [center.x, center.y, half.x, half.y, rotX, rotY, pointer.x, pointer.y, hover, baseR, baseG,
 ///  baseB, finish, fx, fx_intensity, accentR, accentG, accentB, depth, overhang, board, shape].
-pub type CardInstance = [f32; 22];
+pub type CardInstance = [f32; 23];
 
-const CARD_INST_ATTRS: [wgpu::VertexAttribute; 14] = wgpu::vertex_attr_array![
+const CARD_INST_ATTRS: [wgpu::VertexAttribute; 15] = wgpu::vertex_attr_array![
     0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2, 4 => Float32, 5 => Float32x3,
     6 => Float32, 7 => Float32, 8 => Float32, 9 => Float32x3,
-    10 => Float32, 11 => Float32, 12 => Float32, 13 => Float32
+    10 => Float32, 11 => Float32, 12 => Float32, 13 => Float32, 14 => Float32
 ];
 
 fn card_inst_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: 88,
+        array_stride: 92,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &CARD_INST_ATTRS,
     }

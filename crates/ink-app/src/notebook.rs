@@ -81,6 +81,10 @@ pub struct NotebookData {
     /// Multiplicador de la ceja de tapa (1.0 = la de la forma).
     #[serde(default = "default_one")]
     pub overhang: f32,
+    /// Textura del material (0=ninguna, 1=cuero, 2=tela, 3=madera, 4=kraft, 5=carbono, 6=cuadros).
+    /// Se aplica sobre la portada (foils) y sobre las figuras 3D.
+    #[serde(default)]
+    pub texture: u32,
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -110,6 +114,7 @@ impl NotebookData {
             shape: 0,
             thickness: 1.0,
             overhang: 1.0,
+            texture: 0,
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -146,6 +151,7 @@ pub struct NotebookEntry {
     pub shape: u32,
     pub thickness: f32,
     pub overhang: f32,
+    pub texture: u32,
     pub path: PathBuf,
 }
 
@@ -260,6 +266,7 @@ pub fn list() -> Vec<NotebookEntry> {
                         shape: nb.shape,
                         thickness: nb.thickness,
                         overhang: nb.overhang,
+                        texture: nb.texture,
                         path: p,
                     });
                 }

@@ -29,6 +29,7 @@ struct VsIn {
     @location(11) overhang: f32,
     @location(12) board: f32,
     @location(13) shape: f32,
+    @location(14) texture: f32,
 };
 
 struct VsOut {
@@ -48,6 +49,7 @@ struct VsOut {
     @location(12) board: f32,
     @location(13) shape: f32,
     @location(14) overhang: f32,
+    @location(15) texture: f32,
 };
 
 // El cuaderno es una CAJA (6 caras): 0=frente (portada animada), 1=reverso (cinta con el
@@ -105,6 +107,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.board = in.board;
     out.shape = in.shape;
     out.overhang = in.overhang;
+    out.texture = in.texture;
     return out;
 }
 
@@ -478,6 +481,118 @@ fn loader3d(id: i32, p: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+// ============== FIGURAS 3D: solidos raymarcheados (cubo, esfera, piramide, toro, octaedro) ==============
+
+// Ruido de valor suave (a partir de hash21) para las texturas procedurales.
+fn nz2(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash21(i + vec2<f32>(0.0, 0.0)), hash21(i + vec2<f32>(1.0, 0.0)), u.x),
+               mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), u.x), u.y);
+}
+
+fn sd_box3(p: vec3<f32>, b: vec3<f32>) -> f32 {
+    let q = abs(p) - b;
+    return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+fn sd_torus3(p: vec3<f32>, ra: f32, rb: f32) -> f32 {
+    let q = vec2<f32>(length(p.xz) - ra, p.y);
+    return length(q) - rb;
+}
+fn sd_octa3(p: vec3<f32>, s: f32) -> f32 {
+    let q = abs(p);
+    return (q.x + q.y + q.z - s) * 0.57735027;
+}
+fn sd_tetra3(p: vec3<f32>, s: f32) -> f32 {
+    return (max(abs(p.x + p.y) - p.z, abs(p.x - p.y) + p.z) - s) * 0.57735027;
+}
+fn map_fig(id: i32, p: vec3<f32>) -> f32 {
+    if (id == 1) { return length(p) - 0.82; }        // esfera
+    if (id == 2) { return sd_tetra3(p, 1.05); }      // piramide (tetraedro)
+    if (id == 3) { return sd_torus3(p, 0.6, 0.26); } // toro / dona
+    if (id == 4) { return sd_octa3(p, 1.0); }        // octaedro
+    return sd_box3(p, vec3<f32>(0.6, 0.6, 0.6));     // cubo (id 0)
+}
+
+// Textura procedural sobre la superficie (proyeccion triplanar). tex: 0 ninguna, 1 cuero,
+// 2 tela/lino, 3 madera, 4 kraft, 5 fibra de carbono, 6 cuadros.
+fn tex_surface(tex: i32, base: vec3<f32>, q: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (tex <= 0) { return base; }
+    let an = abs(n);
+    var uv2: vec2<f32>;
+    if (an.x >= an.y && an.x >= an.z) { uv2 = q.yz; }
+    else if (an.y >= an.z) { uv2 = q.xz; }
+    else { uv2 = q.xy; }
+    if (tex == 1) { // cuero: grano por ruido
+        let g1 = nz2(uv2 * 7.0);
+        let g2 = nz2(uv2 * 17.0 + vec2<f32>(3.0, 3.0));
+        return base * (0.80 + 0.22 * g1 + 0.08 * g2);
+    }
+    if (tex == 2) { // tela / lino: trama cruzada
+        let wx = 0.5 + 0.5 * sin(uv2.x * 48.0);
+        let wy = 0.5 + 0.5 * sin(uv2.y * 48.0);
+        return base * mix(0.82, 1.12, wx * wy);
+    }
+    if (tex == 3) { // madera: vetas
+        let rings = 0.5 + 0.5 * sin(uv2.x * 9.0 + nz2(uv2 * vec2<f32>(2.0, 6.0)) * 6.0);
+        return base * (0.68 + 0.34 * rings);
+    }
+    if (tex == 4) { // kraft: papel rugoso
+        let nn = nz2(uv2 * 38.0);
+        return base * (0.88 + 0.16 * nn);
+    }
+    if (tex == 5) { // fibra de carbono: tejido 2x2
+        let g = fract(uv2 * 9.0);
+        let a = step(0.5, g.x);
+        let b = step(0.5, g.y);
+        let w = abs(a - b);
+        return mix(base * 0.45, base, w) * (0.75 + 0.25 * sin((g.x + g.y) * 18.0));
+    }
+    // tex == 6: cuadros (tablero)
+    let g = floor(uv2 * 6.0);
+    let c = abs(fract((g.x + g.y) * 0.5) * 2.0 - 1.0);
+    return mix(base * 0.55, base, 1.0 - c);
+}
+
+// Raymarcher de una figura solida que gira, con luz fija en el mundo y textura opcional.
+fn figure3d(id: i32, p2: vec2<f32>, t: f32, accent: vec3<f32>, tex: i32) -> vec3<f32> {
+    var col = vec3<f32>(0.035, 0.04, 0.055);
+    let ro = vec3<f32>(0.0, 0.0, -3.0);
+    let rd = normalize(vec3<f32>(p2, 1.7));
+    let ay = t * 0.55;
+    let ax = t * 0.32 + 0.5;
+    var tt = 0.4;
+    var hit = false;
+    var pr = vec3<f32>(0.0);
+    for (var i: i32 = 0; i < 72; i = i + 1) {
+        let pos = ro + rd * tt;
+        pr = rot3(pos, ay, ax); // marchamos en el espacio de la figura (que gira con el tiempo)
+        let d = map_fig(id, pr);
+        if (d < 0.0015) { hit = true; break; }
+        tt = tt + d;
+        if (tt > 7.0) { break; }
+    }
+    if (hit) {
+        let e = vec2<f32>(0.0018, 0.0);
+        let n = normalize(vec3<f32>(
+            map_fig(id, pr + e.xyy) - map_fig(id, pr - e.xyy),
+            map_fig(id, pr + e.yxy) - map_fig(id, pr - e.yxy),
+            map_fig(id, pr + e.yyx) - map_fig(id, pr - e.yyx)
+        ));
+        // luz fija en el mundo: la rotamos al espacio objeto para iluminar las caras al girar.
+        let lw = normalize(vec3<f32>(-0.5, 0.72, -0.55));
+        let ldir = rot3(lw, ay, ax);
+        let rdo = rot3(rd, ay, ax);
+        let dif = clamp(dot(n, ldir), 0.0, 1.0);
+        let spec = pow(clamp(dot(reflect(rdo, n), ldir), 0.0, 1.0), 26.0);
+        let rim = pow(1.0 - clamp(dot(n, -rdo), 0.0, 1.0), 3.0) * 0.35;
+        let base = tex_surface(tex, accent, pr, n);
+        col = base * (0.22 + 0.95 * dif) + vec3<f32>(1.0) * spec * 0.6 + accent * rim;
+    }
+    return col;
+}
+
 // ============== ARCADE Y DEMOS: animaciones retrowave / arcade / generativas ==============
 
 fn grid_line(x: f32, w: f32) -> f32 {
@@ -771,7 +886,12 @@ fn cover_color(in: VsOut) -> vec3<f32> {
     let gd = distance(in.uv, in.pointer);
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
-    if (fin >= 500) {
+    if (fin >= 600) {
+        // ---------------- FIGURAS 3D: solido raymarcheado que gira (con textura opcional) ----------------
+        var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
+        p.y = p.y * in.aspect;
+        col = figure3d(fin - 600, p, t, in.accent, i32(round(in.texture)));
+    } else if (fin >= 500) {
         // ---------------- NOTA RAPIDA: hoja de papel que refleja la cuadricula REAL ----------------
         // kind: 0 rayas, 1 milimetrado, 2 puntos, 3 blanca (sin cuadricula), 4 iso, 5 triangular.
         let kind = fin - 500;
@@ -836,6 +956,9 @@ fn cover_color(in: VsOut) -> vec3<f32> {
         col = mix(in.base, in.accent, cov);
         col = col + in.accent * cov * 0.08; // leve halo
     } else {
+        // Textura procedural del MATERIAL de la tapa (cuero/tela/madera/kraft/carbono/cuadros)
+        // sobre el color base; el foil/efecto se anade encima.
+        col = tex_surface(i32(round(in.texture)), col, vec3<f32>(in.uv * 2.2, 0.0), vec3<f32>(0.0, 0.0, 1.0));
         // ---------------- FOIL: el efecto vive a reposo (idle) y crece con el cursor ----------------
         let eff = (0.30 + 0.70 * h) * (0.6 + 0.4 * inten);
         if (fin == 1) {
@@ -926,8 +1049,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = i32(round(in.face));
     let shp = i32(round(in.shape));
     var col: vec3<f32>;
-    // NOTA RAPIDA (hoja, finish >= 500): la portada lleva el patron; el resto, papel claro.
-    if (i32(round(in.finish)) >= 500) {
+    // NOTA RAPIDA (hoja, finish 500..599): la portada lleva el patron; el resto, papel claro.
+    // (Las figuras 3D, >= 600, son cuadernos normales y NO entran aqui.)
+    let fin_sc = i32(round(in.finish));
+    if (fin_sc >= 500 && fin_sc < 600) {
         if (face == 0) {
             col = cover_color(in);
         } else {

@@ -266,6 +266,8 @@ struct App {
     current_shape: u32,
     current_thickness: f32,
     current_overhang: f32,
+    /// Textura del material del cuaderno abierto.
+    current_texture: u32,
     /// Paginas del cuaderno abierto (la pagina activa esta volcada en doc/texts/...).
     pages: Vec<notebook::PageData>,
     /// Indice de la pagina activa.
@@ -288,6 +290,8 @@ struct App {
     new_nb_shape: u32,
     new_nb_thickness: f32,
     new_nb_overhang: f32,
+    /// Textura del material elegida para el cuaderno nuevo.
+    new_nb_texture: u32,
     /// Ajustes GLOBALES (panel Tweaks): pose en el estante e interaccion.
     lib_tweaks: notebook::LibTweaks,
     /// Panel de Tweaks (ajustes globales) abierto.
@@ -402,6 +406,7 @@ impl App {
             current_shape: 0,
             current_thickness: 1.0,
             current_overhang: 1.0,
+            current_texture: 0,
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
             lock_page: false,
@@ -415,6 +420,7 @@ impl App {
             new_nb_shape: 0,
             new_nb_thickness: 1.0,
             new_nb_overhang: 1.0,
+            new_nb_texture: 0,
             lib_tweaks: notebook::load_tweaks(),
             show_tweaks: false,
             creating_nb: false,
@@ -858,6 +864,7 @@ impl App {
         self.current_shape = nb.shape;
         self.current_thickness = nb.thickness;
         self.current_overhang = nb.overhang;
+        self.current_texture = nb.texture;
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -886,6 +893,7 @@ impl App {
         nb.shape = self.current_shape;
         nb.thickness = self.current_thickness;
         nb.overhang = self.current_overhang;
+        nb.texture = self.current_texture;
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -909,6 +917,7 @@ impl App {
         nb.shape = self.new_nb_shape;
         nb.thickness = self.new_nb_thickness;
         nb.overhang = self.new_nb_overhang;
+        nb.texture = self.new_nb_texture;
         let path = notebook::path_for(name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
@@ -1250,6 +1259,7 @@ impl App {
             self.new_nb_shape = nb.shape;
             self.new_nb_thickness = nb.thickness;
             self.new_nb_overhang = nb.overhang;
+            self.new_nb_texture = nb.texture;
             self.editing_nb = Some(nb.path.clone());
             self.creating_nb = true;
         }
@@ -1266,6 +1276,7 @@ impl App {
             nb.shape = self.new_nb_shape;
             nb.thickness = self.new_nb_thickness;
             nb.overhang = self.new_nb_overhang;
+            nb.texture = self.new_nb_texture;
             let _ = notebook::save(&nb, path);
         }
         self.notebooks = notebook::list();
@@ -1278,6 +1289,7 @@ impl App {
             self.current_shape = self.new_nb_shape;
             self.current_thickness = self.new_nb_thickness;
             self.current_overhang = self.new_nb_overhang;
+            self.current_texture = self.new_nb_texture;
         }
     }
 
@@ -1295,7 +1307,7 @@ impl App {
             let flip = self.card_flip.get(i).copied().unwrap_or(0.0); // rueda = voltear (ver reverso)
             let nb = self.notebooks.get(i);
             let finish = nb.map_or(1, |n| n.finish);
-            let is_sheet = finish >= 500; // nota rapida = HOJA plana
+            let is_sheet = finish >= 500 && finish < 600; // nota rapida (500..599) = HOJA plana
             // Las HOJAS van planas DE FRENTE (sin giro/inclinacion del estante) para no verse
             // "arrugadas"; los cuadernos si toman su pose 3D del estante.
             let (rotx, roty, hov) = if dragged {
@@ -1337,10 +1349,11 @@ impl App {
                 )
             };
             let cy = center.y - (t * 1.3 + ph).sin() * (if is_sheet { 4.0 } else { 11.0 }) * hov;
+            let texture = nb.map_or(0, |n| n.texture);
             cards.push([
                 center.x, cy, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
                 base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
-                depth, overh, bf, shape as f32,
+                depth, overh, bf, shape as f32, texture as f32,
             ]);
             if dragged || a[0] > 0.45 {
                 hover_idx = Some(i);
@@ -1381,7 +1394,7 @@ impl App {
             c.x, c.y, h.x, h.y, rotx, roty, ptr_x, ptr_y, 1.0,
             base[0], base[1], base[2], finish as f32, self.new_nb_fx as f32,
             self.new_nb_intensity, ac[0], ac[1], ac[2],
-            depth, overh, bf, self.new_nb_shape as f32,
+            depth, overh, bf, self.new_nb_shape as f32, self.new_nb_texture as f32,
         ]]
     }
 
@@ -3116,9 +3129,12 @@ impl ApplicationHandler for App {
                                 }
                                 let Some((c, h)) = card_layout.get(i) else { continue };
                                 let fl = self.card_flip.get(i).copied().unwrap_or(0.0);
-                                // Las notas rapidas (hojas, finish >= 500) no tienen cinta: su
+                                // Las notas rapidas (hojas, finish 500..599) no tienen cinta: su
                                 // nombre va siempre DEBAJO, aunque se volteen.
-                                let is_sheet = self.notebooks.get(i).map_or(false, |n| n.finish >= 500);
+                                let is_sheet = self
+                                    .notebooks
+                                    .get(i)
+                                    .map_or(false, |n| n.finish >= 500 && n.finish < 600);
                                 if fl > 1.5708 && !is_sheet {
                                     // Reverso visible: el nombre va PEGADO a la cinta y ROTADO CON
                                     // ELLA (sigue su inclinacion/giro/flotacion con precision).
@@ -3404,6 +3420,15 @@ impl ApplicationHandler for App {
                                                 }
                                             }
                                         });
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("Figuras 3D (giran)").color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (id, name) in FIGURE_DESIGNS {
+                                                if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
+                                                    self.new_nb_finish = id;
+                                                }
+                                            }
+                                        });
                                     });
                                     ui.add_space(6.0);
                                     ui.separator();
@@ -3422,6 +3447,21 @@ impl ApplicationHandler for App {
                                     ui.horizontal(|ui| {
                                         ui.add(egui::Slider::new(&mut self.new_nb_overhang, 0.0..=2.0));
                                         ui.label("Ceja de tapa");
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Textura del material").strong());
+                                    ui.label(
+                                        egui::RichText::new("Se aplica a la portada y a las figuras 3D.")
+                                            .small()
+                                            .color(gray),
+                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (idx, name) in TEXTURE_NAMES.iter().enumerate() {
+                                            if ui.selectable_label(self.new_nb_texture == idx as u32, *name).clicked() {
+                                                self.new_nb_texture = idx as u32;
+                                            }
+                                        }
                                     });
                                     ui.add_space(6.0);
                                     ui.separator();
@@ -3929,6 +3969,16 @@ const ARCADE_DESIGNS: [(u32, &str); 9] = [
     (404, "Tetris"), (405, "Vida"), (406, "Flores"), (407, "Pac-Man"), (408, "Relámpagos"),
 ];
 
+/// Figuras 3D solidas raymarcheadas que giran (id >= 600). Usan el Acento (color) y la Textura.
+const FIGURE_DESIGNS: [(u32, &str); 5] = [
+    (600, "Cubo"), (601, "Esfera"), (602, "Pirámide"), (603, "Toro"), (604, "Octaedro"),
+];
+
+/// Texturas del material (idx = texture). 0 = ninguna. Se aplican a portadas (foils) y figuras.
+const TEXTURE_NAMES: [&str; 7] = [
+    "Ninguna", "Cuero", "Tela", "Madera", "Kraft", "Fibra carbono", "Cuadros",
+];
+
 /// Capas COMBINABLES (bit, nombre).
 const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4, "Resplandor")];
 
@@ -4060,6 +4110,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if f >= 600 => [0.03, 0.035, 0.05], // Figuras 3D: fondo oscuro
         f if f >= 500 => [0.97, 0.97, 0.95], // Nota rapida (hoja de papel): casi blanco
         f if f >= 400 => [0.02, 0.02, 0.04], // Arcade y demos: fondo oscuro
         f if f >= 300 => [0.04, 0.04, 0.06], // Cargadores 3D: fondo oscuro
