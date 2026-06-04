@@ -998,7 +998,7 @@ impl App {
                 (0.0, base_rx, base_ry)
             };
             let a = &mut self.card_anim[i];
-            let k = 0.12; // suave: el hover/tilt llega despacio (no brusco)
+            let k = 0.07; // muy suave: el hover/tilt llega despacio (movimiento lento, no brusco)
             a[0] += (t_hover - a[0]) * k;
             a[1] += (t_rotx - a[1]) * k;
             a[2] += (t_roty - a[2]) * k;
@@ -1020,9 +1020,9 @@ impl App {
                 }
                 self.card_flip[i] = nf;
             } else {
-                // El cursor ya no esta encima: regresa fluido a su posicion original.
+                // El cursor ya no esta encima: regresa LENTO y fluido a su posicion original.
                 self.card_flip_vel[i] = 0.0;
-                self.card_flip[i] += (0.0 - self.card_flip[i]) * 0.10;
+                self.card_flip[i] += (0.0 - self.card_flip[i]) * 0.06;
                 if self.card_flip[i].abs() < 0.002 {
                     self.card_flip[i] = 0.0;
                 }
@@ -1047,6 +1047,10 @@ impl App {
             return;
         }
         let Some(entry) = self.notebooks.get(idx) else { return };
+        // Si el nombre no cambio, no hacemos NADA (evita el "lagazo" de releer todo el disco).
+        if entry.name == new_name {
+            return;
+        }
         let old_path = entry.path.clone();
         let new_path = notebook::path_for(new_name);
         if let Some(mut nb) = notebook::load(&old_path) {
@@ -1057,7 +1061,7 @@ impl App {
                 // Mantener la posicion en el orden manual (reemplazar el nombre de archivo).
                 let oldfn = old_path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string());
                 let newfn = new_path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string());
-                if let (Some(o), Some(n)) = (oldfn, newfn) {
+                if let (Some(o), Some(n)) = (oldfn.clone(), newfn) {
                     let mut order = notebook::load_order();
                     let mut found = false;
                     for it in order.iter_mut() {
@@ -1071,16 +1075,16 @@ impl App {
                     }
                     notebook::save_order(&order);
                 }
-                // Si era el cuaderno abierto, actualizar su ruta.
                 if self.current_path.as_deref() == Some(old_path.as_path()) {
-                    self.current_path = Some(new_path);
+                    self.current_path = Some(new_path.clone());
                 }
             }
         }
-        self.notebooks = notebook::list();
-        self.card_anim.clear();
-        self.card_flip.clear();
-        self.card_flip_vel.clear();
+        // Actualizar SOLO la entrada en memoria (sin releer todo el disco -> sin lagazo).
+        if let Some(e) = self.notebooks.get_mut(idx) {
+            e.name = new_name.to_string();
+            e.path = new_path;
+        }
     }
 
     /// Zona de la PAPELERA unica (centro y radio, en px): arrastra una carta aqui para borrarla.
@@ -1199,8 +1203,13 @@ impl App {
             let center = if dragged { cur } else { *c };
             let flip = self.card_flip.get(i).copied().unwrap_or(0.0); // rueda = voltear (ver reverso)
             let (rotx, roty, hov) = if dragged { (0.0, flip, 1.0) } else { (a[1], a[2] + flip, a[0]) };
-            let ptr_x = ((cur.x - (center.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
-            let ptr_y = ((cur.y - (center.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
+            // El "puntero" del efecto solo sigue al cursor segun el HOVER: si el cursor no esta
+            // sobre la carta (p.ej. en la fila de abajo, misma columna), queda neutro (0.5) y la
+            // portada no reacciona. Mezclado por `hov` -> transicion suave.
+            let cr_x = ((cur.x - (center.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
+            let cr_y = ((cur.y - (center.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
+            let ptr_x = 0.5 + (cr_x - 0.5) * hov;
+            let ptr_y = 0.5 + (cr_y - 0.5) * hov;
             let nb = self.notebooks.get(i);
             let finish = nb.map_or(1, |n| n.finish);
             let fx = nb.map_or(0, |n| n.fx);
