@@ -350,6 +350,101 @@ fn attractor_scene(aid: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, accent: vec3<f
     return col + mapped * cyc;
 }
 
+// --- CARGADORES 3D: esferas proyectadas (perspectiva + sombreado + profundidad) ---
+
+fn rot3(v: vec3<f32>, ay: f32, ax: f32) -> vec3<f32> {
+    let cy = cos(ay); let sy = sin(ay);
+    let v1 = vec3<f32>(v.x * cy + v.z * sy, v.y, -v.x * sy + v.z * cy);
+    let cx = cos(ax); let sx = sin(ax);
+    return vec3<f32>(v1.x, v1.y * cx - v1.z * sx, v1.y * sx + v1.z * cx);
+}
+
+// Dibuja una esfera 3D (con test de profundidad y sombreado difuso) en el punto P.
+fn put_sphere(p: vec2<f32>, big: vec3<f32>, r: f32, color: vec3<f32>,
+              col: ptr<function, vec3<f32>>, zbuf: ptr<function, f32>) {
+    let persp = 1.0 / (1.0 - big.z * 0.18);
+    let c2 = vec2<f32>(big.x, big.y) * persp;
+    let rr = r * persp;
+    let off = p - c2;
+    let dd = dot(off, off);
+    let cov = smoothstep(rr, rr * 0.55, length(off));
+    if (cov > 0.0 && big.z > *zbuf) {
+        let nz = sqrt(max(rr * rr - dd, 0.0)) / max(rr, 0.0001);
+        let nrm = normalize(vec3<f32>(off / max(rr, 0.0001), nz));
+        let lit = clamp(dot(nrm, normalize(vec3<f32>(-0.45, -0.6, 0.65))), 0.0, 1.0);
+        let shaded = color * (0.22 + 0.9 * lit) + vec3<f32>(1.0) * pow(lit, 16.0) * 0.5;
+        *col = mix(*col, shaded, cov);
+        *zbuf = big.z;
+    }
+}
+
+fn loader3d(id: i32, p: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.04, 0.04, 0.06);
+    var zbuf = -1000.0;
+    let ay = t * 0.7;
+    if (id == 0) {
+        // Atomo: tres anillos de esferas en planos distintos.
+        for (var k: i32 = 0; k < 3; k = k + 1) {
+            let fk = f32(k);
+            for (var i: i32 = 0; i < 14; i = i + 1) {
+                let a = f32(i) / 14.0 * 6.2832 + t * 1.6;
+                var big = vec3<f32>(cos(a) * 0.64, sin(a) * 0.64, 0.0);
+                big = rot3(big, fk * 1.05 + t * 0.2, fk * 0.7);
+                put_sphere(p, big, 0.075, accent, &col, &zbuf);
+            }
+        }
+    } else if (id == 1) {
+        // Helice doble (ADN) girando.
+        for (var i: i32 = 0; i < 26; i = i + 1) {
+            let f = f32(i) / 26.0;
+            let yy = (f - 0.5) * 1.5;
+            let a = f * 9.0 + t * 2.0;
+            var p0 = rot3(vec3<f32>(cos(a) * 0.42, yy, sin(a) * 0.42), ay, 0.18);
+            var p1 = rot3(vec3<f32>(cos(a + 3.1416) * 0.42, yy, sin(a + 3.1416) * 0.42), ay, 0.18);
+            put_sphere(p, p0, 0.06, accent, &col, &zbuf);
+            put_sphere(p, p1, 0.06, accent * 0.6 + vec3<f32>(0.25, 0.25, 0.3), &col, &zbuf);
+        }
+    } else if (id == 2) {
+        // Esfera de puntos (Fibonacci) girando.
+        for (var i: i32 = 0; i < 42; i = i + 1) {
+            let fi = f32(i);
+            let yy = 1.0 - (fi / 41.0) * 2.0;
+            let rad = sqrt(max(1.0 - yy * yy, 0.0));
+            let phi = fi * 2.39996;
+            var big = rot3(vec3<f32>(cos(phi) * rad, yy, sin(phi) * rad) * 0.72, ay, 0.5);
+            put_sphere(p, big, 0.052, accent, &col, &zbuf);
+        }
+    } else if (id == 3) {
+        // Anillo (toro) girando en 3D.
+        for (var i: i32 = 0; i < 24; i = i + 1) {
+            let a = f32(i) / 24.0 * 6.2832;
+            var big = rot3(vec3<f32>(cos(a) * 0.72, sin(a) * 0.72, 0.0), t * 1.3, 0.95);
+            put_sphere(p, big, 0.07, accent, &col, &zbuf);
+        }
+    } else if (id == 4) {
+        // Cumulo esferico que late.
+        for (var i: i32 = 0; i < 32; i = i + 1) {
+            let fi = f32(i);
+            let yy = 1.0 - (fi / 31.0) * 2.0;
+            let rad = sqrt(max(1.0 - yy * yy, 0.0));
+            let phi = fi * 2.39996;
+            let pr = 0.5 + 0.28 * sin(t * 2.2 + fi * 0.35);
+            var big = rot3(vec3<f32>(cos(phi) * rad, yy, sin(phi) * rad) * pr, ay, 0.4);
+            put_sphere(p, big, 0.05, accent, &col, &zbuf);
+        }
+    } else {
+        // Espiral conica 3D.
+        for (var i: i32 = 0; i < 34; i = i + 1) {
+            let f = f32(i) / 34.0;
+            let a = f * 12.0 + t * 2.0;
+            let rad = 0.12 + f * 0.6;
+            var big = rot3(vec3<f32>(cos(a) * rad, (f - 0.5) * 1.35, sin(a) * rad), ay, 0.3);
+            put_sphere(p, big, 0.062 * (1.0 - 0.4 * f), accent, &col, &zbuf);
+        }
+    }
+    return col;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Esquinas redondeadas (SDF) con borde suave (alfa).
@@ -371,7 +466,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let gd = distance(in.uv, in.pointer);
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
-    if (fin >= 200) {
+    if (fin >= 300) {
+        // ---------------- CARGADORES 3D (esferas en perspectiva) ----------------
+        var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
+        p.y = p.y * in.aspect;
+        col = loader3d(fin - 300, p, t, in.accent);
+    } else if (fin >= 200) {
         // ---------------- ESCENAS 3D: sistema solar / atractores ----------------
         var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
         p.y = p.y * in.aspect;

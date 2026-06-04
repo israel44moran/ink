@@ -293,6 +293,10 @@ struct App {
     card_rects: Vec<(f32, f32, f32, f32)>,
     /// Desplazamiento vertical de la cuadricula de cartas (rueda).
     card_scroll: f32,
+    /// Arrastre de cartas en la biblioteca: indice agarrado, punto inicial y si ya se arrastra.
+    drag_idx: Option<usize>,
+    drag_start: Vec2,
+    dragging: bool,
 }
 
 impl App {
@@ -387,6 +391,9 @@ impl App {
             card_anim: Vec::new(),
             card_rects: Vec::new(),
             card_scroll: 0.0,
+            drag_idx: None,
+            drag_start: Vec2::ZERO,
+            dragging: false,
         }
     }
 
@@ -872,6 +879,8 @@ impl App {
         self.card_anim.clear();
         self.creating_nb = false;
         self.editing_nb = None;
+        self.drag_idx = None;
+        self.dragging = false;
     }
 
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
@@ -957,6 +966,61 @@ impl App {
             .position(|&(cx, cy, hx, hy)| (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy)
     }
 
+    /// ¿El cursor esta sobre el icono de papelera (esquina sup-derecha) de la carta `i`?
+    fn library_over_trash(&self, i: usize) -> bool {
+        if let Some(&(cx, cy, hx, hy)) = self.card_rects.get(i) {
+            let (dpx, dpy) = (cx + hx - 18.0, cy - hy + 18.0);
+            (self.cursor.x - dpx).hypot(self.cursor.y - dpy) < 16.0
+        } else {
+            false
+        }
+    }
+
+    /// Borra el cuaderno `i` de la biblioteca.
+    fn delete_card(&mut self, i: usize) {
+        if let Some(nb) = self.notebooks.get(i) {
+            let path = nb.path.clone();
+            notebook::delete(&path);
+            self.notebooks = notebook::list();
+            self.card_anim.clear();
+        }
+    }
+
+    /// Suelta la carta arrastrada `from` en el hueco mas cercano al cursor y guarda el nuevo
+    /// orden (persistente). Los demas cuadernos se desplazan para hacer sitio.
+    fn drop_card(&mut self, from: usize) {
+        let layout = self.library_card_layout();
+        if layout.is_empty() || from >= self.notebooks.len() {
+            return;
+        }
+        // Hueco destino = carta cuyo centro queda mas cerca del cursor.
+        let mut target = from;
+        let mut best = f32::MAX;
+        for (j, (c, _h)) in layout.iter().enumerate() {
+            let d = (c.x - self.cursor.x).hypot(c.y - self.cursor.y);
+            if d < best {
+                best = d;
+                target = j;
+            }
+        }
+        if target == from {
+            return;
+        }
+        let mut files: Vec<String> = self
+            .notebooks
+            .iter()
+            .filter_map(|nb| nb.path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()))
+            .collect();
+        if from >= files.len() {
+            return;
+        }
+        let f = files.remove(from);
+        files.insert(target.min(files.len()), f);
+        notebook::save_order(&files);
+        self.notebooks = notebook::list();
+        self.card_anim.clear();
+    }
+
     /// Abre el panel para EDITAR la carátula del cuaderno `i` (clic derecho): carga sus
     /// valores actuales y entra en modo edición.
     fn start_edit_cover(&mut self, i: usize) {
@@ -998,8 +1062,12 @@ impl App {
         let mut hover_idx: Option<usize> = None;
         for (i, (c, h)) in layout.iter().enumerate() {
             let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
-            let ptr_x = ((cur.x - (c.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
-            let ptr_y = ((cur.y - (c.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
+            // La carta que se esta arrastrando SIGUE al cursor (elevada), para reordenar.
+            let dragged = self.dragging && self.drag_idx == Some(i);
+            let center = if dragged { cur } else { *c };
+            let (rotx, roty, hov) = if dragged { (0.0, 0.0, 1.0) } else { (a[1], a[2], a[0]) };
+            let ptr_x = ((cur.x - (center.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
+            let ptr_y = ((cur.y - (center.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
             let nb = self.notebooks.get(i);
             let finish = nb.map_or(1, |n| n.finish);
             let fx = nb.map_or(0, |n| n.fx);
@@ -1008,10 +1076,10 @@ impl App {
             let base = finish_base_color(finish);
             let ac = accent_color(accent);
             cards.push([
-                c.x, c.y, h.x, h.y, a[1], a[2], ptr_x, ptr_y, a[0],
+                center.x, center.y, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
                 base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
             ]);
-            if a[0] > 0.45 {
+            if dragged || a[0] > 0.45 {
                 hover_idx = Some(i);
             }
         }
@@ -2134,6 +2202,14 @@ impl ApplicationHandler for App {
 
                 self.cursor = cur;
                 self.last_cursor = cur;
+
+                // Biblioteca: si hay un arrastre en curso y el cursor se movio lo suficiente,
+                // pasamos a modo "arrastrando" (la carta seguira al cursor para reordenar).
+                if self.drag_idx.is_some() && !self.dragging
+                    && (cur - self.drag_start).length() > 8.0
+                {
+                    self.dragging = true;
+                }
             }
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if self.touch_recent() => {
@@ -2146,15 +2222,26 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => match button {
                 MouseButton::Left => match state {
                     ElementState::Pressed => {
-                        if egui_consumed {
+                        if self.app_mode == AppMode::Library && !self.creating_nb {
+                            // Cartas (wgpu, no widgets egui): decidir por hit-test, NO por
+                            // `egui_consumed` (egui reclama el puntero del panel). El clic en la
+                            // papelera borra; en el resto inicia un posible arrastre (al soltar se
+                            // decide: abrir si no se movio, o reordenar si se arrastro).
+                            if let Some(i) = self.library_card_at() {
+                                if self.library_over_trash(i) {
+                                    self.delete_card(i);
+                                } else {
+                                    self.drag_idx = Some(i);
+                                    self.drag_start = self.cursor;
+                                    self.dragging = false;
+                                }
+                            }
+                        } else if egui_consumed {
                             // Interaccion con la UI: no dibujar. Si el cuentagotas estaba
                             // activo y se toca otra opcion, se cancela (vuelve la flecha).
                             self.ui.eyedropper = false;
                         } else if self.try_eyedropper() {
                             // Cuentagotas: tomo el color y no dibujo.
-                        } else if self.app_mode == AppMode::Library && !self.creating_nb {
-                            // En la biblioteca, el clic abre o borra una carta (hit-test).
-                            self.library_click();
                         } else {
                             // Tocar el lienzo cierra los paneles flotantes (color, "Mis
                             // pinceles", selector PS y Ajustes) para no estorbar al dibujar.
@@ -2189,8 +2276,18 @@ impl ApplicationHandler for App {
                         }
                     }
                     ElementState::Released => {
-                        // Siempre cerramos el trazo/pan/gesto para no quedar "pegados".
-                        if self.zooming {
+                        if self.app_mode == AppMode::Library {
+                            // Soltar en la biblioteca: si se arrastro, reordenar; si no, abrir.
+                            if let Some(i) = self.drag_idx.take() {
+                                if self.dragging {
+                                    self.drop_card(i);
+                                } else if let Some(nb) = self.notebooks.get(i) {
+                                    self.open_notebook(nb.path.clone());
+                                }
+                            }
+                            self.dragging = false;
+                        } else if self.zooming {
+                            // Siempre cerramos el trazo/pan/gesto para no quedar "pegados".
                             self.zooming = false;
                         } else if self.panning {
                             self.panning = false;
@@ -2217,8 +2314,10 @@ impl ApplicationHandler for App {
                 MouseButton::Right => {
                     if state == ElementState::Pressed {
                         if self.app_mode == AppMode::Library {
-                            // Clic derecho sobre una carta = volver a EDITAR su carátula.
-                            if !egui_consumed && !self.creating_nb {
+                            // Clic derecho sobre una carta = volver a EDITAR su carátula. Las
+                            // cartas las dibuja wgpu (no son widgets egui), asi que se decide por
+                            // hit-test, no por `egui_consumed` (egui reclama el puntero del panel).
+                            if !self.creating_nb {
                                 if let Some(i) = self.library_card_at() {
                                     self.start_edit_cover(i);
                                 }
@@ -2775,6 +2874,15 @@ impl ApplicationHandler for App {
                                             }
                                         });
                                         ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("Cargadores 3D").color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (id, name) in LOADER3D_DESIGNS {
+                                                if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
+                                                    self.new_nb_finish = id;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(4.0);
                                         ui.label(egui::RichText::new("Escenas 3D").color(gray));
                                         ui.horizontal_wrapped(|ui| {
                                             for (id, name) in SCENE_DESIGNS {
@@ -3171,6 +3279,12 @@ const SCENE_DESIGNS: [(u32, &str); 6] = [
     (213, "Thomas"), (214, "Rössler"),
 ];
 
+/// Cargadores en 3D real (esferas con perspectiva/sombreado, id >= 300). Usan el Acento.
+const LOADER3D_DESIGNS: [(u32, &str); 6] = [
+    (300, "Átomo"), (301, "Hélice"), (302, "Esfera"), (303, "Anillo 3D"),
+    (304, "Cúmulo"), (305, "Espiral 3D"),
+];
+
 /// Capas COMBINABLES (bit, nombre).
 const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4, "Resplandor")];
 
@@ -3191,6 +3305,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if f >= 300 => [0.04, 0.04, 0.06], // Cargadores 3D: fondo oscuro
         f if f >= 200 => [0.02, 0.02, 0.05], // Escenas 3D: espacio oscuro
         f if f >= 100 => [0.05, 0.05, 0.06], // Cargadores: fondo oscuro neutro
         _ => [0.17, 0.20, 0.42],  // Holografico (azul-violeta)

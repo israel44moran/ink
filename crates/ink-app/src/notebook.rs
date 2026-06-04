@@ -156,12 +156,38 @@ pub fn path_for(name: &str) -> PathBuf {
     ensure_dir().join(format!("{safe}.json"))
 }
 
-/// Lista los cuadernos guardados (ordenados por nombre).
+/// Archivo con el ORDEN manual de la biblioteca (lista de nombres de archivo).
+fn order_path() -> PathBuf {
+    notebooks_dir().join("_order.json")
+}
+
+/// Lee el orden manual guardado (nombres de archivo, p.ej. "cscs.json"); vacio si no hay.
+pub fn load_order() -> Vec<String> {
+    std::fs::read_to_string(order_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Guarda el orden manual de la biblioteca (lista de nombres de archivo).
+pub fn save_order(files: &[String]) {
+    let _ = ensure_dir();
+    if let Ok(s) = serde_json::to_string(files) {
+        let _ = std::fs::write(order_path(), s);
+    }
+}
+
+/// Lista los cuadernos guardados, en el ORDEN manual (`_order.json`); los que no esten en el
+/// orden (cuadernos nuevos) van al final, alfabeticamente.
 pub fn list() -> Vec<NotebookEntry> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(notebooks_dir()) {
         for e in rd.flatten() {
             let p = e.path();
+            // Saltar el archivo de orden (no es un cuaderno).
+            if p.file_name().map_or(false, |n| n == "_order.json") {
+                continue;
+            }
             if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) {
                 if let Some(nb) = load(&p) {
                     out.push(NotebookEntry {
@@ -177,7 +203,17 @@ pub fn list() -> Vec<NotebookEntry> {
             }
         }
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let order = load_order();
+    let pos = |e: &NotebookEntry| -> Option<usize> {
+        let fname = e.path.file_name().and_then(|s| s.to_str())?;
+        order.iter().position(|o| o == fname)
+    };
+    out.sort_by(|a, b| match (pos(a), pos(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
     out
 }
 
