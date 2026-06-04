@@ -1504,41 +1504,95 @@ impl App {
         self.preview_page = cur.clamp(0, last as i32) as usize;
     }
 
-    /// Construye la carta del LIBRO en vista previa: grande, desplazada a la izquierda y con un
-    /// giro que sugiere "abrirse" (la pagina con el contenido la dibuja egui a la derecha).
-    fn build_preview_book(&self) -> Vec<renderer::CardInstance> {
-        let Some(i) = self.preview_idx else { return Vec::new() };
-        let Some(nb) = self.notebooks.get(i) else { return Vec::new() };
-        let vp = self.camera.viewport;
-        let tt = self.preview_t.clamp(0.0, 1.0);
-        let t = tt * tt * (3.0 - 2.0 * tt); // smoothstep
-        let lerp = |a: f32, b: f32| a + (b - a) * t;
-        // ACERCARSE: vuela desde la carta en la rejilla (origen) a la pose grande de la izquierda.
-        let (fc, fh) = self.preview_from;
-        let hh = (vp.y * 0.33).clamp(150.0, 760.0);
-        let hw = hh * (188.0 / 263.0);
-        let cx = lerp(fc.x, vp.x * 0.34);
-        let cy = lerp(fc.y, vp.y * 0.5);
-        let half = vec2(lerp(fh.x, hw), lerp(fh.y, hh));
-        let finish = nb.finish;
-        let is_sheet = finish >= 500 && finish < 600;
-        let shape = if is_sheet { 4 } else { nb.shape };
-        let (df, ohf, bf) = shape_params(shape);
-        let depth = if is_sheet { 0.012 } else { df * nb.thickness };
-        let overh = if is_sheet { 0.0 } else { ohf * nb.overhang };
-        let base = finish_base_color(finish);
-        let ac = accent_color(nb.accent);
-        // ABRIRSE: de la pose del estante (inclinacion/giro) a una pose girada que muestra el
-        // canto, como si la tapa se abriera; vaiven leve al final.
-        let base_rx = self.lib_tweaks.inclinacion.to_radians();
-        let base_ry = self.lib_tweaks.giro.to_radians();
-        let rotx = lerp(base_rx, 0.12);
-        let roty = lerp(base_ry, -0.42) + (self.clock * 0.4).sin() * 0.03 * t;
-        vec![[
-            cx, cy, half.x, half.y, rotx, roty, 0.5, 0.4, 1.0,
-            base[0], base[1], base[2], finish as f32, nb.fx as f32, nb.fx_intensity,
-            ac[0], ac[1], ac[2], depth, overh, bf, shape as f32, nb.texture as f32,
-        ]]
+    /// La cuadricula del cuaderno en vista previa: si es nota rapida (hoja) la da su `finish`;
+    /// si no, el papel actual (settings.grid).
+    fn preview_grid_kind(&self) -> ink_core::GridKind {
+        use ink_core::GridKind::*;
+        let finish = self
+            .preview_idx
+            .and_then(|i| self.notebooks.get(i))
+            .map_or(0, |n| n.finish);
+        match finish {
+            500 => Lines,
+            501 => Squares,
+            502 => Dots,
+            503 => None,
+            504 => Iso,
+            505 => Triangle,
+            _ => self.settings.grid,
+        }
+    }
+
+    /// Dibuja la cuadricula (papel) dentro de un rectangulo de pagina.
+    fn draw_preview_grid(p: &egui::Painter, r: egui::Rect, kind: ink_core::GridKind) {
+        use ink_core::GridKind::*;
+        let col = egui::Color32::from_rgba_unmultiplied(95, 125, 175, 90);
+        let step = (r.height() / 22.0).max(7.0);
+        let st = egui::Stroke::new(1.0, col);
+        match kind {
+            Lines => {
+                let mut y = r.top() + step;
+                while y < r.bottom() - 1.0 {
+                    p.hline(r.x_range(), y, st);
+                    y += step;
+                }
+            }
+            Squares => {
+                let mut y = r.top() + step;
+                while y < r.bottom() - 1.0 {
+                    p.hline(r.x_range(), y, st);
+                    y += step;
+                }
+                let mut x = r.left() + step;
+                while x < r.right() - 1.0 {
+                    p.vline(x, r.y_range(), st);
+                    x += step;
+                }
+            }
+            Dots => {
+                let mut y = r.top() + step;
+                while y < r.bottom() - 1.0 {
+                    let mut x = r.left() + step;
+                    while x < r.right() - 1.0 {
+                        p.circle_filled(egui::pos2(x, y), 1.3, col);
+                        x += step;
+                    }
+                    y += step;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Dibuja el contenido (trazos) de una pagina ajustado a un rectangulo (recortado a el).
+    fn draw_preview_page(p: &egui::Painter, r: egui::Rect, page: &PreviewPage) {
+        let (strokes, bounds) = page;
+        let Some((mn, mx)) = bounds else { return };
+        let avail = r.shrink(r.width().min(r.height()) * 0.07);
+        let bw = (mx.x - mn.x).max(1.0);
+        let bh = (mx.y - mn.y).max(1.0);
+        let s = (avail.width() / bw).min(avail.height() / bh);
+        let bcx = (mn.x + mx.x) * 0.5;
+        let bcy = (mn.y + mx.y) * 0.5;
+        let rc = avail.center();
+        let pp = p.with_clip_rect(r);
+        for (pts, col, w) in strokes {
+            if pts.len() < 2 {
+                continue;
+            }
+            let c = egui::Color32::from_rgba_unmultiplied(
+                (col[0] * 255.0) as u8,
+                (col[1] * 255.0) as u8,
+                (col[2] * 255.0) as u8,
+                (col[3] * 255.0) as u8,
+            );
+            let sw = (w * s).max(0.6);
+            let line: Vec<egui::Pos2> = pts
+                .iter()
+                .map(|q| egui::pos2(rc.x + (q.x - bcx) * s, rc.y + (q.y - bcy) * s))
+                .collect();
+            pp.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
+        }
     }
 
     /// Deshace la ULTIMA operacion de dibujo (procedural, de pincel PS o de goma), en orden.
@@ -3242,73 +3296,92 @@ impl ApplicationHandler for App {
                         // dibujamos la PAGINA con su contenido (a la derecha) que "se abre".
                         if self.preview_idx.is_some() {
                             let ppp = ctx.pixels_per_point().max(0.01);
-                            let vp = self.camera.viewport;
+                            let vw = self.camera.viewport.x / ppp;
+                            let vh = self.camera.viewport.y / ppp;
                             let tt = self.preview_t.clamp(0.0, 1.0);
-                            let t = tt * tt * (3.0 - 2.0 * tt); // acercarse (libro)
-                            let lerp = |a: f32, b: f32| a + (b - a) * t;
-                            // Pose del libro (igual que build_preview_book) para anclar la pagina.
-                            let (fc, fh) = self.preview_from;
-                            let hh = (vp.y * 0.33).clamp(150.0, 760.0);
-                            let hw = hh * (188.0 / 263.0);
-                            let book_cx = lerp(fc.x, vp.x * 0.34);
-                            let book_hx = lerp(fh.x, hw);
-                            let book_hy = lerp(fh.y, hh);
-                            let cy = lerp(fc.y, vp.y * 0.5);
-                            // ABRIRSE: la pagina se despliega DESPUES de que el libro casi llego.
-                            let to_raw = ((tt - 0.45) / 0.55).clamp(0.0, 1.0);
-                            let to = to_raw * to_raw * (3.0 - 2.0 * to_raw);
-                            let page_h = book_hy * 1.9;
-                            let page_left = book_cx + book_hx * 0.85;
-                            let page_w = (vp.x * 0.33) * to;
-                            let top = cy - page_h * 0.5;
-                            let page = egui::Rect::from_min_size(
-                                egui::pos2(page_left / ppp, top / ppp),
-                                egui::vec2(page_w / ppp, page_h / ppp),
+                            let zoom = tt * tt * (3.0 - 2.0 * tt); // acercarse (suave)
+                            let (fc, fh) = self.preview_from; // carta de origen (px fisicos)
+                            let lerp = |a: f32, b: f32| a + (b - a) * zoom;
+                            let kind = self.preview_grid_kind();
+                            // Tapa (color segun acento) y si es de espiral, para la encuadernacion.
+                            let (cover_col, is_spiral) = self
+                                .preview_idx
+                                .and_then(|i| self.notebooks.get(i))
+                                .map(|n| {
+                                    let a = accent_color(n.accent);
+                                    let cv = |c: f32| ((0.10 + c * 0.20) * 255.0) as u8;
+                                    (egui::Color32::from_rgb(cv(a[0]), cv(a[1]), cv(a[2])), n.shape == 3)
+                                })
+                                .unwrap_or((egui::Color32::from_rgb(30, 28, 34), false));
+                            // LIBRETA ABIERTA: doble pagina centrada, que crece desde su carta.
+                            let ph_t = (vh * 0.62).clamp(180.0, 880.0);
+                            let pw_t = ph_t * 0.74;
+                            let g_t = ph_t * 0.02;
+                            let cur_h = lerp(fh.y * 2.0 / ppp, ph_t);
+                            let scale = (cur_h / ph_t).max(0.001);
+                            let cur_pw = pw_t * scale;
+                            let cur_g = g_t * scale;
+                            let cx = lerp(fc.x / ppp, vw * 0.5);
+                            let cy = lerp(fc.y / ppp, vh * 0.52);
+                            let hh2 = cur_h * 0.5;
+                            let lpage = egui::Rect::from_min_max(
+                                egui::pos2(cx - cur_pw - cur_g * 0.5, cy - hh2),
+                                egui::pos2(cx - cur_g * 0.5, cy + hh2),
                             );
+                            let rpage = egui::Rect::from_min_max(
+                                egui::pos2(cx + cur_g * 0.5, cy - hh2),
+                                egui::pos2(cx + cur_g * 0.5 + cur_pw, cy + hh2),
+                            );
+                            let spread = egui::Rect::from_min_max(lpage.min, rpage.max);
+                            let border = 11.0 * scale;
                             let painter = ui.painter().clone();
-                            painter.rect_filled(page.expand(3.0), 6.0, egui::Color32::from_black_alpha(70));
-                            painter.rect_filled(page, 4.0, egui::Color32::from_rgb(247, 246, 242));
-                            if to > 0.12 {
-                                if let Some((strokes, bounds)) = self.preview_pages.get(self.preview_page) {
-                                    if let Some((mn, mx)) = bounds {
-                                        let avail = page.shrink(14.0);
-                                        let bw = (mx.x - mn.x).max(1.0);
-                                        let bh = (mx.y - mn.y).max(1.0);
-                                        let s = (avail.width() / bw).min(avail.height() / bh);
-                                        let bcx = (mn.x + mx.x) * 0.5;
-                                        let bcy = (mn.y + mx.y) * 0.5;
-                                        let rc = avail.center();
-                                        let pp = painter.with_clip_rect(page);
-                                        for (pts, col, w) in strokes {
-                                            if pts.len() < 2 {
-                                                continue;
-                                            }
-                                            let c = egui::Color32::from_rgba_unmultiplied(
-                                                (col[0] * 255.0) as u8,
-                                                (col[1] * 255.0) as u8,
-                                                (col[2] * 255.0) as u8,
-                                                (col[3] * 255.0) as u8,
-                                            );
-                                            let sw = (w * s).max(0.6);
-                                            let line: Vec<egui::Pos2> = pts
-                                                .iter()
-                                                .map(|p| egui::pos2(rc.x + (p.x - bcx) * s, rc.y + (p.y - bcy) * s))
-                                                .collect();
-                                            pp.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
-                                        }
-                                    } else {
-                                        painter.text(
-                                            page.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            "(página en blanco)",
-                                            egui::FontId::proportional(15.0),
-                                            egui::Color32::from_gray(160),
-                                        );
-                                    }
+                            // Sombra del libro abierto.
+                            painter.rect_filled(
+                                spread.expand(border).translate(egui::vec2(0.0, 12.0 * scale)),
+                                10.0,
+                                egui::Color32::from_black_alpha(90),
+                            );
+                            // Tapa (borde de material alrededor de las hojas).
+                            painter.rect_filled(spread.expand(border), 8.0, cover_col);
+                            // Hojas (papel crema) con su CUADRICULA.
+                            let paper = egui::Color32::from_rgb(248, 247, 243);
+                            painter.rect_filled(lpage, 2.0, paper);
+                            painter.rect_filled(rpage, 2.0, paper);
+                            Self::draw_preview_grid(&painter, lpage, kind);
+                            Self::draw_preview_grid(&painter, rpage, kind);
+                            // Contenido: pagina ACTUAL a la derecha; la anterior a la izquierda.
+                            let cur = self.preview_page;
+                            if let Some(pg) = self.preview_pages.get(cur) {
+                                Self::draw_preview_page(&painter, rpage, pg);
+                            }
+                            if cur > 0 {
+                                if let Some(pg) = self.preview_pages.get(cur - 1) {
+                                    Self::draw_preview_page(&painter, lpage, pg);
                                 }
                             }
+                            // Encuadernacion central: sombra del lomo + espiral si corresponde.
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(cx - cur_g * 0.5, cy - hh2),
+                                    egui::pos2(cx + cur_g * 0.5, cy + hh2),
+                                ),
+                                0.0,
+                                egui::Color32::from_black_alpha(55),
+                            );
+                            if is_spiral {
+                                let rings = (cur_h / (22.0 * scale)).clamp(6.0, 40.0) as i32;
+                                for k in 0..rings {
+                                    let y = cy - hh2 + (k as f32 + 0.5) / rings as f32 * cur_h;
+                                    painter.circle_stroke(
+                                        egui::pos2(cx, y),
+                                        cur_g * 0.9,
+                                        egui::Stroke::new(2.0 * scale, egui::Color32::from_rgb(200, 205, 212)),
+                                    );
+                                }
+                            }
+                            // Nombre arriba, pie abajo.
                             painter.text(
-                                egui::pos2((vp.x * 0.5) / ppp, (top - 26.0) / ppp),
+                                egui::pos2(cx, cy - hh2 - border - 16.0),
                                 egui::Align2::CENTER_CENTER,
                                 &self.preview_name,
                                 egui::FontId::proportional(20.0),
@@ -3318,14 +3391,13 @@ impl ApplicationHandler for App {
                             let foot = if npages > 1 {
                                 format!(
                                     "Pág {} / {}   ·   rueda o ← → para pasar   ·   Esc o clic para cerrar",
-                                    self.preview_page + 1,
-                                    npages
+                                    cur + 1, npages
                                 )
                             } else {
                                 "Esc o clic para cerrar".to_string()
                             };
                             painter.text(
-                                egui::pos2((vp.x * 0.5) / ppp, (top + page_h + 18.0) / ppp),
+                                egui::pos2(cx, cy + hh2 + border + 16.0),
                                 egui::Align2::CENTER_CENTER,
                                 foot,
                                 egui::FontId::proportional(13.0),
@@ -4100,7 +4172,8 @@ impl ApplicationHandler for App {
                 let cards = if !in_library {
                     Vec::new()
                 } else if self.preview_idx.is_some() {
-                    self.build_preview_book()
+                    // La VISTA PREVIA (libreta abierta) se dibuja entera con egui (abajo).
+                    Vec::new()
                 } else if self.creating_nb {
                     self.build_preview_card()
                 } else {
