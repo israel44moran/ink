@@ -2616,6 +2616,7 @@ impl ApplicationHandler for App {
             if let Ok(h) = window.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
                     pen_win::install(w.hwnd.get());
+                    set_dark_titlebar(w.hwnd.get()); // barra de titulo oscura (sin corte de color)
                 }
             }
         }
@@ -3468,39 +3469,28 @@ impl ApplicationHandler for App {
                             ui.painter().rect_filled(bar, egui::CornerRadius::same(2), egui::Color32::from_rgb(120, 112, 255));
                             ui.add_space(12.0);
                             ui.vertical(|ui| {
-                                ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").size(30.0).strong().color(egui::Color32::from_gray(242))).selectable(false));
-                                ui.add(egui::Label::new(egui::RichText::new("Tu biblioteca de cuadernos y notas").size(13.0).color(egui::Color32::from_gray(148))).selectable(false));
+                                ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(egui::FontId::new(30.0, egui::FontFamily::Name("inter_sb".into()))).color(egui::Color32::from_gray(244))).selectable(false));
+                                ui.add(egui::Label::new(egui::RichText::new("Tu biblioteca de cuadernos y notas").size(13.0).color(egui::Color32::from_gray(150))).selectable(false));
                             });
                         });
                         ui.add_space(16.0);
                         if !self.creating_nb {
-                            // Botones: primario (acento) + secundario + Ajustes (a la derecha, fantasma).
+                            // Botones "pill" con iconos vectoriales: primario (acento) + secundario
+                            // + Ajustes (fantasma, a la derecha).
                             let accent = egui::Color32::from_rgb(108, 99, 255);
-                            let r = egui::CornerRadius::same(10);
-                            let bh = egui::vec2(0.0, 36.0);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                if ui
-                                    .add(egui::Button::new(egui::RichText::new("＋  Nuevo cuaderno").color(egui::Color32::WHITE).strong())
-                                        .fill(accent).corner_radius(r).min_size(bh))
-                                    .clicked()
-                                {
+                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, accent, egui::Color32::WHITE, None).clicked() {
                                     lib_open_new = true;
                                 }
-                                if ui
-                                    .add(egui::Button::new(egui::RichText::new("🗒  Nota rápida").color(egui::Color32::from_gray(228)))
-                                        .fill(egui::Color32::from_rgb(44, 46, 58)).corner_radius(r).min_size(bh))
+                                if pill_button(ui, "Nota rápida", BtnIcon::Note, egui::Color32::from_rgb(44, 46, 58), egui::Color32::from_gray(228), None)
                                     .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
                                     .clicked()
                                 {
                                     lib_quick_note = true;
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui
-                                        .add(egui::Button::new(egui::RichText::new("⚙  Ajustes").color(egui::Color32::from_gray(195)))
-                                            .fill(egui::Color32::TRANSPARENT).corner_radius(r).min_size(bh))
-                                        .clicked()
-                                    {
+                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, egui::Color32::TRANSPARENT, egui::Color32::from_gray(200), Some(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28))).clicked() {
                                         lib_toggle_tweaks = true;
                                     }
                                 });
@@ -4337,30 +4327,35 @@ fn smoothing_string_radius_px(smoothing: f32) -> f32 {
 /// Carga una fuente profesional y legible (Segoe UI / alternativas del sistema) como fuente
 /// por defecto de TODA la interfaz; mantiene las de respaldo de egui para los iconos/emoji.
 fn setup_fonts(ctx: &egui::Context) {
-    let candidates = [
-        "C:/Windows/Fonts/segoeui.ttf",
-        "C:/Windows/Fonts/SegoeUI-VF.ttf",
-        "C:/Windows/Fonts/calibri.ttf",
-        "/Library/Fonts/SF-Pro.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("ui".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                fam.insert(0, "ui".to_owned());
-            }
-            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                fam.insert(0, "ui".to_owned());
-            }
-            ctx.set_fonts(fonts);
-            return;
-        }
+    use std::sync::Arc;
+    let mut fonts = egui::FontDefinitions::default();
+    // Fuente principal: INTER (incrustada) — limpia y profesional. SemiBold para titulos.
+    fonts.font_data.insert(
+        "inter".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))),
+    );
+    fonts.font_data.insert(
+        "inter_sb".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
+    );
+    // Respaldo del sistema (acentos/glifos que falten): Segoe UI / Calibri / DejaVu.
+    let fallback = ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/calibri.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok());
+    if let Some(bytes) = fallback {
+        fonts.font_data.insert("ui_fallback".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
     }
+    // Proporcional: Inter primero; luego los de egui (emoji) + el respaldo del sistema al final.
+    let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+    prop.insert(0, "inter".to_owned());
+    if fonts.font_data.contains_key("ui_fallback") {
+        prop.push("ui_fallback".to_owned());
+    }
+    // Familia SemiBold (titulos del Home): Inter SemiBold con Inter como respaldo.
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("inter_sb".into()), vec!["inter_sb".to_owned(), "inter".to_owned()]);
+    ctx.set_fonts(fonts);
 }
 
 /// Diseños FOIL (id, nombre) que se eligen como carátula base.
@@ -4574,6 +4569,114 @@ fn accent_color(accent: u32) -> [f32; 3] {
         7 => [0.35, 0.55, 1.00], // Azul
         _ => [0.95, 0.95, 0.97], // Blanco (B&N)
     }
+}
+
+/// Oscurece la barra de TITULO de la ventana (Windows 11) para que combine con el Home y no
+/// haya un corte de color abrupto: modo oscuro + color de barra/borde = fondo de la app.
+#[cfg(windows)]
+fn set_dark_titlebar(hwnd: isize) {
+    use windows::Win32::Foundation::{BOOL, COLORREF, HWND};
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let cap = COLORREF(0x001C_1412); // 0x00BBGGRR -> RGB(18,20,28), parte superior del degradado
+    unsafe {
+        let dark = BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const core::ffi::c_void,
+            4,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &cap as *const _ as *const core::ffi::c_void,
+            4,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &cap as *const _ as *const core::ffi::c_void,
+            4,
+        );
+    }
+}
+
+/// Icono vectorial (dibujado, no depende de glifos de fuente) para los botones del Home.
+#[derive(Clone, Copy, PartialEq)]
+enum BtnIcon {
+    Plus,    // nuevo
+    Note,    // hoja con renglones (nota rapida)
+    Sliders, // ajustes
+}
+
+fn draw_btn_icon(p: &egui::Painter, icon: BtnIcon, c: egui::Pos2, col: egui::Color32) {
+    let st = egui::Stroke::new(1.7, col);
+    match icon {
+        BtnIcon::Plus => {
+            p.line_segment([egui::pos2(c.x - 6.0, c.y), egui::pos2(c.x + 6.0, c.y)], egui::Stroke::new(2.0, col));
+            p.line_segment([egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 6.0)], egui::Stroke::new(2.0, col));
+        }
+        BtnIcon::Note => {
+            let r = egui::Rect::from_center_size(c, egui::vec2(11.0, 14.0));
+            p.rect_stroke(r, egui::CornerRadius::same(2), st, egui::StrokeKind::Inside);
+            for k in 0..3 {
+                let y = r.top() + 4.0 + k as f32 * 3.4;
+                p.line_segment([egui::pos2(r.left() + 2.6, y), egui::pos2(r.right() - 2.6, y)], egui::Stroke::new(1.0, col));
+            }
+        }
+        BtnIcon::Sliders => {
+            let (y1, y2) = (c.y - 3.6, c.y + 3.6);
+            p.line_segment([egui::pos2(c.x - 7.0, y1), egui::pos2(c.x + 7.0, y1)], st);
+            p.line_segment([egui::pos2(c.x - 7.0, y2), egui::pos2(c.x + 7.0, y2)], st);
+            p.circle_filled(egui::pos2(c.x + 2.5, y1), 2.4, col);
+            p.circle_filled(egui::pos2(c.x - 2.5, y2), 2.4, col);
+        }
+    }
+}
+
+/// Botón "pill" minimalista (fondo redondeado + icono vectorial + texto), con hover.
+/// `fill`=fondo (TRANSPARENT para fantasma), `border`=borde opcional.
+fn pill_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    icon: BtnIcon,
+    fill: egui::Color32,
+    text_col: egui::Color32,
+    border: Option<egui::Color32>,
+) -> egui::Response {
+    let font = egui::FontId::proportional(14.5);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, text_col);
+    let (icon_w, pad, gap) = (18.0_f32, 15.0_f32, 8.0_f32);
+    let w = pad * 2.0 + icon_w + gap + galley.size().x;
+    let h = 38.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let hovered = resp.hovered();
+    let p = ui.painter();
+    let lighten = |c: egui::Color32, a: u8| {
+        egui::Color32::from_rgba_unmultiplied(
+            c.r().saturating_add(a),
+            c.g().saturating_add(a),
+            c.b().saturating_add(a),
+            c.a().max(if c.a() == 0 { 26 } else { c.a() }),
+        )
+    };
+    let bg = if hovered { lighten(fill, 22) } else { fill };
+    if bg.a() > 0 {
+        p.rect_filled(rect, egui::CornerRadius::same(10), bg);
+    }
+    if let Some(bc) = border {
+        p.rect_stroke(rect, egui::CornerRadius::same(10), egui::Stroke::new(1.0, bc), egui::StrokeKind::Inside);
+    }
+    let ic = egui::pos2(rect.left() + pad + icon_w * 0.5, rect.center().y);
+    draw_btn_icon(p, icon, ic, text_col);
+    let tx = rect.left() + pad + icon_w + gap;
+    let ty = rect.center().y - galley.size().y * 0.5;
+    p.galley(egui::pos2(tx, ty), galley, text_col);
+    resp
 }
 
 fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
