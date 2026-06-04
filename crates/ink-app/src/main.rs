@@ -273,6 +273,9 @@ struct App {
     current_overhang: f32,
     /// Textura del material del cuaderno abierto.
     current_texture: u32,
+    /// Color de todo el cuaderno abierto (para finish 800 solido / 801 degradado).
+    current_cover_a: [f32; 3],
+    current_cover_b: [f32; 3],
     /// Paginas del cuaderno abierto (la pagina activa esta volcada en doc/texts/...).
     pages: Vec<notebook::PageData>,
     /// Indice de la pagina activa.
@@ -297,6 +300,9 @@ struct App {
     new_nb_overhang: f32,
     /// Textura del material elegida para el cuaderno nuevo.
     new_nb_texture: u32,
+    /// Color (COPIC) elegido para el cuaderno nuevo (finish 800 solido / 801 degradado).
+    new_nb_cover_a: [f32; 3],
+    new_nb_cover_b: [f32; 3],
     /// Ajustes GLOBALES (panel Tweaks): pose en el estante e interaccion.
     lib_tweaks: notebook::LibTweaks,
     /// Panel de Tweaks (ajustes globales) abierto.
@@ -421,6 +427,8 @@ impl App {
             current_thickness: 1.0,
             current_overhang: 1.0,
             current_texture: 0,
+            current_cover_a: [1.0, 1.0, 1.0],
+            current_cover_b: [1.0, 1.0, 1.0],
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
             lock_page: false,
@@ -435,6 +443,8 @@ impl App {
             new_nb_thickness: 1.0,
             new_nb_overhang: 1.0,
             new_nb_texture: 0,
+            new_nb_cover_a: [1.0, 1.0, 1.0],
+            new_nb_cover_b: [1.0, 1.0, 1.0],
             lib_tweaks: notebook::load_tweaks(),
             show_tweaks: false,
             creating_nb: false,
@@ -885,6 +895,8 @@ impl App {
         self.current_thickness = nb.thickness;
         self.current_overhang = nb.overhang;
         self.current_texture = nb.texture;
+        self.current_cover_a = nb.cover_a;
+        self.current_cover_b = nb.cover_b;
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -919,6 +931,8 @@ impl App {
         nb.thickness = self.current_thickness;
         nb.overhang = self.current_overhang;
         nb.texture = self.current_texture;
+        nb.cover_a = self.current_cover_a;
+        nb.cover_b = self.current_cover_b;
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -943,6 +957,8 @@ impl App {
         nb.thickness = self.new_nb_thickness;
         nb.overhang = self.new_nb_overhang;
         nb.texture = self.new_nb_texture;
+        nb.cover_a = self.new_nb_cover_a;
+        nb.cover_b = self.new_nb_cover_b;
         let path = notebook::path_for(name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
@@ -1330,6 +1346,8 @@ impl App {
             self.new_nb_thickness = nb.thickness;
             self.new_nb_overhang = nb.overhang;
             self.new_nb_texture = nb.texture;
+            self.new_nb_cover_a = nb.cover_a;
+            self.new_nb_cover_b = nb.cover_b;
             self.editing_nb = Some(nb.path.clone());
             self.creating_nb = true;
         }
@@ -1347,6 +1365,8 @@ impl App {
             nb.thickness = self.new_nb_thickness;
             nb.overhang = self.new_nb_overhang;
             nb.texture = self.new_nb_texture;
+            nb.cover_a = self.new_nb_cover_a;
+            nb.cover_b = self.new_nb_cover_b;
             let _ = notebook::save(&nb, path);
         }
         self.notebooks = notebook::list();
@@ -1360,6 +1380,8 @@ impl App {
             self.current_thickness = self.new_nb_thickness;
             self.current_overhang = self.new_nb_overhang;
             self.current_texture = self.new_nb_texture;
+            self.current_cover_a = self.new_nb_cover_a;
+            self.current_cover_b = self.new_nb_cover_b;
         }
     }
 
@@ -1412,8 +1434,18 @@ impl App {
             // Hoja: muy fina (papel); cuaderno: grosor segun su forma.
             let depth = if is_sheet { 0.012 } else { df * nb.map_or(1.0, |n| n.thickness) };
             let overh = if is_sheet { 0.0 } else { ohf * nb.map_or(1.0, |n| n.overhang) };
-            let base = finish_base_color(finish);
-            let ac = accent_color(accent);
+            // Color de TODO el cuaderno (COPIC): finish 800 = solido (cover_a); 801 = degradado
+            // (cover_a -> cover_b). Reutiliza los slots base/accent de la instancia.
+            let mut base = finish_base_color(finish);
+            let mut ac = accent_color(accent);
+            if finish == 800 || finish == 801 {
+                if let Some(n) = nb {
+                    base = n.cover_a;
+                    if finish == 801 {
+                        ac = n.cover_b;
+                    }
+                }
+            }
             // FLOTACION: cuando el cursor esta encima (hov>0), el libro flota lentamente -como
             // gravedad cero-: vaiven sutil en rotacion + leve sube/baja. Fase por carta (segun el
             // indice) para que no floten todos sincronizados. Se desvanece con `hov`.
@@ -1460,8 +1492,14 @@ impl App {
     fn build_preview_card(&self) -> Vec<renderer::CardInstance> {
         let (c, h) = self.preview_rect();
         let finish = self.new_nb_finish;
-        let base = finish_base_color(finish);
-        let ac = accent_color(self.new_nb_accent);
+        let mut base = finish_base_color(finish);
+        let mut ac = accent_color(self.new_nb_accent);
+        if finish == 800 || finish == 801 {
+            base = self.new_nb_cover_a;
+            if finish == 801 {
+                ac = self.new_nb_cover_b;
+            }
+        }
         let (df, ohf, bf) = shape_params(self.new_nb_shape);
         let depth = df * self.new_nb_thickness;
         let overh = ohf * self.new_nb_overhang;
@@ -3822,6 +3860,60 @@ impl ApplicationHandler for App {
                                             }
                                         });
                                     });
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                        ui.label(egui::RichText::new("Color · gama COPIC").strong());
+                                        ui.label(egui::RichText::new("Un color (o degradado) para TODO el cuaderno.").size(11.0).color(gray));
+                                        let c32 = |c: [f32; 3]| egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+                                            for &hx in COPIC_SOLIDS {
+                                                let rgb = hexf(hx);
+                                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                                                let sel = self.new_nb_finish == 800 && self.new_nb_cover_a == rgb;
+                                                let p = ui.painter();
+                                                p.rect_filled(rect, egui::CornerRadius::same(5), c32(rgb));
+                                                if sel {
+                                                    p.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+                                                } else if resp.hovered() {
+                                                    p.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(1.5, egui::Color32::from_gray(210)), egui::StrokeKind::Outside);
+                                                }
+                                                if resp.clicked() {
+                                                    self.new_nb_finish = 800;
+                                                    self.new_nb_cover_a = rgb;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(3.0);
+                                        ui.label(egui::RichText::new("Degradados").size(11.0).color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+                                            for &(ha, hb) in COPIC_GRADS {
+                                                let (a, b) = (hexf(ha), hexf(hb));
+                                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 22.0), egui::Sense::click());
+                                                let sel = self.new_nb_finish == 801 && self.new_nb_cover_a == a && self.new_nb_cover_b == b;
+                                                let p = ui.painter();
+                                                let mut mesh = egui::Mesh::default();
+                                                let (ca, cb) = (c32(a), c32(b));
+                                                mesh.colored_vertex(rect.left_top(), ca);
+                                                mesh.colored_vertex(rect.left_bottom(), ca);
+                                                mesh.colored_vertex(rect.right_top(), cb);
+                                                mesh.colored_vertex(rect.right_bottom(), cb);
+                                                mesh.add_triangle(0, 1, 2);
+                                                mesh.add_triangle(2, 1, 3);
+                                                p.add(mesh);
+                                                if sel {
+                                                    p.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+                                                } else if resp.hovered() {
+                                                    p.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(1.5, egui::Color32::from_gray(210)), egui::StrokeKind::Outside);
+                                                }
+                                                if resp.clicked() {
+                                                    self.new_nb_finish = 801;
+                                                    self.new_nb_cover_a = a;
+                                                    self.new_nb_cover_b = b;
+                                                }
+                                            }
+                                        });
                                     ui.add_space(6.0);
                                     ui.separator();
                                     ui.label(egui::RichText::new("Forma del cuaderno").strong());
@@ -4358,6 +4450,41 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Hex 0xRRGGBB -> [f32;3] lineal-de-pantalla (la superficie es WYSIWYG, no-sRGB).
+fn hexf(h: u32) -> [f32; 3] {
+    [
+        ((h >> 16) & 0xFF) as f32 / 255.0,
+        ((h >> 8) & 0xFF) as f32 / 255.0,
+        (h & 0xFF) as f32 / 255.0,
+    ]
+}
+
+/// Gama COPIC curada (hex sRGB aprox., por familias BV/V/RV/R/YR/Y/YG/G/BG/B/E + grises). Valores
+/// aproximados (los marcadores varian al capar). Para el COLOR de todo el cuaderno (finish 800).
+const COPIC_SOLIDS: &[u32] = &[
+    0xECEDF6, 0x9E9FC6, 0x7C74B0, 0x5E4F97, 0x3B3A5E, // BV
+    0xE6C7E0, 0xB98CC8, 0x9C5BA0, 0x6B3A8E, // V
+    0xF6CBD6, 0xF79FB0, 0xE85C8E, 0xC0356E, // RV
+    0xF8C9BC, 0xF59A86, 0xE85B52, 0xC0273A, 0x8E2238, // R
+    0xFBD9B0, 0xF6B25A, 0xF0852E, 0xDA5A1E, // YR
+    0xF7EFB0, 0xF6E45A, 0xF4D000, 0xEAC12A, // Y
+    0xDDE89A, 0xAFD060, 0x6FB23A, 0x4A8E2E, // YG
+    0xBFE3C2, 0x7FCB86, 0x36A85A, 0x1E7A4A, // G
+    0xC6E8E6, 0x7ED0CE, 0x2EB6B0, 0x0E8E96, 0x2A6E7A, // BG
+    0xCFE8F6, 0x8EC6EC, 0x3E9EDC, 0x1E6FC0, 0x224E9E, // B
+    0xF6E6D8, 0xE6C0A0, 0xCF9A6E, 0xA86A44, 0x6E3F26, // E
+    0xEBEDED, 0xC9CFCF, 0x9BA2A2, 0x6E7474, 0x444A4A, 0x1E1C22, // grises + negro
+];
+
+/// Degradados COPIC (par de hex): claro->oscuro por familia + combinaciones vibrantes.
+const COPIC_GRADS: &[(u32, u32)] = &[
+    (0xECEDF6, 0x3B3A5E), (0xE6C7E0, 0x6B3A8E), (0xF6CBD6, 0xC0356E), (0xF8C9BC, 0x8E2238),
+    (0xFBD9B0, 0xDA5A1E), (0xF7EFB0, 0xF4D000), (0xDDE89A, 0x4A8E2E), (0xBFE3C2, 0x1E7A4A),
+    (0xC6E8E6, 0x0E8E96), (0xCFE8F6, 0x224E9E), (0xF6E6D8, 0x6E3F26), (0xEBEDED, 0x1E1C22),
+    (0xF6E45A, 0xE85B52), (0x7ED0CE, 0x1E6FC0), (0xF79FB0, 0x6B3A8E), (0xAFD060, 0x1E7A4A),
+    (0x8EC6EC, 0x9C5BA0), (0xF6B25A, 0xC0273A),
+];
+
 /// Diseños FOIL (id, nombre) que se eligen como carátula base.
 const FOIL_DESIGNS: [(u32, &str); 12] = [
     (0, "Mate"), (1, "Holográfico"), (2, "Galaxia"), (3, "Oro"), (4, "Prisma"), (5, "Destellos"),
@@ -4547,6 +4674,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if (800..900).contains(&f) => [0.6, 0.6, 0.6], // Color solido/degradado (lo fija la instancia)
         f if f >= 600 => [0.03, 0.035, 0.05], // Figuras 3D: fondo oscuro
         f if f >= 500 => [0.97, 0.97, 0.95], // Nota rapida (hoja de papel): casi blanco
         f if f >= 400 => [0.02, 0.02, 0.04], // Arcade y demos: fondo oscuro

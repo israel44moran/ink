@@ -23,6 +23,10 @@ fn default_one() -> f32 {
     1.0
 }
 
+fn default_white3() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
 /// Una pagina (hoja) del cuaderno: su propio dibujo, texto y borrados. Un cuaderno
 /// infinito tiene UNA pagina (el espacio infinito); uno de hojas tiene varias.
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,6 +89,12 @@ pub struct NotebookData {
     /// Se aplica sobre la portada (foils) y sobre las figuras 3D.
     #[serde(default)]
     pub texture: u32,
+    /// Color de TODO el cuaderno cuando el diseño es color solido (finish 800) o degradado (801):
+    /// `cover_a` = color principal (solido / inicio del degradado), `cover_b` = fin del degradado.
+    #[serde(default = "default_white3")]
+    pub cover_a: [f32; 3],
+    #[serde(default = "default_white3")]
+    pub cover_b: [f32; 3],
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -115,6 +125,8 @@ impl NotebookData {
             thickness: 1.0,
             overhang: 1.0,
             texture: 0,
+            cover_a: [1.0, 1.0, 1.0],
+            cover_b: [1.0, 1.0, 1.0],
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -152,6 +164,8 @@ pub struct NotebookEntry {
     pub thickness: f32,
     pub overhang: f32,
     pub texture: u32,
+    pub cover_a: [f32; 3],
+    pub cover_b: [f32; 3],
     pub path: PathBuf,
 }
 
@@ -267,6 +281,8 @@ pub fn list() -> Vec<NotebookEntry> {
                         thickness: nb.thickness,
                         overhang: nb.overhang,
                         texture: nb.texture,
+                        cover_a: nb.cover_a,
+                        cover_b: nb.cover_b,
                         path: p,
                     });
                 }

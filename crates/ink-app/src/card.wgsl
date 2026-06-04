@@ -978,6 +978,17 @@ fn paper_dir(uv: vec2<f32>, asp: f32, ang: f32, n: f32) -> f32 {
     return smoothstep(0.45, 0.5, abs(fract(proj) - 0.5));
 }
 
+// Color COPIC de todo el cuaderno: solido (fin 800 -> base) o degradado diagonal (801 -> base..accent).
+fn copic_color(fin: i32, uv: vec2<f32>, base: vec3<f32>, accent: vec3<f32>) -> vec3<f32> {
+    if (fin == 801) {
+        let g = clamp(uv.x * 0.5 + uv.y * 0.5, 0.0, 1.0);
+        var c = mix(base, accent, g);
+        c = c + (hash21(uv * 911.0) - 0.5) * 0.01; // leve dither anti-banding
+        return c;
+    }
+    return base;
+}
+
 fn cover_color(in: VsOut) -> vec3<f32> {
     let h = in.hover;
     let t = in.time;
@@ -989,7 +1000,10 @@ fn cover_color(in: VsOut) -> vec3<f32> {
     let gd = distance(in.uv, in.pointer);
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
-    if (fin >= 600) {
+    if (fin >= 800) {
+        // ---------------- COLOR COPIC: todo el cuaderno de un color (800) o degradado (801) ----------------
+        col = copic_color(fin, in.uv, in.base, in.accent);
+    } else if (fin >= 600) {
         // ---------------- FIGURAS 3D: solido raymarcheado que gira (con textura opcional) ----------------
         var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
         p.y = p.y * in.aspect;
@@ -1203,10 +1217,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             col = mix(col, vec3<f32>(0.11, 0.10, 0.13), elastic * 0.85);
         }
     } else if (face == 1) {
-        // Reverso: si hay TEXTURA, el material envuelve TODO el cuaderno (cuaderno real); si no,
-        // carton oscuro. Encima, una "cinta de masquin" beige para el nombre (lo dibuja la UI).
-        let tex1 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
-        if (tex1 > 0) {
+        // Reverso: color COPIC (todo el cuaderno), o material si hay textura, o carton oscuro.
+        // Encima, una "cinta de masquin" beige para el nombre (lo dibuja la UI).
+        let finb = i32(round(in.finish));
+        let tex1 = select(0, i32(round(in.texture)), finb < 100);
+        if (finb >= 800) {
+            col = copic_color(finb, in.uv, in.base, in.accent);
+        } else if (tex1 > 0) {
             col = material_at(tex1, in.uv * vec2<f32>(1.0, in.aspect));
         } else {
             col = vec3<f32>(0.15, 0.13, 0.12);
@@ -1216,9 +1233,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let tcol = vec3<f32>(0.86, 0.80, 0.62) * (0.96 + 0.04 * sin(in.uv.x * 70.0));
         col = mix(col, tcol, tape);
     } else if (face == 3) {
-        // LOMO (encuadernacion). Con textura, el lomo tambien es del material.
-        let tex3 = select(0, i32(round(in.texture)), i32(round(in.finish)) < 100);
-        if (tex3 > 0 && shp != 3) {
+        // LOMO (encuadernacion). Color COPIC / material / por defecto. La espiral siempre va.
+        let finb = i32(round(in.finish));
+        let tex3 = select(0, i32(round(in.texture)), finb < 100);
+        if (finb >= 800 && shp != 3) {
+            col = copic_color(finb, in.uv, in.base, in.accent);
+        } else if (tex3 > 0 && shp != 3) {
             col = material_at(tex3, in.uv * vec2<f32>(1.0, in.aspect));
         } else if (shp == 3) {
             // ESPIRAL: anillos metalicos a lo largo del lomo (uv.x recorre el largo del lomo).
