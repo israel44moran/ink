@@ -305,8 +305,11 @@ struct App {
     card_rects: Vec<(f32, f32, f32, f32)>,
     /// Desplazamiento vertical de la cuadricula de cartas (rueda).
     card_scroll: f32,
-    /// Angulo de volteo (rad, 0=portada, PI=reverso) de cada cuaderno (rueda sobre el).
+    /// Angulo de volteo ANIMADO (rad, 0=portada, PI=reverso) de cada cuaderno (se suaviza hacia
+    /// `card_flip_target`).
     card_flip: Vec<f32>,
+    /// Objetivo de volteo de cada cuaderno (lo fija la rueda); el valor animado lo persigue suave.
+    card_flip_target: Vec<f32>,
     /// Arrastre de cartas en la biblioteca: indice agarrado, punto inicial y si ya se arrastra.
     drag_idx: Option<usize>,
     drag_start: Vec2,
@@ -418,6 +421,7 @@ impl App {
             card_rects: Vec::new(),
             card_scroll: 0.0,
             card_flip: Vec::new(),
+            card_flip_target: Vec::new(),
             drag_idx: None,
             drag_start: Vec2::ZERO,
             dragging: false,
@@ -917,6 +921,7 @@ impl App {
         self.card_scroll = 0.0;
         self.card_anim.clear();
         self.card_flip.clear();
+        self.card_flip_target.clear();
         self.creating_nb = false;
         self.editing_nb = None;
         self.drag_idx = None;
@@ -944,7 +949,7 @@ impl App {
         let total_w = cols as f32 * cw + cols.saturating_sub(1) as f32 * gap;
         let x0 = (usable - total_w) * 0.5 + cw * 0.5;
         let top = 300.0; // bajo las cartas para no solaparse con la cabecera/separador
-        let row_h = ch + gap + 26.0; // espacio extra para el nombre bajo cada carta
+        let row_h = ch + gap + 96.0; // espacio para el nombre (hasta 3 renglones) bajo la carta
         (0..n)
             .map(|i| {
                 let (col, row) = (i % cols, i / cols);
@@ -960,6 +965,7 @@ impl App {
     fn update_card_anim(&mut self, layout: &[(Vec2, Vec2)]) {
         self.card_anim.resize(layout.len(), [0.0, 0.0, 0.0]);
         self.card_flip.resize(layout.len(), 0.0);
+        self.card_flip_target.resize(layout.len(), 0.0);
         let cur = self.cursor;
         // Inclinacion BASE (siempre, para que se note el grosor 3D del cuaderno) + un rango
         // mayor al pasar el cursor (la carta "se mueve mas").
@@ -996,6 +1002,11 @@ impl App {
             a[0] += (t_hover - a[0]) * k;
             a[1] += (t_rotx - a[1]) * k;
             a[2] += (t_roty - a[2]) * k;
+            // Volteo MUY suave (sin "gravedad"): el angulo persigue su objetivo con un paso
+            // pequeño cada frame -> giro fluido (60/120 fps) en vez de a saltos.
+            let f = self.card_flip[i];
+            let ft = self.card_flip_target[i];
+            self.card_flip[i] = f + (ft - f) * 0.10;
         }
         self.card_rects = layout.iter().map(|(c, h)| (c.x, c.y, h.x, h.y)).collect();
     }
@@ -1008,12 +1019,12 @@ impl App {
             .position(|&(cx, cy, hx, hy)| (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy)
     }
 
-    /// Indice del cuaderno cuyo NOMBRE (texto bajo la carta) esta bajo el cursor.
+    /// Indice del cuaderno cuyo NOMBRE (texto bajo la carta, hasta 3 renglones) esta bajo el
+    /// cursor.
     fn library_name_at(&self) -> Option<usize> {
         let cur = self.cursor;
         self.card_rects.iter().position(|&(cx, cy, hx, hy)| {
-            let ny = cy + hy + 17.0; // centro del nombre, justo bajo la carta
-            (cur.x - cx).abs() <= hx && (cur.y - ny).abs() <= 16.0
+            (cur.x - cx).abs() <= hx && cur.y >= cy + hy + 16.0 && cur.y <= cy + hy + 118.0
         })
     }
 
@@ -1058,6 +1069,7 @@ impl App {
         self.notebooks = notebook::list();
         self.card_anim.clear();
         self.card_flip.clear();
+        self.card_flip_target.clear();
     }
 
     /// Zona de la PAPELERA unica (centro y radio, en px): arrastra una carta aqui para borrarla.
@@ -1080,6 +1092,7 @@ impl App {
             self.notebooks = notebook::list();
             self.card_anim.clear();
             self.card_flip.clear();
+            self.card_flip_target.clear();
         }
     }
 
@@ -1117,6 +1130,7 @@ impl App {
         self.notebooks = notebook::list();
         self.card_anim.clear();
         self.card_flip.clear();
+        self.card_flip_target.clear();
     }
 
     /// Abre el panel para EDITAR la carátula del cuaderno `i` (clic derecho): carga sus
@@ -2471,10 +2485,11 @@ impl ApplicationHandler for App {
                     // Biblioteca: la rueda SOBRE un cuaderno lo VOLTEA (ver portada/reverso); en
                     // zona vacia desplaza la cuadricula. (Las cartas son wgpu, no widgets egui.)
                     if let Some(i) = self.library_card_at() {
-                        self.card_flip.resize(self.notebooks.len(), 0.0);
-                        if i < self.card_flip.len() {
-                            self.card_flip[i] =
-                                (self.card_flip[i] + amount * 0.6).clamp(0.0, std::f32::consts::PI);
+                        self.card_flip_target.resize(self.notebooks.len(), 0.0);
+                        if i < self.card_flip_target.len() {
+                            // Solo fijamos el OBJETIVO; el giro se anima suave hacia el.
+                            self.card_flip_target[i] =
+                                (self.card_flip_target[i] + amount * 0.6).clamp(0.0, std::f32::consts::PI);
                         }
                     } else {
                         self.card_scroll = (self.card_scroll - amount * 80.0).max(0.0);
@@ -2981,31 +2996,23 @@ impl ApplicationHandler for App {
                                         egui::Color32::from_rgb(55, 45, 30),
                                     );
                                 } else {
-                                    // Nombre BAJO la carta: que no se salga ni invada al vecino;
-                                    // se reduce el tamaño y, si aun es largo, se recorta con elipsis.
-                                    let avail = (2.0 * h.x * 1.1 / ppp).max(40.0);
-                                    let len = name.chars().count().max(1) as f32;
-                                    let size = if len * 15.0 * 0.55 > avail {
-                                        (avail / (len * 0.55)).clamp(9.0, 15.0)
-                                    } else {
-                                        15.0
-                                    };
-                                    let max_chars = (avail / (size * 0.55)).floor() as usize;
-                                    let shown = if name.chars().count() > max_chars && max_chars >= 2 {
-                                        let mut s: String =
-                                            name.chars().take(max_chars.saturating_sub(1)).collect();
-                                        s.push('…');
-                                        s
-                                    } else {
-                                        name.clone()
-                                    };
-                                    lp.text(
-                                        egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
-                                        egui::Align2::CENTER_CENTER,
-                                        shown,
-                                        egui::FontId::proportional(size),
-                                        egui::Color32::from_gray(230),
-                                    );
+                                    // Nombre BAJO la carta: hasta 3 renglones (ajustados), un poco
+                                    // mas abajo para que no lo tape el cuaderno al girar/levantar.
+                                    let size = 13.0_f32;
+                                    let card_w_pts = 2.0 * h.x / ppp;
+                                    let max_chars = (card_w_pts / (size * 0.55)).floor().max(4.0) as usize;
+                                    let lines = wrap_name(name, max_chars, 3);
+                                    let line_h = size * 1.18; // renglones juntos
+                                    let top_y = (c.y + h.y + 28.0) / ppp;
+                                    for (li, ln) in lines.iter().enumerate() {
+                                        lp.text(
+                                            egui::pos2(c.x / ppp, top_y + li as f32 * line_h),
+                                            egui::Align2::CENTER_TOP,
+                                            ln,
+                                            egui::FontId::proportional(size),
+                                            egui::Color32::from_gray(230),
+                                        );
+                                    }
                                 }
                             }
                             // PAPELERA unica: arrastra una carta aqui (y suelta) para borrarla.
@@ -3047,8 +3054,12 @@ impl ApplicationHandler for App {
                             // RENOMBRAR en linea: caja de texto centrada sobre el nombre elegido.
                             if let Some(ri) = self.renaming {
                                 if let Some((c, h)) = card_layout.get(ri) {
-                                    let w = (2.0 * h.x / ppp).clamp(70.0, 240.0);
-                                    let pos = egui::pos2(c.x / ppp, (c.y + h.y + 6.0) / ppp);
+                                    let card_w_pts = 2.0 * h.x / ppp;
+                                    let w = card_w_pts.clamp(70.0, 240.0);
+                                    // Limite de caracteres = lo que cabe en 3 renglones.
+                                    let per_line = (card_w_pts / (13.0 * 0.55)).floor().max(4.0) as usize;
+                                    let char_limit = (per_line * 3).max(12);
+                                    let pos = egui::pos2(c.x / ppp, (c.y + h.y + 22.0) / ppp);
                                     egui::Area::new(egui::Id::new("rename_edit"))
                                         .order(egui::Order::Foreground)
                                         .fixed_pos(pos)
@@ -3057,6 +3068,7 @@ impl ApplicationHandler for App {
                                             let resp = ui.add(
                                                 egui::TextEdit::singleline(&mut self.rename_buf)
                                                     .desired_width(w)
+                                                    .char_limit(char_limit)
                                                     .horizontal_align(egui::Align::Center),
                                             );
                                             if self.rename_focus {
@@ -3682,6 +3694,51 @@ fn shape_params(shape: u32) -> (f32, f32, f32) {
 
 /// Modos de hover (idx). 0=levantar, 1=abrir, 2=girar, 3=sutil.
 const HOVER_NAMES: [&str; 4] = ["Levantar", "Abrir", "Girar", "Sutil"];
+
+/// Parte un nombre en hasta `max_lines` renglones de `max_chars` caracteres (corta por
+/// palabras; parte palabras muy largas; recorta con elipsis si sigue sin caber).
+fn wrap_name(name: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
+    let max_chars = max_chars.max(3);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in name.split_whitespace() {
+        let mut word = word.to_string();
+        while word.chars().count() > max_chars {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            lines.push(word.chars().take(max_chars).collect());
+            word = word.chars().skip(max_chars).collect();
+        }
+        let extra = if cur.is_empty() { 0 } else { 1 };
+        if cur.chars().count() + extra + word.chars().count() <= max_chars {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(&word);
+        } else {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            cur = word;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        let last = lines.last_mut().unwrap();
+        while last.chars().count() > max_chars.saturating_sub(1) {
+            last.pop();
+        }
+        last.push('…');
+    }
+    lines
+}
 
 /// Proyecta un punto LOCAL del cuaderno (caja) a pantalla, replicando la transformacion del
 /// vertex shader (rotacion Y, rotacion X, elevacion por hover y perspectiva). Devuelve
