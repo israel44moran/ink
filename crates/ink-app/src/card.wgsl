@@ -762,7 +762,33 @@ fn cover_color(in: VsOut) -> vec3<f32> {
     let gd = distance(in.uv, in.pointer);
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
-    if (fin >= 400) {
+    if (fin >= 500) {
+        // ---------------- NOTA RAPIDA: hoja de papel (rayas / cuadricula / puntos) ----------------
+        let kind = fin - 500; // 0 = rayas, 1 = cuadricula, 2 = puntos
+        let paper = vec3<f32>(0.95, 0.94, 0.90);
+        let ink = vec3<f32>(0.55, 0.64, 0.78); // azul claro de cuaderno
+        col = paper;
+        let rows = 13.0;
+        if (kind == 0 || kind == 1) {
+            // rayas horizontales
+            let dy = abs(fract(in.uv.y * rows) - 0.5);
+            col = mix(col, ink, smoothstep(0.45, 0.5, dy) * 0.55);
+        }
+        if (kind == 1) {
+            // verticales (cuadricula); ~9 columnas para que salgan casi cuadradas
+            let dx = abs(fract(in.uv.x * 9.0) - 0.5);
+            col = mix(col, ink, smoothstep(0.45, 0.5, dx) * 0.55);
+        }
+        if (kind == 2) {
+            // puntos
+            let f = fract(in.uv * vec2<f32>(9.0, rows)) - vec2<f32>(0.5, 0.5);
+            col = mix(col, ink, smoothstep(0.18, 0.10, length(f)) * 0.6);
+        }
+        if (kind == 0 || kind == 1) {
+            // margen rojo a la izquierda (estilo cuaderno)
+            col = mix(col, vec3<f32>(0.86, 0.45, 0.45), smoothstep(0.012, 0.005, abs(in.uv.x - 0.12)) * 0.55);
+        }
+    } else if (fin >= 400) {
         // ---------------- ARCADE Y DEMOS (retrowave / arcade / generativas) ----------------
         var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
         p.y = p.y * in.aspect;
@@ -879,6 +905,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = i32(round(in.face));
     let shp = i32(round(in.shape));
     var col: vec3<f32>;
+    // NOTA RAPIDA (hoja, finish >= 500): la portada lleva el patron; el resto, papel claro.
+    if (i32(round(in.finish)) >= 500) {
+        if (face == 0) {
+            col = cover_color(in);
+        } else {
+            col = vec3<f32>(0.90, 0.89, 0.85);
+        }
+        var shs = 1.0;
+        if (face == 5) { shs = 0.9; } else if (face == 4) { shs = 1.05; }
+        return vec4<f32>(clamp(col * shs, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
     if (face == 0) {
         // Portada: el diseño/animacion elegido.
         col = cover_color(in);

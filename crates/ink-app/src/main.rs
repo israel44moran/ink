@@ -912,6 +912,31 @@ impl App {
         self.app_mode = AppMode::Canvas;
     }
 
+    /// Crea una NOTA RAPIDA: una sola hoja, con nombre = fecha y hora de creación. Su carátula
+    /// no es un cuaderno 3D sino una HOJA (rayas/cuadrícula/puntos, segun el papel actual). Se
+    /// abre al momento para escribir. En la biblioteca, su `finish` >= 500 la dibuja como hoja.
+    fn new_quick_note(&mut self) {
+        let name = quick_note_name();
+        // La carátula refleja el papel actual: 500=rayas, 501=cuadrícula, 502=puntos.
+        let finish = match self.settings.grid {
+            ink_core::GridKind::Squares => 501,
+            ink_core::GridKind::Dots => 502,
+            _ => 500,
+        };
+        let mut nb = notebook::NotebookData::new(&name, false, finish);
+        nb.fx = 0;
+        nb.fx_intensity = 1.0;
+        nb.accent = 0;
+        nb.shape = 0;
+        nb.thickness = 1.0;
+        nb.overhang = 1.0;
+        let path = notebook::path_for(&name);
+        let _ = notebook::save(&nb, &path);
+        self.apply_notebook(nb);
+        self.current_path = Some(path);
+        self.app_mode = AppMode::Canvas;
+    }
+
     /// Guarda el cuaderno actual y vuelve a la biblioteca (refrescando la lista).
     fn go_to_library(&mut self) {
         self.save_current();
@@ -1219,10 +1244,12 @@ impl App {
             let fx = nb.map_or(0, |n| n.fx);
             let inten = nb.map_or(1.0, |n| n.fx_intensity);
             let accent = nb.map_or(0, |n| n.accent);
-            let shape = nb.map_or(0, |n| n.shape);
+            // Nota rapida (finish >= 500): se dibuja como HOJA plana (sin grosor de cuaderno).
+            let is_sheet = finish >= 500;
+            let shape = if is_sheet { 4 } else { nb.map_or(0, |n| n.shape) };
             let (df, ohf, bf) = shape_params(shape);
-            let depth = df * nb.map_or(1.0, |n| n.thickness);
-            let overh = ohf * nb.map_or(1.0, |n| n.overhang);
+            let depth = if is_sheet { 0.02 } else { df * nb.map_or(1.0, |n| n.thickness) };
+            let overh = if is_sheet { 0.0 } else { ohf * nb.map_or(1.0, |n| n.overhang) };
             let base = finish_base_color(finish);
             let ac = accent_color(accent);
             // FLOTACION: cuando el cursor esta encima (hov>0), el libro flota lentamente -como
@@ -2845,6 +2872,7 @@ impl ApplicationHandler for App {
                 let mut lib_create = false;
                 let mut lib_save_cover = false;
                 let mut lib_open_new = false;
+                let mut lib_quick_note = false;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
@@ -2959,6 +2987,14 @@ impl ApplicationHandler for App {
                                 if ui.button(egui::RichText::new("Nuevo cuaderno").strong()).clicked() {
                                     lib_open_new = true;
                                 }
+                                // Nota rapida: icono de hoja rayada -> crea una hoja con la fecha/hora.
+                                if ui
+                                    .button(egui::RichText::new("🗒 Nota rápida").strong())
+                                    .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
+                                    .clicked()
+                                {
+                                    lib_quick_note = true;
+                                }
                                 if ui.button("Ajustes ⚙").clicked() {
                                     lib_toggle_tweaks = true;
                                 }
@@ -2991,7 +3027,10 @@ impl ApplicationHandler for App {
                                 }
                                 let Some((c, h)) = card_layout.get(i) else { continue };
                                 let fl = self.card_flip.get(i).copied().unwrap_or(0.0);
-                                if fl > 1.5708 {
+                                // Las notas rapidas (hojas, finish >= 500) no tienen cinta: su
+                                // nombre va siempre DEBAJO, aunque se volteen.
+                                let is_sheet = self.notebooks.get(i).map_or(false, |n| n.finish >= 500);
+                                if fl > 1.5708 && !is_sheet {
                                     // Reverso visible: el nombre va PEGADO a la cinta y ROTADO CON
                                     // ELLA (sigue su inclinacion/giro/flotacion con precision).
                                     // Proyecto el centro y los dos extremos del eje horizontal del
@@ -3366,6 +3405,9 @@ impl ApplicationHandler for App {
                     self.editing_nb = None;
                     self.creating_nb = true;
                     self.renaming = None;
+                }
+                if lib_quick_note {
+                    self.new_quick_note();
                 }
                 if lib_cancel_new {
                     self.creating_nb = false;
@@ -3832,6 +3874,38 @@ fn project_card_point(c: Vec2, rotx: f32, roty: f32, hover: f32, lx: f32, ly: f3
     (c.x + p2x * factor, c.y + p2y * factor, factor)
 }
 
+/// Fecha y hora LOCAL actual como (año, mes, día, hora, min, seg). En Windows usa GetLocalTime.
+#[cfg(windows)]
+fn local_now() -> (u16, u16, u16, u16, u16, u16) {
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    (st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
+}
+#[cfg(not(windows))]
+fn local_now() -> (u16, u16, u16, u16, u16, u16) {
+    // Fallback (UTC) desde el reloj del sistema, con el algoritmo civil de Howard Hinnant.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let (h, mi, s) = (((secs % 86400) / 3600) as u16, ((secs % 3600) / 60) as u16, (secs % 60) as u16);
+    let z = secs.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u16;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u16;
+    let y = (yoe + era * 400 + if m <= 2 { 1 } else { 0 }) as u16;
+    (y, m, d, h, mi, s)
+}
+
+/// Nombre de una nota rápida: la fecha y hora de creación. Los ":" se sanean en el archivo.
+fn quick_note_name() -> String {
+    let (y, mo, d, h, mi, s) = local_now();
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)
+}
+
 /// Color base de cada diseño (el shader de cartas anade el efecto encima).
 fn finish_base_color(finish: u32) -> [f32; 3] {
     match finish {
@@ -3846,6 +3920,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if f >= 500 => [0.95, 0.94, 0.90], // Nota rapida (hoja de papel): crema claro
         f if f >= 400 => [0.02, 0.02, 0.04], // Arcade y demos: fondo oscuro
         f if f >= 300 => [0.04, 0.04, 0.06], // Cargadores 3D: fondo oscuro
         f if f >= 200 => [0.02, 0.02, 0.05], // Escenas 3D: espacio oscuro
