@@ -311,6 +311,10 @@ struct App {
     drag_idx: Option<usize>,
     drag_start: Vec2,
     dragging: bool,
+    /// Renombrado en linea: indice del cuaderno cuyo nombre se edita (clic en el nombre).
+    renaming: Option<usize>,
+    rename_buf: String,
+    rename_focus: bool,
 }
 
 impl App {
@@ -417,6 +421,9 @@ impl App {
             drag_idx: None,
             drag_start: Vec2::ZERO,
             dragging: false,
+            renaming: None,
+            rename_buf: String::new(),
+            rename_focus: false,
         }
     }
 
@@ -914,6 +921,7 @@ impl App {
         self.editing_nb = None;
         self.drag_idx = None;
         self.dragging = false;
+        self.renaming = None;
         // Limpiar la tinta del cuaderno que se cerro para que NO se vea en el Home.
         if let Some(g) = self.gpu.as_mut() {
             g.clear_ink();
@@ -998,6 +1006,58 @@ impl App {
         self.card_rects
             .iter()
             .position(|&(cx, cy, hx, hy)| (cur.x - cx).abs() <= hx && (cur.y - cy).abs() <= hy)
+    }
+
+    /// Indice del cuaderno cuyo NOMBRE (texto bajo la carta) esta bajo el cursor.
+    fn library_name_at(&self) -> Option<usize> {
+        let cur = self.cursor;
+        self.card_rects.iter().position(|&(cx, cy, hx, hy)| {
+            let ny = cy + hy + 17.0; // centro del nombre, justo bajo la carta
+            (cur.x - cx).abs() <= hx && (cur.y - ny).abs() <= 16.0
+        })
+    }
+
+    /// Renombra el cuaderno `idx`: cambia su nombre y MUEVE su archivo para que el nombre de
+    /// archivo coincida (asi se conserva al guardar). Tambien actualiza el orden manual.
+    fn rename_notebook(&mut self, idx: usize, new_name: &str) {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return;
+        }
+        let Some(entry) = self.notebooks.get(idx) else { return };
+        let old_path = entry.path.clone();
+        let new_path = notebook::path_for(new_name);
+        if let Some(mut nb) = notebook::load(&old_path) {
+            nb.name = new_name.to_string();
+            let _ = notebook::save(&nb, &new_path);
+            if new_path != old_path {
+                notebook::delete(&old_path);
+                // Mantener la posicion en el orden manual (reemplazar el nombre de archivo).
+                let oldfn = old_path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string());
+                let newfn = new_path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string());
+                if let (Some(o), Some(n)) = (oldfn, newfn) {
+                    let mut order = notebook::load_order();
+                    let mut found = false;
+                    for it in order.iter_mut() {
+                        if *it == o {
+                            *it = n.clone();
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        order.push(n);
+                    }
+                    notebook::save_order(&order);
+                }
+                // Si era el cuaderno abierto, actualizar su ruta.
+                if self.current_path.as_deref() == Some(old_path.as_path()) {
+                    self.current_path = Some(new_path);
+                }
+            }
+        }
+        self.notebooks = notebook::list();
+        self.card_anim.clear();
+        self.card_flip.clear();
     }
 
     /// Zona de la PAPELERA unica (centro y radio, en px): arrastra una carta aqui para borrarla.
@@ -2283,13 +2343,19 @@ impl ApplicationHandler for App {
                     ElementState::Pressed => {
                         if self.app_mode == AppMode::Library && !self.creating_nb {
                             // Cartas (wgpu, no widgets egui): decidir por hit-test, NO por
-                            // `egui_consumed` (egui reclama el puntero del panel). Se inicia un
-                            // posible arrastre; al soltar se decide: abrir (si no se movio),
-                            // reordenar, o borrar (si se solto sobre la papelera).
-                            if let Some(i) = self.library_card_at() {
-                                self.drag_idx = Some(i);
-                                self.drag_start = self.cursor;
-                                self.dragging = false;
+                            // `egui_consumed`. Clic en el NOMBRE = editarlo en linea; en la carta =
+                            // posible arrastre (al soltar: abrir / reordenar / borrar).
+                            if self.renaming.is_none() {
+                                if let Some(i) = self.library_name_at() {
+                                    self.renaming = Some(i);
+                                    self.rename_buf =
+                                        self.notebooks.get(i).map(|n| n.name.clone()).unwrap_or_default();
+                                    self.rename_focus = true;
+                                } else if let Some(i) = self.library_card_at() {
+                                    self.drag_idx = Some(i);
+                                    self.drag_start = self.cursor;
+                                    self.dragging = false;
+                                }
                             }
                         } else if egui_consumed {
                             // Interaccion con la UI: no dibujar. Si el cuentagotas estaba
@@ -2740,6 +2806,8 @@ impl ApplicationHandler for App {
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
                 let mut tweaks_save = false;
+                let mut lib_rename: Option<usize> = None;
+                let mut lib_cancel_rename = false;
                 let mut lib_go = false;
                 let mut page_prev = false;
                 let mut page_next = false;
@@ -2873,6 +2941,10 @@ impl ApplicationHandler for App {
                                 if self.dragging && self.drag_idx == Some(i) {
                                     continue;
                                 }
+                                // El nombre que se esta EDITANDO se dibuja como TextEdit (abajo).
+                                if self.renaming == Some(i) {
+                                    continue;
+                                }
                                 let Some((c, h)) = card_layout.get(i) else { continue };
                                 let fl = self.card_flip.get(i).copied().unwrap_or(0.0);
                                 if fl > 1.5708 {
@@ -2909,11 +2981,29 @@ impl ApplicationHandler for App {
                                         egui::Color32::from_rgb(55, 45, 30),
                                     );
                                 } else {
+                                    // Nombre BAJO la carta: que no se salga ni invada al vecino;
+                                    // se reduce el tamaño y, si aun es largo, se recorta con elipsis.
+                                    let avail = (2.0 * h.x * 1.1 / ppp).max(40.0);
+                                    let len = name.chars().count().max(1) as f32;
+                                    let size = if len * 15.0 * 0.55 > avail {
+                                        (avail / (len * 0.55)).clamp(9.0, 15.0)
+                                    } else {
+                                        15.0
+                                    };
+                                    let max_chars = (avail / (size * 0.55)).floor() as usize;
+                                    let shown = if name.chars().count() > max_chars && max_chars >= 2 {
+                                        let mut s: String =
+                                            name.chars().take(max_chars.saturating_sub(1)).collect();
+                                        s.push('…');
+                                        s
+                                    } else {
+                                        name.clone()
+                                    };
                                     lp.text(
                                         egui::pos2(c.x / ppp, (c.y + h.y + 17.0) / ppp),
                                         egui::Align2::CENTER_CENTER,
-                                        name,
-                                        egui::FontId::proportional(15.0),
+                                        shown,
+                                        egui::FontId::proportional(size),
                                         egui::Color32::from_gray(230),
                                     );
                                 }
@@ -2954,6 +3044,33 @@ impl ApplicationHandler for App {
                                 egui::FontId::proportional(12.0),
                                 tcol,
                             );
+                            // RENOMBRAR en linea: caja de texto centrada sobre el nombre elegido.
+                            if let Some(ri) = self.renaming {
+                                if let Some((c, h)) = card_layout.get(ri) {
+                                    let w = (2.0 * h.x / ppp).clamp(70.0, 240.0);
+                                    let pos = egui::pos2(c.x / ppp, (c.y + h.y + 6.0) / ppp);
+                                    egui::Area::new(egui::Id::new("rename_edit"))
+                                        .order(egui::Order::Foreground)
+                                        .fixed_pos(pos)
+                                        .pivot(egui::Align2::CENTER_TOP)
+                                        .show(ctx, |ui| {
+                                            let resp = ui.add(
+                                                egui::TextEdit::singleline(&mut self.rename_buf)
+                                                    .desired_width(w)
+                                                    .horizontal_align(egui::Align::Center),
+                                            );
+                                            if self.rename_focus {
+                                                resp.request_focus();
+                                                self.rename_focus = false;
+                                            }
+                                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                lib_cancel_rename = true;
+                                            } else if resp.lost_focus() {
+                                                lib_rename = Some(ri);
+                                            }
+                                        });
+                                }
+                            }
                         } else {
                             ui.label(
                                 egui::RichText::new("Vista previa de la carátula a la izquierda; ajústala en el panel de la derecha.")
@@ -3149,9 +3266,18 @@ impl ApplicationHandler for App {
                 if tweaks_save {
                     notebook::save_tweaks(&self.lib_tweaks);
                 }
+                if let Some(ri) = lib_rename {
+                    let name = self.rename_buf.clone();
+                    self.rename_notebook(ri, &name);
+                    self.renaming = None;
+                }
+                if lib_cancel_rename {
+                    self.renaming = None;
+                }
                 if lib_open_new {
                     self.editing_nb = None;
                     self.creating_nb = true;
+                    self.renaming = None;
                 }
                 if lib_cancel_new {
                     self.creating_nb = false;
