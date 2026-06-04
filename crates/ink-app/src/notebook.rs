@@ -11,6 +11,10 @@ fn default_tick() -> f32 {
     1.0
 }
 
+fn default_finish() -> u32 {
+    1 // holografico
+}
+
 /// Una pagina (hoja) del cuaderno: su propio dibujo, texto y borrados. Un cuaderno
 /// infinito tiene UNA pagina (el espacio infinito); uno de hojas tiene varias.
 #[derive(Clone, Serialize, Deserialize)]
@@ -45,6 +49,10 @@ pub struct NotebookData {
     pub name: String,
     /// `true` = lienzo infinito (1 pagina); `false` = con hojas (varias paginas A4).
     pub infinite: bool,
+    /// Acabado/diseño de la "carta" en la biblioteca (0=mate, 1=holo, 2=galaxia, 3=oro,
+    /// 4=prisma, 5=destellos).
+    #[serde(default = "default_finish")]
+    pub finish: u32,
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -62,11 +70,12 @@ pub struct NotebookData {
 
 impl NotebookData {
     /// Cuaderno nuevo con una pagina vacia.
-    pub fn new(name: &str, infinite: bool) -> Self {
+    pub fn new(name: &str, infinite: bool, finish: u32) -> Self {
         Self {
             version: 2,
             name: name.to_string(),
             infinite,
+            finish,
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -96,6 +105,7 @@ impl NotebookData {
 pub struct NotebookEntry {
     pub name: String,
     pub infinite: bool,
+    pub finish: u32,
     pub path: PathBuf,
 }
 
@@ -133,7 +143,7 @@ pub fn list() -> Vec<NotebookEntry> {
             let p = e.path();
             if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) {
                 if let Some(nb) = load(&p) {
-                    out.push(NotebookEntry { name: nb.name, infinite: nb.infinite, path: p });
+                    out.push(NotebookEntry { name: nb.name, infinite: nb.infinite, finish: nb.finish, path: p });
                 }
             }
         }

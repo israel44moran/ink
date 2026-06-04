@@ -256,6 +256,8 @@ struct App {
     notebooks: Vec<notebook::NotebookEntry>,
     /// Ruta del cuaderno abierto (donde se guarda).
     current_path: Option<std::path::PathBuf>,
+    /// Acabado/diseño del cuaderno abierto (se conserva al guardar).
+    current_finish: u32,
     /// Paginas del cuaderno abierto (la pagina activa esta volcada en doc/texts/...).
     pages: Vec<notebook::PageData>,
     /// Indice de la pagina activa.
@@ -268,6 +270,8 @@ struct App {
     new_nb_name: String,
     /// Tipo del cuaderno nuevo: infinito (true) o con hojas (false).
     new_nb_infinite: bool,
+    /// Acabado/diseño elegido para el cuaderno nuevo (0..5).
+    new_nb_finish: u32,
     // --- Cartas hologr aficas de la biblioteca (Home) ---
     /// Animacion por carta: [hover 0..1, rotX, rotY] (suavizado hacia el objetivo).
     card_anim: Vec<[f32; 3]>,
@@ -349,12 +353,14 @@ impl App {
             app_mode: AppMode::Library,
             notebooks: Vec::new(),
             current_path: None,
+            current_finish: 1,
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
             lock_page: false,
             wheel_accum: 0.0,
             new_nb_name: String::new(),
             new_nb_infinite: true,
+            new_nb_finish: 1,
             card_anim: Vec::new(),
             card_rects: Vec::new(),
             card_scroll: 0.0,
@@ -777,6 +783,7 @@ impl App {
     /// Carga un cuaderno (sus paginas) en el estado y reconstruye la GPU.
     fn apply_notebook(&mut self, nb: notebook::NotebookData) {
         self.commit_text();
+        self.current_finish = nb.finish;
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -798,7 +805,7 @@ impl App {
         self.stash_current_page();
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("cuaderno").to_string();
         let infinite = matches!(self.settings.artboard, settings::Artboard::Infinite);
-        let mut nb = notebook::NotebookData::new(&name, infinite);
+        let mut nb = notebook::NotebookData::new(&name, infinite, self.current_finish);
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -813,9 +820,9 @@ impl App {
     }
 
     /// Crea un cuaderno nuevo, lo guarda y lo abre.
-    fn new_notebook(&mut self, name: &str, infinite: bool) {
+    fn new_notebook(&mut self, name: &str, infinite: bool, finish: u32) {
         let name = if name.trim().is_empty() { "Cuaderno" } else { name.trim() };
-        let nb = notebook::NotebookData::new(name, infinite);
+        let nb = notebook::NotebookData::new(name, infinite, finish);
         let path = notebook::path_for(name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
@@ -911,14 +918,6 @@ impl App {
     /// Construye las instancias de carta para la GPU. La carta bajo el cursor se dibuja al
     /// final (encima de las demas, ya que se eleva en 3D).
     fn build_card_instances(&self, layout: &[(Vec2, Vec2)]) -> Vec<renderer::CardInstance> {
-        const PALETTE: [[f32; 3]; 6] = [
-            [0.16, 0.30, 0.52],
-            [0.45, 0.18, 0.42],
-            [0.16, 0.42, 0.34],
-            [0.52, 0.34, 0.14],
-            [0.30, 0.20, 0.52],
-            [0.12, 0.40, 0.46],
-        ];
         let cur = self.cursor;
         let mut cards: Vec<renderer::CardInstance> = Vec::with_capacity(layout.len());
         let mut hover_idx: Option<usize> = None;
@@ -926,8 +925,9 @@ impl App {
             let a = self.card_anim.get(i).copied().unwrap_or([0.0; 3]);
             let ptr_x = ((cur.x - (c.x - h.x)) / (2.0 * h.x)).clamp(0.0, 1.0);
             let ptr_y = ((cur.y - (c.y - h.y)) / (2.0 * h.y)).clamp(0.0, 1.0);
-            let base = PALETTE[i % PALETTE.len()];
-            cards.push([c.x, c.y, h.x, h.y, a[1], a[2], ptr_x, ptr_y, a[0], base[0], base[1], base[2]]);
+            let finish = self.notebooks.get(i).map_or(1, |n| n.finish);
+            let base = finish_base_color(finish);
+            cards.push([c.x, c.y, h.x, h.y, a[1], a[2], ptr_x, ptr_y, a[0], base[0], base[1], base[2], finish as f32]);
             if a[0] > 0.45 {
                 hover_idx = Some(i);
             }
@@ -2557,6 +2557,16 @@ impl ApplicationHandler for App {
                                 lib_create = true;
                             }
                         });
+                        ui.add_space(6.0);
+                        // Acabado/diseño de la carta del cuaderno nuevo.
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Diseño:").color(egui::Color32::from_gray(220)));
+                            for (idx, fname) in FINISH_NAMES.iter().enumerate() {
+                                if ui.selectable_label(self.new_nb_finish == idx as u32, *fname).clicked() {
+                                    self.new_nb_finish = idx as u32;
+                                }
+                            }
+                        });
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(8.0);
@@ -2617,7 +2627,7 @@ impl ApplicationHandler for App {
                 }
                 if lib_create {
                     let name = self.new_nb_name.clone();
-                    self.new_notebook(&name, self.new_nb_infinite);
+                    self.new_notebook(&name, self.new_nb_infinite, self.new_nb_finish);
                     self.new_nb_name.clear();
                 }
                 if let Some(p) = lib_delete {
@@ -2906,6 +2916,21 @@ fn dyn_combo(ui: &mut egui::Ui, id: &str, ctrl: &mut ink_core::DynControl) {
 /// (no crece con la velocidad como un filtro paso-bajo), igual que el Suavizado de Photoshop.
 fn smoothing_string_radius_px(smoothing: f32) -> f32 {
     smoothing.clamp(0.0, 1.0) * 48.0
+}
+
+/// Nombres de los acabados de carta de la biblioteca (indice = id del acabado).
+const FINISH_NAMES: [&str; 6] = ["Mate", "Holográfico", "Galaxia", "Oro", "Prisma", "Destellos"];
+
+/// Color base de cada acabado (el shader de cartas anade el efecto encima).
+fn finish_base_color(finish: u32) -> [f32; 3] {
+    match finish {
+        0 => [0.82, 0.82, 0.86], // Mate (claro, sin holografico)
+        2 => [0.06, 0.05, 0.16], // Galaxia (azul casi negro)
+        3 => [0.34, 0.24, 0.07], // Oro (marron oscuro)
+        4 => [0.12, 0.13, 0.18], // Prisma (gris oscuro)
+        5 => [0.17, 0.10, 0.24], // Destellos (morado oscuro)
+        _ => [0.17, 0.20, 0.42], // Holografico (azul-violeta)
+    }
 }
 
 fn pct_row(ui: &mut egui::Ui, label: &str, v: &mut f32) {
