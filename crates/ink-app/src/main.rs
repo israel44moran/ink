@@ -262,6 +262,10 @@ struct App {
     current_fx: u32,
     current_intensity: f32,
     current_accent: u32,
+    /// Forma/grosor/ceja del cuaderno abierto (se conservan al guardar).
+    current_shape: u32,
+    current_thickness: f32,
+    current_overhang: f32,
     /// Paginas del cuaderno abierto (la pagina activa esta volcada en doc/texts/...).
     pages: Vec<notebook::PageData>,
     /// Indice de la pagina activa.
@@ -280,6 +284,14 @@ struct App {
     new_nb_fx: u32,
     new_nb_intensity: f32,
     new_nb_accent: u32,
+    /// Forma/grosor/ceja elegidos para el cuaderno nuevo.
+    new_nb_shape: u32,
+    new_nb_thickness: f32,
+    new_nb_overhang: f32,
+    /// Ajustes GLOBALES (panel Tweaks): pose en el estante e interaccion.
+    lib_tweaks: notebook::LibTweaks,
+    /// Panel de Tweaks (ajustes globales) abierto.
+    show_tweaks: bool,
     /// Panel de creación abierto (vista previa + opciones de carátula).
     creating_nb: bool,
     /// Si se está EDITANDO la carátula de un cuaderno ya creado, su ruta (None = crear nuevo).
@@ -377,6 +389,9 @@ impl App {
             current_fx: 0,
             current_intensity: 1.0,
             current_accent: 0,
+            current_shape: 0,
+            current_thickness: 1.0,
+            current_overhang: 1.0,
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
             lock_page: false,
@@ -387,6 +402,11 @@ impl App {
             new_nb_fx: 0,
             new_nb_intensity: 1.0,
             new_nb_accent: 0,
+            new_nb_shape: 0,
+            new_nb_thickness: 1.0,
+            new_nb_overhang: 1.0,
+            lib_tweaks: notebook::load_tweaks(),
+            show_tweaks: false,
             creating_nb: false,
             editing_nb: None,
             clock: 0.0,
@@ -820,6 +840,9 @@ impl App {
         self.current_fx = nb.fx;
         self.current_intensity = nb.fx_intensity;
         self.current_accent = nb.accent;
+        self.current_shape = nb.shape;
+        self.current_thickness = nb.thickness;
+        self.current_overhang = nb.overhang;
         self.settings.artboard = if nb.infinite { settings::Artboard::Infinite } else { settings::Artboard::A4 };
         self.pages = nb.pages;
         if self.pages.is_empty() {
@@ -845,6 +868,9 @@ impl App {
         nb.fx = self.current_fx;
         nb.fx_intensity = self.current_intensity;
         nb.accent = self.current_accent;
+        nb.shape = self.current_shape;
+        nb.thickness = self.current_thickness;
+        nb.overhang = self.current_overhang;
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
     }
@@ -858,13 +884,16 @@ impl App {
         }
     }
 
-    /// Crea un cuaderno nuevo (con su carátula: diseño base + capas), lo guarda y lo abre.
+    /// Crea un cuaderno nuevo (con su carátula: diseño base + capas + forma), lo guarda y lo abre.
     fn new_notebook(&mut self, name: &str, infinite: bool, finish: u32, fx: u32, intensity: f32, accent: u32) {
         let name = if name.trim().is_empty() { "Cuaderno" } else { name.trim() };
         let mut nb = notebook::NotebookData::new(name, infinite, finish);
         nb.fx = fx;
         nb.fx_intensity = intensity;
         nb.accent = accent;
+        nb.shape = self.new_nb_shape;
+        nb.thickness = self.new_nb_thickness;
+        nb.overhang = self.new_nb_overhang;
         let path = notebook::path_for(name);
         let _ = notebook::save(&nb, &path);
         self.apply_notebook(nb);
@@ -921,8 +950,11 @@ impl App {
         let cur = self.cursor;
         // Inclinacion BASE (siempre, para que se note el grosor 3D del cuaderno) + un rango
         // mayor al pasar el cursor (la carta "se mueve mas").
-        let base_rx = 0.08; // mirar un poco desde arriba (canto de hojas superior)
-        let base_ry = 0.20; // girar un poco para ver el LOMO en el lado izquierdo
+        // Pose en el estante (global, panel Tweaks): inclinacion = mirar desde arriba; giro =
+        // girar para ver el lomo. En grados -> radianes.
+        let base_rx = self.lib_tweaks.inclinacion.to_radians();
+        let base_ry = self.lib_tweaks.giro.to_radians();
+        let hover_mode = self.lib_tweaks.hover;
         let max_ang = 0.40;
         for (i, (c, h)) in layout.iter().enumerate() {
             let inside = (cur.x - c.x).abs() <= h.x && (cur.y - c.y).abs() <= h.y;
@@ -935,7 +967,14 @@ impl App {
                 (0.5, 0.5)
             };
             let (t_hover, t_rotx, t_roty) = if inside {
-                (1.0, base_rx + (0.5 - ty) * 2.0 * max_ang, base_ry + (tx - 0.5) * 2.0 * max_ang)
+                let tilt_x = base_rx + (0.5 - ty) * 2.0 * max_ang;
+                let tilt_y = base_ry + (tx - 0.5) * 2.0 * max_ang;
+                match hover_mode {
+                    3 => (0.5, base_rx + (0.5 - ty) * max_ang, base_ry + (tx - 0.5) * max_ang), // sutil
+                    2 => (0.45, base_rx, base_ry + 0.6), // girar (muestra mas el lomo)
+                    1 => (1.0, tilt_x, base_ry - 0.45),  // abrir (gira hacia el lector)
+                    _ => (1.0, tilt_x, tilt_y),          // levantar
+                }
             } else {
                 (0.0, base_rx, base_ry)
             };
@@ -1023,6 +1062,9 @@ impl App {
             self.new_nb_fx = nb.fx;
             self.new_nb_intensity = nb.fx_intensity;
             self.new_nb_accent = nb.accent;
+            self.new_nb_shape = nb.shape;
+            self.new_nb_thickness = nb.thickness;
+            self.new_nb_overhang = nb.overhang;
             self.editing_nb = Some(nb.path.clone());
             self.creating_nb = true;
         }
@@ -1036,6 +1078,9 @@ impl App {
             nb.fx = self.new_nb_fx;
             nb.fx_intensity = self.new_nb_intensity;
             nb.accent = self.new_nb_accent;
+            nb.shape = self.new_nb_shape;
+            nb.thickness = self.new_nb_thickness;
+            nb.overhang = self.new_nb_overhang;
             let _ = notebook::save(&nb, path);
         }
         self.notebooks = notebook::list();
@@ -1045,6 +1090,9 @@ impl App {
             self.current_fx = self.new_nb_fx;
             self.current_intensity = self.new_nb_intensity;
             self.current_accent = self.new_nb_accent;
+            self.current_shape = self.new_nb_shape;
+            self.current_thickness = self.new_nb_thickness;
+            self.current_overhang = self.new_nb_overhang;
         }
     }
 
@@ -1068,11 +1116,16 @@ impl App {
             let fx = nb.map_or(0, |n| n.fx);
             let inten = nb.map_or(1.0, |n| n.fx_intensity);
             let accent = nb.map_or(0, |n| n.accent);
+            let shape = nb.map_or(0, |n| n.shape);
+            let (df, ohf, bf) = shape_params(shape);
+            let depth = df * nb.map_or(1.0, |n| n.thickness);
+            let overh = ohf * nb.map_or(1.0, |n| n.overhang);
             let base = finish_base_color(finish);
             let ac = accent_color(accent);
             cards.push([
                 center.x, center.y, h.x, h.y, rotx, roty, ptr_x, ptr_y, hov,
                 base[0], base[1], base[2], finish as f32, fx as f32, inten, ac[0], ac[1], ac[2],
+                depth, overh, bf, shape as f32,
             ]);
             if dragged || a[0] > 0.45 {
                 hover_idx = Some(i);
@@ -1101,6 +1154,9 @@ impl App {
         let finish = self.new_nb_finish;
         let base = finish_base_color(finish);
         let ac = accent_color(self.new_nb_accent);
+        let (df, ohf, bf) = shape_params(self.new_nb_shape);
+        let depth = df * self.new_nb_thickness;
+        let overh = ohf * self.new_nb_overhang;
         let t = self.clock;
         let rotx = (t * 0.7).sin() * 0.12; // vaiven suave para lucir el 3D
         let roty = (t * 0.9).cos() * 0.16;
@@ -1110,6 +1166,7 @@ impl App {
             c.x, c.y, h.x, h.y, rotx, roty, ptr_x, ptr_y, 1.0,
             base[0], base[1], base[2], finish as f32, self.new_nb_fx as f32,
             self.new_nb_intensity, ac[0], ac[1], ac[2],
+            depth, overh, bf, self.new_nb_shape as f32,
         ]]
     }
 
@@ -2675,6 +2732,9 @@ impl ApplicationHandler for App {
                 let mut lib_save_cover = false;
                 let mut lib_open_new = false;
                 let mut lib_cancel_new = false;
+                let mut lib_toggle_tweaks = false;
+                let mut lib_close_tweaks = false;
+                let mut tweaks_save = false;
                 let mut lib_go = false;
                 let mut page_prev = false;
                 let mut page_next = false;
@@ -2777,10 +2837,15 @@ impl ApplicationHandler for App {
                         );
                         ui.add_space(12.0);
                         if !self.creating_nb {
-                            // Boton que abre el panel de creación con vista previa.
-                            if ui.button(egui::RichText::new("Nuevo cuaderno").strong()).clicked() {
-                                lib_open_new = true;
-                            }
+                            // Botones: crear cuaderno + abrir el panel de Tweaks (ajustes globales).
+                            ui.horizontal(|ui| {
+                                if ui.button(egui::RichText::new("Nuevo cuaderno").strong()).clicked() {
+                                    lib_open_new = true;
+                                }
+                                if ui.button("Ajustes ⚙").clicked() {
+                                    lib_toggle_tweaks = true;
+                                }
+                            });
                             ui.add_space(10.0);
                             ui.separator();
                             ui.add_space(8.0);
@@ -2953,6 +3018,24 @@ impl ApplicationHandler for App {
                                     });
                                     ui.add_space(6.0);
                                     ui.separator();
+                                    ui.label(egui::RichText::new("Forma del cuaderno").strong());
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (idx, name) in SHAPE_NAMES.iter().enumerate() {
+                                            if ui.selectable_label(self.new_nb_shape == idx as u32, *name).clicked() {
+                                                self.new_nb_shape = idx as u32;
+                                            }
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::Slider::new(&mut self.new_nb_thickness, 0.4..=1.8));
+                                        ui.label("Grosor");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::Slider::new(&mut self.new_nb_overhang, 0.0..=2.0));
+                                        ui.label("Ceja de tapa");
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.separator();
                                     ui.label(egui::RichText::new("Capas (combinables)").strong());
                                     ui.horizontal_wrapped(|ui| {
                                         for (bit, name) in FX_LAYERS {
@@ -2983,6 +3066,44 @@ impl ApplicationHandler for App {
                                     });
                                 });
                         }
+
+                        // Panel de TWEAKS (ajustes GLOBALES): pose en el estante + interaccion.
+                        if self.show_tweaks && !self.creating_nb {
+                            egui::Window::new(egui::RichText::new("Tweaks").strong())
+                                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 64.0))
+                                .collapsible(false)
+                                .resizable(false)
+                                .default_width(250.0)
+                                .show(ctx, |ui| {
+                                    ui.label(egui::RichText::new("Pose en el estante").strong());
+                                    if ui.add(egui::Slider::new(&mut self.lib_tweaks.giro, 0.0..=40.0).text("Giro (lomo)")).changed() {
+                                        tweaks_save = true;
+                                    }
+                                    if ui.add(egui::Slider::new(&mut self.lib_tweaks.inclinacion, -4.0..=24.0).text("Inclinación")).changed() {
+                                        tweaks_save = true;
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Interacción").strong());
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (idx, name) in HOVER_NAMES.iter().enumerate() {
+                                            if ui.selectable_label(self.lib_tweaks.hover == idx as u32, *name).clicked() {
+                                                self.lib_tweaks.hover = idx as u32;
+                                                tweaks_save = true;
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    if ui.checkbox(&mut self.lib_tweaks.animate, "Portadas animadas").changed() {
+                                        tweaks_save = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    if ui.button("Cerrar").clicked() {
+                                        lib_close_tweaks = true;
+                                    }
+                                });
+                        }
                     });
                   }
                 });
@@ -2995,6 +3116,15 @@ impl ApplicationHandler for App {
                 }
                 if let Some(p) = lib_open {
                     self.open_notebook(p);
+                }
+                if lib_toggle_tweaks {
+                    self.show_tweaks = !self.show_tweaks;
+                }
+                if lib_close_tweaks {
+                    self.show_tweaks = false;
+                }
+                if tweaks_save {
+                    notebook::save_tweaks(&self.lib_tweaks);
                 }
                 if lib_open_new {
                     self.editing_nb = None;
@@ -3248,7 +3378,8 @@ impl ApplicationHandler for App {
                     g.set_bg(bg);
                     g.set_content_clip(content_clip);
                     g.set_grid(&self.grid_mesh);
-                    g.set_cards(&cards, self.camera.viewport.x, self.camera.viewport.y, self.clock);
+                    let card_time = if self.lib_tweaks.animate { self.clock } else { 0.0 };
+                    g.set_cards(&cards, self.camera.viewport.x, self.camera.viewport.y, card_time);
                     g.update_camera(self.camera.view_proj());
                     g.render(&primitives, &full_output.textures_delta, &screen);
                 }
@@ -3384,6 +3515,24 @@ const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4
 
 /// Paleta de ACENTO (idx, nombre). El 0 es blanco (B&N en los cargadores).
 const ACCENTS: [&str; 8] = ["Blanco", "Cian", "Magenta", "Ámbar", "Verde", "Rojo", "Violeta", "Azul"];
+
+/// FORMAS de cuaderno (idx = shape): geometria, no portada.
+const SHAPE_NAMES: [&str; 5] = ["Actual", "Tapa dura", "Moleskine", "Espiral", "Minimalista"];
+
+/// Parametros de geometria de cada forma: (grosor relativo, ceja [fraccion], tabla de tapa
+/// en el canto [fraccion del grosor]). El cuaderno es la caja 3D del shader.
+fn shape_params(shape: u32) -> (f32, f32, f32) {
+    match shape {
+        1 => (0.16, 0.060, 0.22), // Tapa dura: gruesa, ceja marcada, tabla ancha
+        2 => (0.12, 0.012, 0.10), // Moleskine: flexible, casi a ras
+        3 => (0.12, 0.035, 0.12), // Espiral
+        4 => (0.06, 0.000, 0.10), // Minimalista: fina
+        _ => (0.13, 0.000, 0.00), // Actual (la de ahora: a ras, hojas de borde a borde)
+    }
+}
+
+/// Modos de hover (idx). 0=levantar, 1=abrir, 2=girar, 3=sutil.
+const HOVER_NAMES: [&str; 4] = ["Levantar", "Abrir", "Girar", "Sutil"];
 
 /// Proyecta un punto LOCAL del cuaderno (caja) a pantalla, replicando la transformacion del
 /// vertex shader (rotacion Y, rotacion X, elevacion por hover y perspectiva). Devuelve

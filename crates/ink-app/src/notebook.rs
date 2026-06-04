@@ -19,6 +19,10 @@ fn default_intensity() -> f32 {
     1.0
 }
 
+fn default_one() -> f32 {
+    1.0
+}
+
 /// Una pagina (hoja) del cuaderno: su propio dibujo, texto y borrados. Un cuaderno
 /// infinito tiene UNA pagina (el espacio infinito); uno de hojas tiene varias.
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,6 +72,15 @@ pub struct NotebookData {
     /// Acento de color (indice de paleta; 0 = por defecto / blanco y negro en los cargadores).
     #[serde(default)]
     pub accent: u32,
+    /// FORMA del cuaderno (0=Actual, 1=Tapa dura, 2=Moleskine, 3=Espiral, 4=Minimalista).
+    #[serde(default)]
+    pub shape: u32,
+    /// Multiplicador de grosor (1.0 = el de la forma).
+    #[serde(default = "default_one")]
+    pub thickness: f32,
+    /// Multiplicador de la ceja de tapa (1.0 = la de la forma).
+    #[serde(default = "default_one")]
+    pub overhang: f32,
     /// Las paginas del cuaderno.
     #[serde(default)]
     pub pages: Vec<PageData>,
@@ -94,6 +107,9 @@ impl NotebookData {
             fx: 0,
             fx_intensity: 1.0,
             accent: 0,
+            shape: 0,
+            thickness: 1.0,
+            overhang: 1.0,
             pages: vec![PageData::empty()],
             doc: None,
             texts: Vec::new(),
@@ -127,7 +143,51 @@ pub struct NotebookEntry {
     pub fx: u32,
     pub fx_intensity: f32,
     pub accent: u32,
+    pub shape: u32,
+    pub thickness: f32,
+    pub overhang: f32,
     pub path: PathBuf,
+}
+
+/// Ajustes GLOBALES de la biblioteca (panel "Tweaks"): pose en el estante e interaccion.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LibTweaks {
+    /// Giro (lomo) en grados (cuanto gira para ver el lomo).
+    #[serde(default = "tw_giro")]
+    pub giro: f32,
+    /// Inclinacion en grados (cuanto se mira desde arriba).
+    #[serde(default = "tw_incl")]
+    pub inclinacion: f32,
+    /// Modo de hover: 0=levantar, 1=abrir, 2=girar, 3=sutil.
+    #[serde(default)]
+    pub hover: u32,
+    /// Animar las portadas (si no, quedan estaticas).
+    #[serde(default = "tw_true")]
+    pub animate: bool,
+}
+fn tw_giro() -> f32 { 18.0 }
+fn tw_incl() -> f32 { 9.0 }
+fn tw_true() -> bool { true }
+impl Default for LibTweaks {
+    fn default() -> Self {
+        Self { giro: 18.0, inclinacion: 9.0, hover: 0, animate: true }
+    }
+}
+
+fn tweaks_path() -> PathBuf {
+    notebooks_dir().join("_tweaks.json")
+}
+pub fn load_tweaks() -> LibTweaks {
+    std::fs::read_to_string(tweaks_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+pub fn save_tweaks(t: &LibTweaks) {
+    let _ = ensure_dir();
+    if let Ok(s) = serde_json::to_string(t) {
+        let _ = std::fs::write(tweaks_path(), s);
+    }
 }
 
 /// Carpeta donde viven los cuadernos: `%USERPROFILE%/Documents/Cuadernos Ink`.
@@ -184,8 +244,8 @@ pub fn list() -> Vec<NotebookEntry> {
     if let Ok(rd) = std::fs::read_dir(notebooks_dir()) {
         for e in rd.flatten() {
             let p = e.path();
-            // Saltar el archivo de orden (no es un cuaderno).
-            if p.file_name().map_or(false, |n| n == "_order.json") {
+            // Saltar archivos internos (orden / tweaks), no son cuadernos.
+            if p.file_name().map_or(false, |n| n == "_order.json" || n == "_tweaks.json") {
                 continue;
             }
             if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) {
@@ -197,6 +257,9 @@ pub fn list() -> Vec<NotebookEntry> {
                         fx: nb.fx,
                         fx_intensity: nb.fx_intensity,
                         accent: nb.accent,
+                        shape: nb.shape,
+                        thickness: nb.thickness,
+                        overhang: nb.overhang,
                         path: p,
                     });
                 }

@@ -25,6 +25,10 @@ struct VsIn {
     @location(7) fx: f32,
     @location(8) intensity: f32,
     @location(9) accent: vec3<f32>,
+    @location(10) depth: f32,
+    @location(11) overhang: f32,
+    @location(12) board: f32,
+    @location(13) shape: f32,
 };
 
 struct VsOut {
@@ -41,6 +45,9 @@ struct VsOut {
     @location(9) aspect: f32,
     @location(10) face: f32,
     @location(11) pz01: f32,
+    @location(12) board: f32,
+    @location(13) shape: f32,
+    @location(14) overhang: f32,
 };
 
 // El cuaderno es una CAJA (6 caras): 0=frente (portada animada), 1=reverso (cinta con el
@@ -62,8 +69,13 @@ fn vs_main(in: VsIn) -> VsOut {
     else if (face == 3) { origin = vec3<f32>(-1.0, -1.0, 1.0); du = vec3<f32>(0.0, 2.0, 0.0); dv = vec3<f32>(0.0, 0.0, -2.0); }
     else if (face == 4) { origin = vec3<f32>(-1.0, 1.0, -1.0); du = vec3<f32>(0.0, 0.0, 2.0); dv = vec3<f32>(2.0, 0.0, 0.0); }
     else { origin = vec3<f32>(-1.0, -1.0, -1.0); du = vec3<f32>(2.0, 0.0, 0.0); dv = vec3<f32>(0.0, 0.0, 2.0); }
-    let unit = origin + du * st.x + dv * st.y;          // posicion en el cubo unidad
-    let hz = in.half.x * 0.13;                          // grosor (pila de hojas)
+    var unit = origin + du * st.x + dv * st.y;          // posicion en el cubo unidad
+    // Ceja de tapa: las caras de canto (pila de hojas) se meten hacia dentro en X/Y; las tapas
+    // (0,1) y el lomo (3, a ras del lomo) quedan a tamaño completo -> la tapa sobresale.
+    let oh = in.overhang;
+    if (face == 2) { unit.x = unit.x * (1.0 - 2.0 * oh); }              // fore-edge (derecha)
+    if (face == 4 || face == 5) { unit.y = unit.y * (1.0 - 2.0 * oh); } // top / pie
+    let hz = in.half.x * max(in.depth, 0.02);           // grosor por instancia (segun la forma)
     var p = vec3<f32>(unit.x * in.half.x, unit.y * in.half.y, unit.z * hz);
 
     let cy = cos(in.rot.y); let sy = sin(in.rot.y);
@@ -90,6 +102,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.aspect = in.half.y / max(in.half.x, 1.0);
     out.face = f32(face);
     out.pz01 = (unit.z + 1.0) * 0.5;
+    out.board = in.board;
+    out.shape = in.shape;
+    out.overhang = in.overhang;
     return out;
 }
 
@@ -862,10 +877,21 @@ fn cover_color(in: VsOut) -> vec3<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = i32(round(in.face));
+    let shp = i32(round(in.shape));
     var col: vec3<f32>;
     if (face == 0) {
         // Portada: el diseño/animacion elegido.
         col = cover_color(in);
+        // TAPA DURA: ranura de bisagra (francesa) junto al lomo.
+        if (shp == 1) {
+            let groove = smoothstep(0.012, 0.0, abs(in.uv.x - (0.04 + in.overhang)));
+            col = col * (1.0 - 0.45 * groove);
+        }
+        // MOLESKINE: cincha elastica (banda oscura vertical cerca del borde derecho).
+        if (shp == 2) {
+            let elastic = smoothstep(0.022, 0.0, abs(in.uv.x - 0.84));
+            col = mix(col, vec3<f32>(0.11, 0.10, 0.13), elastic * 0.85);
+        }
     } else if (face == 1) {
         // Reverso: carton oscuro + una "cinta de masquin" beige (el NOMBRE lo dibuja la UI).
         col = vec3<f32>(0.15, 0.13, 0.12);
@@ -874,14 +900,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let tcol = vec3<f32>(0.86, 0.80, 0.62) * (0.96 + 0.04 * sin(in.uv.x * 70.0));
         col = mix(col, tcol, tape);
     } else if (face == 3) {
-        // LOMO (encuadernacion) en UN solo lado: sin hojas, con un brillo central a lo largo.
-        let sheen = smoothstep(0.55, 0.0, abs(in.pz01 - 0.5));
-        col = mix(vec3<f32>(0.10, 0.09, 0.12), vec3<f32>(0.27, 0.25, 0.30), sheen * 0.85);
+        // LOMO (encuadernacion).
+        if (shp == 3) {
+            // ESPIRAL: anillos metalicos a lo largo del lomo (uv.x recorre el largo del lomo).
+            let rings = grid_line(in.uv.x * 22.0, 0.32);
+            let metal = mix(vec3<f32>(0.32, 0.34, 0.38), vec3<f32>(0.88, 0.91, 0.96), rings);
+            col = mix(vec3<f32>(0.05, 0.05, 0.06), metal, rings);
+        } else {
+            let sheen = smoothstep(0.55, 0.0, abs(in.pz01 - 0.5));
+            col = mix(vec3<f32>(0.10, 0.09, 0.12), vec3<f32>(0.27, 0.25, 0.30), sheen * 0.85);
+            // TAPA DURA: nervios (cords) del lomo.
+            if (shp == 1) {
+                let c1 = smoothstep(0.02, 0.0, abs(in.uv.x - 0.18));
+                let c2 = smoothstep(0.02, 0.0, abs(in.uv.x - 0.82));
+                col = col + vec3<f32>(0.09, 0.09, 0.10) * (c1 + c2);
+            }
+        }
     } else {
-        // Cantos (lados sin lomo): pila de hojas (lineas finas a lo largo del grosor).
+        // Cantos (2,4,5): TABLA de tapa en los extremos del grosor + pila de HOJAS en el centro.
+        let bf = in.board;
+        let inboard = (in.pz01 < bf) || (in.pz01 > (1.0 - bf));
         let paper = vec3<f32>(0.93, 0.91, 0.85);
         let lines = grid_line(in.pz01 * 46.0, 0.25);
-        col = mix(paper, paper * 0.6, lines * 0.55);
+        let pages = mix(paper, paper * 0.6, lines * 0.55);
+        col = mix(pages, vec3<f32>(0.13, 0.12, 0.14), select(0.0, 1.0, inboard));
     }
     // Sombreado por cara para dar sensacion de volumen 3D.
     var shade = 1.0;
