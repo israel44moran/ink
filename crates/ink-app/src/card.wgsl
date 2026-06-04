@@ -1180,14 +1180,33 @@ fn bg_gradient(uv: vec2<f32>) -> vec3<f32> {
     return c + (hash21(uv * 997.0) - 0.5) * 0.004;
 }
 
+// Fondo del Home, tema CUADERNO: hoja de papel crema con renglones azules + margen rojo.
+fn bg_paper(uv: vec2<f32>) -> vec3<f32> {
+    let cream_top = vec3<f32>(0.937, 0.906, 0.839); // #efe7d6
+    let cream_bot = vec3<f32>(0.906, 0.867, 0.788); // #e7ddc9
+    var c = mix(cream_top, cream_bot, uv.y);
+    let py = uv.y * max(view.vp.y, 1.0);
+    let fy = py - floor(py / 34.0) * 34.0;
+    c = mix(c, vec3<f32>(0.282, 0.424, 0.643), step(33.0, fy) * 0.13); // renglones azules
+    let px = uv.x * max(view.vp.x, 1.0);
+    c = mix(c, vec3<f32>(0.753, 0.349, 0.310), smoothstep(2.5, 0.0, abs(px - 80.0)) * 0.5); // margen rojo
+    let d = distance(uv, vec2<f32>(0.5, 0.5));
+    c = c * (1.0 - smoothstep(0.55, 1.15, d) * 0.10); // viñeta calida
+    return c;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = i32(round(in.face));
     let shp = i32(round(in.shape));
     var col: vec3<f32>;
-    // FONDO del Home (finish >= 900): cuad plano a pantalla completa con degradado/viñeta.
-    if (i32(round(in.finish)) >= 900) {
+    // FONDO del Home a pantalla completa: 900 = Tinta (oscuro), 901 = Cuaderno (papel).
+    let finbg = i32(round(in.finish));
+    if (finbg >= 900) {
         if (face == 0) {
+            if (finbg == 901) {
+                return vec4<f32>(bg_paper(in.uv), 1.0);
+            }
             return vec4<f32>(bg_gradient(in.uv), 1.0);
         }
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);

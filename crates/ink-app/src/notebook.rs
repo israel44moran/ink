@@ -184,13 +184,16 @@ pub struct LibTweaks {
     /// Animar las portadas (si no, quedan estaticas).
     #[serde(default = "tw_true")]
     pub animate: bool,
+    /// Tema de la interfaz (chrome): 0 = Tinta (galeria oscura), 1 = Cuaderno (papel rayado).
+    #[serde(default)]
+    pub theme: u32,
 }
 fn tw_giro() -> f32 { 18.0 }
 fn tw_incl() -> f32 { 9.0 }
 fn tw_true() -> bool { true }
 impl Default for LibTweaks {
     fn default() -> Self {
-        Self { giro: 18.0, inclinacion: 9.0, hover: 0, animate: true }
+        Self { giro: 18.0, inclinacion: 9.0, hover: 0, animate: true, theme: 0 }
     }
 }
 

@@ -6,6 +6,8 @@ Estilo editorial de la interfaz. Ambas con licencia **SIL Open Font License 1.1 
   © Alfredo Marco Pradil. https://github.com/Hanken-Design/Hanken-Grotesk
 - **JetBrains Mono** (JetBrainsMono-Regular.ttf) — etiquetas monoespaciadas (estilo devtool).
   © JetBrains. https://github.com/JetBrains/JetBrainsMono
+- **Spectral** (Spectral-Regular/SemiBold/Italic.ttf) — titulo/subtitulo del tema "Cuaderno"
+  (serif editorial). © Production Type. https://github.com/productiontype/Spectral
 
 Subconjunto latino (TTF estatico) via Fontsource. Se incrustan con `include_bytes!` (ver
 `setup_fonts` en `main.rs`); el sistema (Segoe UI / DejaVu) queda como respaldo.

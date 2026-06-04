@@ -1010,6 +1010,23 @@ impl App {
         }
     }
 
+    /// Aplica el color de la barra de titulo del SO segun el tema actual (Windows 11, DWM).
+    #[allow(unused_variables)]
+    fn apply_titlebar(&self) {
+        #[cfg(windows)]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Some(w) = &self.window {
+                if let Ok(h) = w.window_handle() {
+                    if let RawWindowHandle::Win32(wh) = h.as_raw() {
+                        let cap = if self.lib_tweaks.theme == 1 { 0x0013_181C } else { 0x0014_0F0E };
+                        set_dark_titlebar(wh.hwnd.get(), cap);
+                    }
+                }
+            }
+        }
+    }
+
     // ===================== Cartas hologr aficas de la biblioteca (Home) =====================
 
     /// Linea (px fisicos) justo BAJO la cabecera (titulo + botones): donde se recortan las cartas
@@ -1390,9 +1407,10 @@ impl App {
     /// Se dibuja el primero (detras de las cartas) para dar profundidad.
     fn bg_card(&self) -> renderer::CardInstance {
         let vp = self.camera.viewport;
+        let finish = if self.lib_tweaks.theme == 1 { 901.0 } else { 900.0 };
         [
             vp.x * 0.5, vp.y * 0.5, vp.x * 0.5 + 4.0, vp.y * 0.5 + 4.0, 0.0, 0.0, 0.5, 0.5, 0.0,
-            0.0, 0.0, 0.0, 900.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 4.0, 0.0,
+            0.0, 0.0, 0.0, finish, 0.0, 1.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 4.0, 0.0,
         ]
     }
 
@@ -2655,7 +2673,9 @@ impl ApplicationHandler for App {
             if let Ok(h) = window.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
                     pen_win::install(w.hwnd.get());
-                    set_dark_titlebar(w.hwnd.get()); // barra de titulo oscura (sin corte de color)
+                    // Barra de titulo segun el tema: Tinta (RGB 14,15,20) / Cuaderno (#1c1813).
+                    let cap = if self.lib_tweaks.theme == 1 { 0x0013_181C } else { 0x0014_0F0E };
+                    set_dark_titlebar(w.hwnd.get(), cap);
                 }
             }
         }
@@ -3269,6 +3289,7 @@ impl ApplicationHandler for App {
                 let mut lib_close_preview = false;
                 let mut lib_preview_prev = false;
                 let mut lib_preview_next = false;
+                let mut lib_set_theme: Option<u32> = None;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
                 let mut lib_close_tweaks = false;
@@ -3501,43 +3522,56 @@ impl ApplicationHandler for App {
                             });
                             return;
                         }
-                        // --- Cabecera editorial: titulo (Hanken Bold) + subtitulo ---
+                        // --- Cabecera editorial segun el TEMA (Tinta / Cuaderno) ---
+                        let th = home_theme(self.lib_tweaks.theme);
                         ui.add_space(10.0);
-                        ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(egui::FontId::new(34.0, egui::FontFamily::Name("head".into()))).color(egui::Color32::from_gray(245))).selectable(false));
-                        ui.add(egui::Label::new(egui::RichText::new("Tu biblioteca de cuadernos y notas").size(14.0).color(egui::Color32::from_gray(150))).selectable(false));
+                        // Kicker monoespaciado: "INK · BIBLIOTECA".
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.add(egui::Label::new(egui::RichText::new("INK · ").font(egui::FontId::new(11.0, egui::FontFamily::Monospace)).color(th.kicker)).selectable(false));
+                            ui.add(egui::Label::new(egui::RichText::new("BIBLIOTECA").font(egui::FontId::new(11.0, egui::FontFamily::Monospace)).color(th.kicker_b)).selectable(false));
+                        });
+                        ui.add_space(6.0);
+                        let title_font = if th.serif {
+                            egui::FontId::new(38.0, egui::FontFamily::Name("serif".into()))
+                        } else {
+                            egui::FontId::new(34.0, egui::FontFamily::Name("head".into()))
+                        };
+                        ui.add(egui::Label::new(egui::RichText::new("Mis cuadernos").font(title_font).color(th.title)).selectable(false));
+                        let sub = if th.serif {
+                            egui::RichText::new("Tu biblioteca de cuadernos y notas").font(egui::FontId::new(15.0, egui::FontFamily::Name("serif_it".into()))).color(th.sub)
+                        } else {
+                            egui::RichText::new("Tu biblioteca de cuadernos y notas").size(14.0).color(th.sub)
+                        };
+                        ui.add(egui::Label::new(sub).selectable(false));
                         ui.add_space(16.0);
                         if !self.creating_nb {
-                            // Botones "pill" con iconos vectoriales: primario (acento) + secundario
-                            // + Ajustes (fantasma, a la derecha).
-                            // Estilo "Trazo": contorno en acento papel/lavanda (#cabfa7), sin relleno.
-                            let accent = egui::Color32::from_rgb(202, 191, 167);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 12.0;
-                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, accent).clicked() {
+                                if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, th.primary).clicked() {
                                     lib_open_new = true;
                                 }
-                                if pill_button(ui, "Nota rápida", BtnIcon::Note, accent)
+                                if pill_button(ui, "Nota rápida", BtnIcon::Note, th.secondary)
                                     .on_hover_text("Crea una hoja suelta con la fecha y hora; escribe al instante.")
                                     .clicked()
                                 {
                                     lib_quick_note = true;
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, accent).clicked() {
+                                    if pill_button(ui, "Ajustes", BtnIcon::Sliders, th.secondary).clicked() {
                                         lib_toggle_tweaks = true;
                                     }
                                 });
                             });
                             ui.add_space(16.0);
-                            // Separador editorial fino (cards ya estan mas abajo, no las cruza).
                             let sep = ui.available_rect_before_wrap();
-                            ui.painter().hline(sep.x_range(), sep.top(), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(202, 191, 167, 26)));
+                            ui.painter().hline(sep.x_range(), sep.top(), egui::Stroke::new(1.0, th.sep));
                             ui.add_space(10.0);
                             if nb_list.is_empty() {
                                 ui.label(
                                     egui::RichText::new("Aún no tienes cuadernos. Pulsa «Nuevo cuaderno».")
                                         .italics()
-                                        .color(egui::Color32::from_gray(140)),
+                                        .color(th.sub),
                                 );
                             }
                             // Las CARTAS se dibujan con wgpu detras de la UI; aqui solo va, bajo
@@ -3633,7 +3667,7 @@ impl ApplicationHandler for App {
                                             egui::Align2::CENTER_TOP,
                                             ln,
                                             egui::FontId::proportional(size),
-                                            egui::Color32::from_gray(230),
+                                            th.name,
                                         );
                                     }
                                     // Zona CLICABLE (invisible) de egui sobre TODO el nombre (los 3
@@ -3663,7 +3697,7 @@ impl ApplicationHandler for App {
                             } else if drag_on {
                                 egui::Color32::from_rgb(225, 130, 130)
                             } else {
-                                egui::Color32::from_gray(140)
+                                th.icon_btn
                             };
                             let tc = egui::pos2(tzx / ppp, tzy / ppp);
                             if drag_on {
@@ -3690,6 +3724,35 @@ impl ApplicationHandler for App {
                                 egui::FontId::proportional(12.0),
                                 tcol,
                             );
+                            // CONMUTADOR de tema (abajo-centro): Tinta / Cuaderno.
+                            egui::Area::new(egui::Id::new("theme_switch"))
+                                .order(egui::Order::Foreground)
+                                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
+                                .show(ctx, |ui| {
+                                    egui::Frame::NONE
+                                        .fill(egui::Color32::from_rgba_unmultiplied(20, 18, 26, 235))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 41, 54)))
+                                        .corner_radius(12)
+                                        .inner_margin(egui::Margin::same(5))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                for (idx, name) in ["Tinta", "Cuaderno"].iter().enumerate() {
+                                                    let on = self.lib_tweaks.theme == idx as u32;
+                                                    let txt = egui::RichText::new(*name)
+                                                        .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
+                                                        .color(if on { egui::Color32::from_rgb(22, 19, 28) } else { egui::Color32::from_gray(154) });
+                                                    let b = egui::Button::new(txt)
+                                                        .fill(if on { egui::Color32::from_rgb(202, 191, 167) } else { egui::Color32::TRANSPARENT })
+                                                        .corner_radius(8)
+                                                        .min_size(egui::vec2(78.0, 30.0));
+                                                    if ui.add(b).clicked() {
+                                                        lib_set_theme = Some(idx as u32);
+                                                    }
+                                                }
+                                            });
+                                        });
+                                });
                             // RENOMBRAR en linea: caja de texto centrada sobre el nombre elegido.
                             if let Some(ri) = self.renaming {
                                 if let Some((c, h)) = card_layout.get(ri) {
@@ -4064,6 +4127,11 @@ impl ApplicationHandler for App {
                 if lib_close_preview {
                     self.close_preview();
                 }
+                if let Some(t) = lib_set_theme {
+                    self.lib_tweaks.theme = t;
+                    notebook::save_tweaks(&self.lib_tweaks);
+                    self.apply_titlebar();
+                }
                 if lib_preview_next {
                     self.preview_flip(1);
                 }
@@ -4433,6 +4501,10 @@ fn setup_fonts(ctx: &egui::Context) {
         "mono".to_owned(),
         Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))),
     );
+    // Serif (Spectral) para el tema "Cuaderno": titulo y subtitulo en estilo editorial impreso.
+    fonts.font_data.insert("spectral".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Spectral-Regular.ttf"))));
+    fonts.font_data.insert("spectral_sb".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Spectral-SemiBold.ttf"))));
+    fonts.font_data.insert("spectral_it".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Spectral-Italic.ttf"))));
     // Respaldo del sistema (acentos/glifos que falten): Segoe UI / Calibri / DejaVu.
     let fallback = ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/calibri.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
         .iter()
@@ -4449,10 +4521,13 @@ fn setup_fonts(ctx: &egui::Context) {
     // Monospace: JetBrains Mono (etiquetas tipo devtool).
     let monop = fonts.families.entry(egui::FontFamily::Monospace).or_default();
     monop.insert(0, "mono".to_owned());
-    // Familia "head" (titulos): Hanken Bold.
+    // Familia "head" (titulos Tinta): Hanken Bold.
     fonts
         .families
         .insert(egui::FontFamily::Name("head".into()), vec!["hanken_b".to_owned(), "hanken".to_owned()]);
+    // Familias serif (titulos/subtitulos Cuaderno): Spectral.
+    fonts.families.insert(egui::FontFamily::Name("serif".into()), vec!["spectral_sb".to_owned(), "spectral".to_owned()]);
+    fonts.families.insert(egui::FontFamily::Name("serif_it".into()), vec!["spectral_it".to_owned(), "spectral".to_owned()]);
     ctx.set_fonts(fonts);
 }
 
@@ -4708,14 +4783,14 @@ fn accent_color(accent: u32) -> [f32; 3] {
 /// Oscurece la barra de TITULO de la ventana (Windows 11) para que combine con el Home y no
 /// haya un corte de color abrupto: modo oscuro + color de barra/borde = fondo de la app.
 #[cfg(windows)]
-fn set_dark_titlebar(hwnd: isize) {
+fn set_dark_titlebar(hwnd: isize, caption: u32) {
     use windows::Win32::Foundation::{BOOL, COLORREF, HWND};
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-    let cap = COLORREF(0x0014_0F0E); // 0x00BBGGRR -> RGB(14,15,20) = borde superior del fondo
+    let cap = COLORREF(caption); // 0x00BBGGRR
     unsafe {
         let dark = BOOL(1);
         let _ = DwmSetWindowAttribute(
@@ -4772,27 +4847,118 @@ fn draw_btn_icon(p: &egui::Painter, icon: BtnIcon, c: egui::Pos2, col: egui::Col
     }
 }
 
-/// Botón estilo "Trazo" (contorno de tinta): sin relleno, borde 1.5px en `accent`, icono+texto en
-/// `accent`, radio 7, peso ~600 (Hanken Bold). Hover = relleno tenue del acento; active baja 1px.
-fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, accent: egui::Color32) -> egui::Response {
+/// Estilo de un boton segun el tema (relleno, texto, icono, borde, y sus variantes al pasar el cursor).
+#[derive(Clone, Copy)]
+struct BtnStyle {
+    fill: egui::Color32,
+    text: egui::Color32,
+    icon: egui::Color32,
+    border: egui::Color32,
+    hover_fill: egui::Color32,
+    hover_text: egui::Color32,
+}
+
+/// Paleta del CHROME (interfaz) por tema. No afecta a los notebooks (su diseño es aparte).
+struct HomeTheme {
+    title: egui::Color32,
+    sub: egui::Color32,
+    kicker: egui::Color32,
+    kicker_b: egui::Color32,
+    name: egui::Color32,
+    sep: egui::Color32,
+    icon_btn: egui::Color32,
+    serif: bool, // Cuaderno usa titulo/subtitulo serif (Spectral)
+    primary: BtnStyle,
+    secondary: BtnStyle,
+}
+
+fn home_theme(theme: u32) -> HomeTheme {
+    let rgba = egui::Color32::from_rgba_unmultiplied;
+    let rgb = egui::Color32::from_rgb;
+    if theme == 1 {
+        // CUADERNO: papel claro, texto oscuro, acento rojo, serif.
+        HomeTheme {
+            title: rgb(34, 28, 20),
+            sub: rgb(138, 125, 100),
+            kicker: rgb(154, 143, 120),
+            kicker_b: rgb(192, 89, 79),
+            name: rgb(43, 37, 27),
+            sep: rgba(60, 48, 30, 46),
+            icon_btn: rgb(111, 99, 80),
+            serif: true,
+            primary: BtnStyle {
+                fill: rgb(33, 27, 18),
+                text: rgb(240, 233, 216),
+                icon: rgb(192, 89, 79),
+                border: egui::Color32::TRANSPARENT,
+                hover_fill: rgb(45, 37, 25),
+                hover_text: rgb(240, 233, 216),
+            },
+            secondary: BtnStyle {
+                fill: egui::Color32::TRANSPARENT,
+                text: rgb(74, 66, 50),
+                icon: rgb(138, 125, 100),
+                border: rgba(60, 48, 30, 80),
+                hover_fill: rgba(192, 89, 79, 22),
+                hover_text: rgb(36, 31, 23),
+            },
+        }
+    } else {
+        // TINTA: galeria oscura, texto claro, acento crema (#cabfa7).
+        let cream = rgb(202, 191, 167);
+        HomeTheme {
+            title: rgb(236, 233, 242),
+            sub: rgb(134, 131, 143),
+            kicker: rgb(125, 122, 135),
+            kicker_b: cream,
+            name: rgb(205, 202, 214),
+            sep: rgba(202, 191, 167, 26),
+            icon_btn: rgb(127, 124, 138),
+            serif: false,
+            primary: BtnStyle {
+                fill: egui::Color32::TRANSPARENT,
+                text: cream,
+                icon: cream,
+                border: cream,
+                hover_fill: cream,
+                hover_text: rgb(14, 12, 19), // tinta llena -> texto oscuro
+            },
+            secondary: BtnStyle {
+                fill: egui::Color32::TRANSPARENT,
+                text: rgb(183, 179, 193),
+                icon: rgb(127, 124, 138),
+                border: rgb(44, 41, 54),
+                hover_fill: rgba(255, 255, 255, 8),
+                hover_text: rgb(230, 227, 238),
+            },
+        }
+    }
+}
+
+/// Botón con estilo de tema (relleno/borde/hover) + icono vectorial + texto (Hanken peso 600).
+fn pill_button(ui: &mut egui::Ui, text: &str, icon: BtnIcon, st: BtnStyle) -> egui::Response {
     let font = egui::FontId::new(15.0, egui::FontFamily::Name("head".into()));
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, accent);
-    let (icon_w, pad, gap) = (16.0_f32, 16.0_f32, 9.0_f32);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), st.text);
+    let (icon_w, pad, gap) = (16.0_f32, 17.0_f32, 9.0_f32);
     let w = pad * 2.0 + icon_w + gap + galley.size().x;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 38.0), egui::Sense::click());
+    let hov = resp.hovered();
     let off = if resp.is_pointer_button_down_on() { egui::vec2(0.0, 1.0) } else { egui::Vec2::ZERO };
     let r = rect.translate(off);
     let p = ui.painter();
-    if resp.hovered() {
-        // relleno tenue rgba(acento, .08)
-        let h = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 20);
-        p.rect_filled(r, egui::CornerRadius::same(7), h);
+    let bg = if hov { st.hover_fill } else { st.fill };
+    if bg.a() > 0 {
+        p.rect_filled(r, egui::CornerRadius::same(7), bg);
     }
-    p.rect_stroke(r, egui::CornerRadius::same(7), egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+    if st.border.a() > 0 {
+        p.rect_stroke(r, egui::CornerRadius::same(7), egui::Stroke::new(1.5, st.border), egui::StrokeKind::Inside);
+    }
+    let (tcol, icol) = if hov { (st.hover_text, st.hover_text) } else { (st.text, st.icon) };
     let ic = egui::pos2(r.left() + pad + icon_w * 0.5, r.center().y);
-    draw_btn_icon(p, icon, ic, accent);
-    let tx = r.left() + pad + icon_w + gap;
-    p.galley(egui::pos2(tx, r.center().y - galley.size().y * 0.5), galley, accent);
+    draw_btn_icon(p, icon, ic, icol);
+    // Re-layout solo si cambia el color del texto al pasar el cursor.
+    let g = if hov { ui.painter().layout_no_wrap(text.to_string(), font, tcol) } else { galley };
+    p.galley(egui::pos2(r.left() + pad + icon_w + gap, r.center().y - g.size().y * 0.5), g, tcol);
     resp
 }
 
