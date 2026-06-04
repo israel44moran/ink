@@ -2896,6 +2896,15 @@ impl ApplicationHandler for App {
                                                 }
                                             }
                                         });
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("Arcade y demos").color(gray));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (id, name) in ARCADE_DESIGNS {
+                                                if ui.selectable_label(self.new_nb_finish == id, name).clicked() {
+                                                    self.new_nb_finish = id;
+                                                }
+                                            }
+                                        });
                                     });
                                     ui.add_space(6.0);
                                     ui.separator();
@@ -3290,6 +3299,12 @@ const LOADER3D_DESIGNS: [(u32, &str); 6] = [
     (304, "Cúmulo"), (305, "Espiral 3D"),
 ];
 
+/// Animaciones tipo retrowave / arcade clasico / generativas (id >= 400). Usan el Acento.
+const ARCADE_DESIGNS: [(u32, &str); 8] = [
+    (400, "Retrowave"), (401, "Hiperespacio"), (402, "Vórtice"), (403, "Invaders"),
+    (404, "Tetris"), (405, "Vida"), (406, "Flores"), (407, "Pac-Man"),
+];
+
 /// Capas COMBINABLES (bit, nombre).
 const FX_LAYERS: [(u32, &str); 3] = [(1, "Destellos"), (2, "Brillo animado"), (4, "Resplandor")];
 
@@ -3310,6 +3325,7 @@ fn finish_base_color(finish: u32) -> [f32; 3] {
         9 => [0.12, 0.03, 0.05],  // Rubí (rojo oscuro)
         10 => [0.20, 0.22, 0.26], // Cromo (gris medio)
         11 => [0.10, 0.05, 0.10], // Atardecer (calido oscuro)
+        f if f >= 400 => [0.02, 0.02, 0.04], // Arcade y demos: fondo oscuro
         f if f >= 300 => [0.04, 0.04, 0.06], // Cargadores 3D: fondo oscuro
         f if f >= 200 => [0.02, 0.02, 0.05], // Escenas 3D: espacio oscuro
         f if f >= 100 => [0.05, 0.05, 0.06], // Cargadores: fondo oscuro neutro

@@ -445,6 +445,240 @@ fn loader3d(id: i32, p: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+// ============== ARCADE Y DEMOS: animaciones retrowave / arcade / generativas ==============
+
+fn grid_line(x: f32, w: f32) -> f32 {
+    let g = min(fract(x), 1.0 - fract(x));
+    return 1.0 - smoothstep(0.0, w, g);
+}
+
+// Retrowave: cielo con sol de franjas + rejilla en perspectiva que avanza hacia el espectador.
+fn fx_retrowave(uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    let horizon = 0.52;
+    var col: vec3<f32>;
+    if (uv.y < horizon) {
+        col = mix(vec3<f32>(0.06, 0.02, 0.16), vec3<f32>(0.40, 0.07, 0.34), uv.y / horizon);
+        col = col + vec3<f32>(star_field(uv * vec2<f32>(1.0, 2.2), t)) * 0.5 * (1.0 - uv.y / horizon);
+        let sc = vec2<f32>(0.5, horizon - 0.02);
+        let d = distance(uv, sc);
+        let g = clamp((uv.y - (horizon - 0.26)) / 0.26, 0.0, 1.0);
+        let suncol = mix(vec3<f32>(1.0, 0.86, 0.2), vec3<f32>(1.0, 0.2, 0.5), g);
+        let sun = smoothstep(0.215, 0.205, d);
+        let stripe = step(0.0, sin((uv.y - horizon) * 150.0));
+        let mask = select(1.0, stripe, uv.y > sc.y);
+        col = mix(col, suncol, sun * mask);
+    } else {
+        col = vec3<f32>(0.03, 0.01, 0.06);
+        let fy = (uv.y - horizon) / (1.0 - horizon);
+        let z = 0.18 / (fy + 0.02);
+        let wx = (uv.x - 0.5) * z * 2.4;
+        let lh = grid_line(z * 3.0 - t * 2.2, 0.05);
+        let lv = grid_line(wx, 0.045);
+        let grid = max(lh, lv) * clamp(fy * 1.6, 0.0, 1.0);
+        let neon = mix(vec3<f32>(0.95, 0.1, 0.7), mix(vec3<f32>(0.1, 0.85, 1.0), accent, 0.4), fy);
+        col = col + neon * grid;
+    }
+    return col;
+}
+
+// Hiperespacio: estrellas que se alargan en rayos radiales (viaje a supervelocidad).
+fn fx_warp(p: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.01, 0.01, 0.03);
+    let ang = atan2(p.y, p.x);
+    let rad = length(p);
+    let spokes = 80.0;
+    let a01 = ang / 6.28318 + 0.5;
+    let cell = floor(a01 * spokes);
+    let rnd = hash21(vec2<f32>(cell, 3.0));
+    let rnd2 = hash21(vec2<f32>(cell, 9.0));
+    let speed = 0.5 + rnd * 1.3;
+    let head = fract(rnd2 + t * speed);
+    let len = 0.2 + rnd * 0.45;
+    let along = smoothstep(head, head - len, rad) * step(rad, head + 0.02);
+    let acen = abs(fract(a01 * spokes) - 0.5);
+    let line = smoothstep(0.5, 0.12, acen);
+    let star = along * line * smoothstep(0.0, 0.55, rad);
+    let tint = mix(vec3<f32>(0.8, 0.9, 1.0), accent, 0.45);
+    col = col + tint * star * 1.4 + tint * smoothstep(0.14, 0.0, rad) * 0.35;
+    return col;
+}
+
+// Vortice: espiral que gira y absorbe hacia el centro.
+fn fx_vortex(p: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    let ang = atan2(p.y, p.x);
+    let rad = length(p);
+    let sw = sin(4.0 * ang + 14.0 * log(rad + 0.06) - t * 3.0);
+    let band = smoothstep(0.0, 0.85, sw);
+    let fall = smoothstep(1.15, 0.0, rad);
+    var col = vec3<f32>(0.02, 0.01, 0.04);
+    let hue = fract(rad * 1.2 - t * 0.1);
+    col = col + mix(accent, hue2rgb(hue), 0.5) * band * fall;
+    col = col + accent * smoothstep(0.12, 0.0, rad) * 0.6;
+    return col;
+}
+
+// Sprite 8x8 de un "invasor" (dos fotogramas para la animacion de patas).
+fn invader_bit(lx: i32, ly: i32, frame: i32) -> f32 {
+    if (lx < 0 || lx > 7 || ly < 0 || ly > 7) { return 0.0; }
+    var row: i32 = 0;
+    if (frame == 0) {
+        var ra = array<i32, 8>(0x18, 0x3C, 0x7E, 0xDB, 0xFF, 0x5A, 0x81, 0x42);
+        row = ra[ly];
+    } else {
+        var rb = array<i32, 8>(0x18, 0x3C, 0x7E, 0xDB, 0xFF, 0x24, 0x42, 0xA5);
+        row = rb[ly];
+    }
+    return f32((row >> u32(7 - lx)) & 1);
+}
+
+// Space Invaders: formacion de invasores que se mueve + canon + bala.
+fn fx_invaders(uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.02, 0.02, 0.04);
+    let frame = i32(floor(t * 2.0)) & 1;
+    let sway = sin(t) * 0.10;
+    let descend = fract(t * 0.04) * 0.12;
+    let ax = (uv.x - 0.12 - sway) / 0.76;
+    let ay = (uv.y - 0.10 - descend) / 0.46;
+    if (ax > 0.0 && ax < 1.0 && ay > 0.0 && ay < 1.0) {
+        let cx = ax * 5.0;
+        let cy = ay * 3.0;
+        let lx = i32(floor(fract(cx) * 8.0));
+        let ly = i32(floor(fract(cy) * 8.0));
+        let acol = mix(accent, vec3<f32>(0.2, 1.0, 0.45), 0.45);
+        col = col + acol * invader_bit(lx, ly, frame);
+    }
+    let cannonx = 0.5 + sin(t * 1.3) * 0.32;
+    let base = step(abs(uv.x - cannonx), 0.05) * step(abs(uv.y - 0.93), 0.018);
+    let barrel = step(abs(uv.x - cannonx), 0.012) * step(abs(uv.y - 0.90), 0.02);
+    col = col + vec3<f32>(0.9, 0.95, 1.0) * clamp(base + barrel, 0.0, 1.0);
+    let by = 0.9 - fract(t * 0.7) * 0.78;
+    col = col + vec3<f32>(1.0, 1.0, 0.6) * step(abs(uv.x - cannonx), 0.006) * step(abs(uv.y - by), 0.03);
+    return col;
+}
+
+// Tetris: el pozo se llena de bloques de colores y se reinicia (con una pieza cayendo).
+fn fx_tetris(uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.03, 0.03, 0.05);
+    let w = 8.0; let h = 14.0;
+    let gx = floor(uv.x * w);
+    let gy = floor(uv.y * h);
+    let cycle = 11.0;
+    let prog = fract(t / cycle);
+    let epoch = floor(t / cycle);
+    let top = h - prog * h + (hash21(vec2<f32>(gx, epoch)) - 0.5) * 2.0; // borde superior irregular
+    var filled = select(0.0, 1.0, gy > top);
+    // Pieza cayendo (2 celdas) en una columna pseudo-aleatoria.
+    let pcol = floor(hash21(vec2<f32>(floor(t * 1.5), epoch)) * w);
+    let py = fract(t * 1.5) * (top + 1.0);
+    if (abs(gx - pcol) < 0.5 && gy >= floor(py) && gy <= floor(py) + 1.0) { filled = 1.0; }
+    if (filled > 0.5) {
+        let bcol = hue2rgb(fract(hash21(vec2<f32>(gx, gy)) + 0.05));
+        let lx = fract(uv.x * w); let ly = fract(uv.y * h);
+        let edge = step(0.1, lx) * step(lx, 0.9) * step(0.1, ly) * step(ly, 0.9);
+        col = mix(bcol * 0.45, bcol, edge);
+    }
+    return col;
+}
+
+fn life_seed(idx: i32, n: i32, epoch: f32) -> i32 {
+    let x = f32(idx % n);
+    let y = f32(idx / n);
+    return select(0, 1, hash21(vec2<f32>(x + epoch * 13.0, y + epoch * 7.0)) > 0.56);
+}
+
+// Juego de la Vida de Conway: se siembra y evoluciona unas generaciones; luego reinicia.
+fn fx_life(uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    let n = 10;
+    let maxgen = 8.0;
+    let g = t * 3.0;
+    let epoch = floor(g / maxgen);
+    let gen = i32(floor(g % maxgen));
+    var cur = array<i32, 100>();
+    for (var i = 0; i < 100; i = i + 1) { cur[i] = life_seed(i, n, epoch); }
+    for (var s = 0; s < gen; s = s + 1) {
+        var nxt = array<i32, 100>();
+        for (var y = 0; y < n; y = y + 1) {
+            for (var x = 0; x < n; x = x + 1) {
+                var cnt = 0;
+                for (var dy = -1; dy <= 1; dy = dy + 1) {
+                    for (var dx = -1; dx <= 1; dx = dx + 1) {
+                        if (dx == 0 && dy == 0) { continue; }
+                        let xx = (x + dx + n) % n;
+                        let yy = (y + dy + n) % n;
+                        cnt = cnt + cur[yy * n + xx];
+                    }
+                }
+                let alive = cur[y * n + x];
+                var nv = 0;
+                if (alive == 1 && (cnt == 2 || cnt == 3)) { nv = 1; }
+                if (alive == 0 && cnt == 3) { nv = 1; }
+                nxt[y * n + x] = nv;
+            }
+        }
+        cur = nxt;
+    }
+    let cx = i32(floor(uv.x * f32(n)));
+    let cy = i32(floor(uv.y * f32(n)));
+    let idx = clamp(cy * n + cx, 0, 99);
+    var col = vec3<f32>(0.03, 0.04, 0.05);
+    if (cur[idx] == 1) {
+        let lx = fract(uv.x * f32(n));
+        let ly = fract(uv.y * f32(n));
+        let cell = smoothstep(0.08, 0.18, lx) * smoothstep(0.08, 0.18, 1.0 - lx)
+                 * smoothstep(0.08, 0.18, ly) * smoothstep(0.08, 0.18, 1.0 - ly);
+        col = mix(col, accent, cell);
+    }
+    return col;
+}
+
+// Flores creciendo: petalos (rosa polar) que florecen y se reinician, en varias fases.
+fn fx_flowers(p: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.02, 0.03, 0.02);
+    for (var i = 0; i < 3; i = i + 1) {
+        let fi = f32(i);
+        let center = vec2<f32>((fi - 1.0) * 0.55, 0.18 * sin(fi * 2.0));
+        let q = p - center;
+        let ang = atan2(q.y, q.x);
+        let rad = length(q);
+        let bloom = fract(t * 0.2 + fi * 0.33);
+        let pr = (0.16 + 0.18 * abs(cos(ang * 3.0))) * smoothstep(0.0, 0.35, bloom) * (0.45 + 0.55 * bloom);
+        let pet = smoothstep(0.02, -0.02, rad - pr);
+        let pcol = mix(accent, vec3<f32>(1.0, 0.82, 0.25), 0.5 + 0.5 * sin(fi * 2.0));
+        col = mix(col, pcol, pet);
+        col = mix(col, vec3<f32>(1.0, 0.85, 0.25), smoothstep(0.045, 0.0, rad) * step(0.12, bloom));
+    }
+    return col;
+}
+
+// Pac-Man: se mueve comiendo puntos (boca que abre/cierra) con un fantasma detras.
+fn fx_pacman(uv: vec2<f32>, t: f32, aspect: f32, accent: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.02, 0.02, 0.06);
+    let y = 0.5;
+    let px = fract(t * 0.22) * 1.3 - 0.15;
+    let dotrow = step(abs(uv.y - y), 0.02) * step(0.4, fract(uv.x * 12.0)) * step(fract(uv.x * 12.0), 0.6);
+    col = col + vec3<f32>(1.0, 1.0, 0.7) * dotrow * (1.0 - step(uv.x, px));
+    let pd = vec2<f32>(uv.x - px, (uv.y - y) * aspect);
+    let pang = abs(atan2(pd.y, pd.x));
+    let mouth = 0.15 + 0.4 * abs(sin(t * 8.0));
+    col = mix(col, vec3<f32>(1.0, 0.9, 0.1), step(length(pd), 0.07) * step(mouth, pang));
+    let gx = px - 0.2;
+    let gd = vec2<f32>(uv.x - gx, (uv.y - y) * aspect);
+    let dome = step(length(vec2<f32>(gd.x, min(gd.y, 0.0))), 0.055) * step(abs(gd.x), 0.055) * step(gd.y, 0.05) * step(-0.06, gd.y);
+    col = mix(col, vec3<f32>(1.0, 0.35, 0.35), clamp(dome, 0.0, 1.0));
+    return col;
+}
+
+fn arcade(id: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, aspect: f32, accent: vec3<f32>) -> vec3<f32> {
+    if (id == 0) { return fx_retrowave(uv, t, accent); }
+    else if (id == 1) { return fx_warp(p, t, accent); }
+    else if (id == 2) { return fx_vortex(p, t, accent); }
+    else if (id == 3) { return fx_invaders(uv, t, accent); }
+    else if (id == 4) { return fx_tetris(uv, t, accent); }
+    else if (id == 5) { return fx_life(uv, t, accent); }
+    else if (id == 6) { return fx_flowers(p, t, accent); }
+    return fx_pacman(uv, t, aspect, accent);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Esquinas redondeadas (SDF) con borde suave (alfa).
@@ -466,7 +700,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let gd = distance(in.uv, in.pointer);
     let glare = smoothstep(0.55, 0.0, gd) * 0.45 * h;
 
-    if (fin >= 300) {
+    if (fin >= 400) {
+        // ---------------- ARCADE Y DEMOS (retrowave / arcade / generativas) ----------------
+        var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
+        p.y = p.y * in.aspect;
+        col = arcade(fin - 400, p, in.uv, t, in.aspect, in.accent);
+    } else if (fin >= 300) {
         // ---------------- CARGADORES 3D (esferas en perspectiva) ----------------
         var p = (in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
         p.y = p.y * in.aspect;
