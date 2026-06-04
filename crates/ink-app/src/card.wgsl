@@ -302,30 +302,52 @@ fn attractor_deriv(id: i32, s: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(-s.y - s.z, s.x + a * s.y, b + s.z * (s.x - c));
 }
 
-// Dibuja un atractor extraño (integrando su ODE en cada pixel y acumulando brillo por
-// cercania a la trayectoria) girando lentamente, en el color de acento.
+const ATTR_N: i32 = 520;
+
+// Dibuja un atractor extraño TRAZANDOSE: un "cabezal" recorre la trayectoria (integrada en
+// cada pixel) dejando estela, de modo que la curva se va GENERANDO y reinicia en ciclo. Gira
+// lento para apreciar el 3D. El color es el de acento.
 fn attractor_scene(aid: i32, p: vec2<f32>, uv: vec2<f32>, t: f32, accent: vec3<f32>) -> vec3<f32> {
     var col = vec3<f32>(0.02, 0.02, 0.05) + vec3<f32>(star_field(uv, t)) * 0.5;
     var s = vec3<f32>(0.1, 0.0, 0.0);
-    var dt = 0.005; var scale = 0.045; var center = vec3<f32>(0.0, 0.0, 25.0);
-    if (aid == 1) { s = vec3<f32>(0.1, 0.0, 0.0); dt = 0.01; scale = 0.62; center = vec3<f32>(0.0, 0.0, 0.0); }
-    else if (aid == 2) { s = vec3<f32>(-1.0, 0.0, 0.0); dt = 0.005; scale = 0.085; center = vec3<f32>(-2.0, -2.0, -2.0); }
-    else if (aid == 3) { s = vec3<f32>(0.5, 0.1, 0.0); dt = 0.04; scale = 0.22; center = vec3<f32>(0.0, 0.0, 0.0); }
-    else if (aid == 4) { s = vec3<f32>(0.1, 0.0, 0.0); dt = 0.025; scale = 0.075; center = vec3<f32>(0.0, 0.0, 6.0); }
-    // Calentamiento: entrar en el atractor (descartar el transitorio).
-    for (var w: i32 = 0; w < 60; w = w + 1) { s = s + attractor_deriv(aid, s) * dt; }
-    let ang = t * 0.3;
+    var dt = 0.0075; var scale = 0.045; var center = vec3<f32>(0.0, 0.0, 25.0);
+    var warm: i32 = 60;
+    if (aid == 1) { s = vec3<f32>(0.1, 0.0, 0.0); dt = 0.014; scale = 0.62; center = vec3<f32>(0.0, 0.0, 0.0); }
+    else if (aid == 2) { s = vec3<f32>(-1.0, 0.0, 0.0); dt = 0.0075; scale = 0.085; center = vec3<f32>(-2.0, -2.0, -2.0); }
+    else if (aid == 3) { s = vec3<f32>(0.5, 0.1, 0.0); dt = 0.06; scale = 0.22; center = vec3<f32>(0.0, 0.0, 0.0); }
+    else if (aid == 4) { s = vec3<f32>(-6.0, 0.0, 0.0); dt = 0.013; scale = 0.085; center = vec3<f32>(0.0, 0.0, 3.0); warm = 360; }
+    // Calentamiento: entrar en el atractor (descartar el transitorio; Rössler tarda mas).
+    for (var w: i32 = 0; w < warm; w = w + 1) { s = s + attractor_deriv(aid, s) * dt; }
+    // Progreso del trazado (ciclo): el cabezal avanza de 0 a N y reinicia.
+    let prog = fract(t * 0.13);
+    let head = prog * f32(ATTR_N);
+    // Atenuacion suave al reiniciar el ciclo (entra/sale sin saltos bruscos).
+    let cyc = smoothstep(0.0, 0.06, prog) * smoothstep(1.0, 0.92, prog);
+    // Balanceo suave (no giro completo) para no colapsar la proyeccion de atractores planos.
+    let ang = sin(t * 0.25) * 0.55;
     let ca = cos(ang); let sa = sin(ang);
     var glow = 0.0;
-    for (var i: i32 = 0; i < 240; i = i + 1) {
+    var head_glow = 0.0;
+    for (var i: i32 = 0; i < ATTR_N; i = i + 1) {
         s = s + attractor_deriv(aid, s) * dt;
         let q = (s - center) * scale;
         let x2 = q.x * ca + q.z * sa;     // giro lento alrededor de Y
         let proj = vec2<f32>(x2, q.y);
         let dd = dot(p - proj, p - proj);
-        glow += 0.00006 / (dd + 0.0008);
+        let fi = f32(i);
+        // Solo lo ya recorrido por el cabezal es visible (la curva "crece").
+        let drawn = smoothstep(head + 2.0, head - 2.0, fi);
+        let behind = max(head - fi, 0.0);          // distancia detras del cabezal
+        let comet = exp(-behind / 14.0);           // realce compacto que viaja con el cabezal
+        let bright = 0.000038 / (dd + 0.0005);     // linea fina
+        glow = glow + drawn * (0.6 + 1.5 * comet) * bright;
+        head_glow = head_glow + drawn * comet * bright;
     }
-    return col + accent * glow;
+    // Mapeo de tono: comprime los cruces de la curva para ver la ESTRUCTURA (no un borron
+    // blanco). Cuerpo en el color de acento + nucleo del cabezal blanco.
+    let att = accent * glow + vec3<f32>(1.0, 1.0, 1.0) * head_glow * 0.5;
+    let mapped = vec3<f32>(1.0, 1.0, 1.0) - exp(-att * 1.5);
+    return col + mapped * cyc;
 }
 
 @fragment
