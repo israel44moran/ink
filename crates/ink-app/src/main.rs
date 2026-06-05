@@ -209,6 +209,8 @@ struct App {
     cell_focus: bool,
     /// Desplazamiento horizontal de la tabla ancha (cuando excede el ancho de la hoja).
     table_hscroll: f32,
+    /// Desplazamiento vertical de la tabla alta (cuando es mas alta que una hoja entera).
+    table_vscroll: f32,
     /// El popup de tamaño de tabla esta abierto: se dibuja una tabla de muestra en la hoja
     /// (tamaño real) para decidir el tamaño antes de insertar.
     table_size_popup: bool,
@@ -437,6 +439,7 @@ impl App {
             cell_buf: String::new(),
             cell_focus: false,
             table_hscroll: 0.0,
+            table_vscroll: 0.0,
             table_size_popup: false,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
@@ -2935,7 +2938,7 @@ impl App {
         // "+columna" y para que la tabla NUNCA invada el margen derecho de la hoja.
         let avail_w = (rect.width() - 24.0).max(40.0);
         for (cstart, cend, cells, top, col_scale, row_scale) in tables {
-            self.render_table(ctx, cstart, cend, &cells, top, avail_w, size_pts, fam.clone(), text_col, col_scale, row_scale);
+            self.render_table(ctx, cstart, cend, &cells, top, avail_w, rect.top(), rect.bottom(), size_pts, fam.clone(), text_col, col_scale, row_scale);
         }
         // Vista previa EN LA HOJA (tamaño real) mientras el popup de tamaño esta abierto.
         if preview_active {
@@ -2978,7 +2981,7 @@ impl App {
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
     /// con el texto); si la tabla supera el ancho de la hoja aparece un DESLIZADOR horizontal.
     /// Celdas editables (clic), Enter pasa a la fila siguiente (creandola), y botones "+".
-    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32, col_scale: f32, row_scale: f32) {
+    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, content_top: f32, content_bottom: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32, col_scale: f32, row_scale: f32) {
         if cells.is_empty() {
             return;
         }
@@ -2997,6 +3000,7 @@ impl App {
         let mut start_edit: Option<(usize, usize)> = None;
         let (mut add_col, mut add_row, mut lost, mut enter_row) = (false, false, false, false);
         let mut scroll_x = self.table_hscroll.max(0.0);
+        let mut scroll_y = self.table_vscroll.max(0.0);
         egui::Area::new(egui::Id::new(("doc_table", cstart)))
             .order(egui::Order::Foreground)
             .fixed_pos(top)
@@ -3027,28 +3031,41 @@ impl App {
                 for c in 0..ncols {
                     xstart[c + 1] = xstart[c] + col_w[c];
                 }
-                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 21.0, th + 38.0)));
+                // Scroll VERTICAL: si la tabla (empezando arriba de la hoja) es mas alta que lo que
+                // queda hasta el margen inferior, se recorta y aparece un deslizador vertical para
+                // que NUNCA invada el margen.
+                let avail_h = (content_bottom - top.y).max(cell_h);
+                let starts_top = top.y <= content_top + cell_h * 1.5;
+                let has_vscroll = starts_top && th > avail_h + 1.0;
+                let max_vscroll = if has_vscroll { (th - avail_h).max(0.0) } else { 0.0 };
+                scroll_y = if has_vscroll { scroll_y.clamp(0.0, max_vscroll) } else { 0.0 };
+                let view_h = if has_vscroll { avail_h } else { th };
+                let oy = top.y - scroll_y;
+                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 22.0, view_h + if has_vscroll { 4.0 } else { 38.0 })));
                 let painter = ui.painter().clone();
-                // Painter recortado EXACTO al area de la tabla: el texto de las celdas no se sale
-                // por el borde derecho (al desplazar) ni invade el margen.
-                let cellp = painter.with_clip_rect(egui::Rect::from_min_size(egui::pos2(top.x, top.y - 1.0), egui::vec2(view_w, th + 2.0)));
+                // Painter recortado EXACTO al area visible: el texto no se sale por ningun borde
+                // (al desplazar) ni invade el margen.
+                let cellp = painter.with_clip_rect(egui::Rect::from_min_size(egui::pos2(top.x, top.y - 1.0), egui::vec2(view_w, view_h + 2.0)));
                 let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
                 let ox = top.x - scroll_x;
                 for r in 0..=nrows {
-                    let y = top.y + r as f32 * cell_h;
-                    painter.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + view_w, y)], grid);
+                    let y = oy + r as f32 * cell_h;
+                    if y >= top.y - 0.5 && y <= top.y + view_h + 0.5 {
+                        painter.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + view_w, y)], grid);
+                    }
                 }
                 for c in 0..=ncols {
                     let x = ox + xstart[c];
                     if x >= top.x - 0.5 && x <= top.x + view_w + 0.5 {
-                        painter.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], grid);
+                        painter.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + view_h)], grid);
                     }
                 }
                 for r in 0..nrows {
                     for c in 0..ncols {
                         let cx = ox + xstart[c];
-                        let crect = egui::Rect::from_min_size(egui::pos2(cx, top.y + r as f32 * cell_h), egui::vec2(col_w[c], cell_h));
-                        if crect.right() < top.x - 0.5 || crect.left() > top.x + view_w + 0.5 {
+                        let cy = oy + r as f32 * cell_h;
+                        let crect = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(col_w[c], cell_h));
+                        if crect.right() < top.x - 0.5 || crect.left() > top.x + view_w + 0.5 || crect.bottom() < top.y - 0.5 || crect.top() > top.y + view_h + 0.5 {
                             continue; // fuera del area visible (scroll)
                         }
                         if editing == Some((cstart, r, c)) {
@@ -3076,9 +3093,11 @@ impl App {
                     }
                 }
                 // Botones "+": solo al pasar el cursor; transparentes (solo el "+").
-                let near = egui::Rect::from_min_size(top, egui::vec2(view_w + 24.0, th + 34.0));
+                let near = egui::Rect::from_min_size(top, egui::vec2(view_w + 24.0, view_h + if has_vscroll { 4.0 } else { 34.0 }));
                 let hovering = ui.rect_contains_pointer(near);
-                let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + view_w + 3.0, top.y), egui::vec2(18.0, th));
+                // +columna (derecha); si hay deslizador vertical, se corre para dejarle sitio.
+                let cbtn_x = top.x + view_w + if has_vscroll { 9.0 } else { 3.0 };
+                let cbtn = egui::Rect::from_min_size(egui::pos2(cbtn_x, top.y), egui::vec2(13.0, view_h));
                 let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
                 if hovering || cr.hovered() {
                     let col = if cr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
@@ -3087,19 +3106,23 @@ impl App {
                 if cr.clicked() {
                     add_col = true;
                 }
-                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 2.0), egui::vec2(view_w, 13.0));
-                let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
-                if hovering || rr.hovered() {
-                    let col = if rr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
-                    painter.text(egui::pos2(top.x + view_w * 0.5, rbtn.center().y), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
+                // +fila (abajo): solo si la tabla NO esta recortada verticalmente (si no, caeria en
+                // el margen inferior; en ese caso se añaden filas con Enter).
+                if !has_vscroll {
+                    let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + view_h + 2.0), egui::vec2(view_w, 13.0));
+                    let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
+                    if hovering || rr.hovered() {
+                        let col = if rr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
+                        painter.text(egui::pos2(top.x + view_w * 0.5, rbtn.center().y), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
+                    }
+                    if rr.clicked() {
+                        add_row = true;
+                    }
                 }
-                if rr.clicked() {
-                    add_row = true;
-                }
-                // Deslizador horizontal: SOLO al acercar el cursor; se arrastra siguiendo el
-                // puntero (interact_pos es mas fiable que drag_delta para una barra propia).
+                // Deslizador HORIZONTAL: SOLO al acercar el cursor; se arrastra siguiendo el puntero
+                // (interact_pos es mas fiable que drag_delta para una barra propia).
                 if has_scroll {
-                    let sy = top.y + th + 18.0;
+                    let sy = if has_vscroll { top.y + view_h - 12.0 } else { top.y + view_h + 18.0 };
                     let track = egui::Rect::from_min_size(egui::pos2(top.x, sy), egui::vec2(view_w, 10.0));
                     let sresp = ui.interact(track, egui::Id::new(("tscroll", cstart)), egui::Sense::click_and_drag());
                     let thumb_w = (view_w * view_w / total_w).clamp(30.0, view_w);
@@ -3118,8 +3141,30 @@ impl App {
                         painter.rect_filled(thumb, egui::CornerRadius::same(5), if active { egui::Color32::from_gray(190) } else { egui::Color32::from_gray(135) });
                     }
                 }
+                // Deslizador VERTICAL: cuando la tabla es mas alta que la hoja. A la derecha.
+                if has_vscroll {
+                    let sx = top.x + view_w + 2.0;
+                    let track = egui::Rect::from_min_size(egui::pos2(sx, top.y), egui::vec2(6.0, view_h));
+                    let vresp = ui.interact(track, egui::Id::new(("tvscroll", cstart)), egui::Sense::click_and_drag());
+                    let thumb_h = (view_h * view_h / th).clamp(30.0, view_h);
+                    let active = vresp.dragged() || vresp.is_pointer_button_down_on();
+                    if active {
+                        if let Some(py) = ui.input(|i| i.pointer.interact_pos().map(|p| p.y)) {
+                            let denom = (view_h - thumb_h).max(1.0);
+                            scroll_y = (((py - top.y - thumb_h * 0.5) / denom).clamp(0.0, 1.0)) * max_vscroll;
+                        }
+                    }
+                    if hovering || vresp.hovered() || active {
+                        painter.rect_filled(track, egui::CornerRadius::same(3), egui::Color32::from_gray(80));
+                        let frac = if max_vscroll > 0.0 { scroll_y / max_vscroll } else { 0.0 };
+                        let thumb_y = top.y + frac * (view_h - thumb_h);
+                        let thumb = egui::Rect::from_min_size(egui::pos2(sx, thumb_y), egui::vec2(6.0, thumb_h));
+                        painter.rect_filled(thumb, egui::CornerRadius::same(3), if active { egui::Color32::from_gray(190) } else { egui::Color32::from_gray(135) });
+                    }
+                }
             });
         self.table_hscroll = scroll_x;
+        self.table_vscroll = scroll_y;
         // Consumir la peticion de foco (ya se pidio este frame).
         if want_focus {
             self.cell_focus = false;
