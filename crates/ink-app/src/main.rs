@@ -217,6 +217,12 @@ struct App {
     /// Rect de la barra "page_nav" (donde esta el boton "Página…"): para no cerrar el panel de
     /// Diseño de pagina con el mismo clic que lo abre.
     page_nav_rect: Option<egui::Rect>,
+    /// Vista "cubo": carrusel 3D de las hojas del cuaderno para navegar rapido.
+    cube_view: bool,
+    /// Progreso de la transicion de entrada/salida del cubo (0 = fuera, 1 = dentro).
+    cube_anim: f32,
+    /// Giro horizontal del cubo (rueda del raton).
+    cube_yaw: f32,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -445,6 +451,9 @@ impl App {
             table_vscroll: 0.0,
             table_size_popup: false,
             page_nav_rect: None,
+            cube_view: false,
+            cube_anim: 0.0,
+            cube_yaw: 0.0,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2982,6 +2991,127 @@ impl App {
             });
     }
 
+    /// Vista CUBO: carrusel 3D con las hojas del cuaderno en las caras de un prisma que flota y
+    /// gira con la rueda. Devuelve la hoja sobre la que se hizo clic (para ir a ella). Sale si se
+    /// hace clic fuera de las tarjetas. La transicion de entrada/salida la controla `cube_anim`.
+    fn draw_cube_view(&mut self, ctx: &egui::Context) -> Option<usize> {
+        let t = self.cube_anim;
+        if t <= 0.003 {
+            return None;
+        }
+        let screen = ctx.screen_rect();
+        let center = egui::pos2(screen.center().x, screen.center().y - screen.height() * 0.08);
+        let n = self.pages.len().max(1);
+        let yaw = self.cube_yaw;
+        let pitch = 0.16_f32;
+        let radius = ((n as f32) * 0.5).clamp(1.5, 7.0);
+        let dist = radius + 4.5;
+        let focal = screen.height() * 0.82 * t;
+        let bob = (self.clock * 1.1).sin() * 0.06; // flotacion como las cartas del home
+        let (cw, ch) = (0.62, 0.86); // semi-ancho/alto de tarjeta (proporcion hoja)
+        let (sp, cp) = (pitch.sin(), pitch.cos());
+        let project = |x: f32, y: f32, z: f32| -> (egui::Pos2, f32) {
+            let y = y + bob;
+            let y2 = y * cp - z * sp;
+            let z2 = y * sp + z * cp;
+            let zc = (dist - z2).max(0.35);
+            let s = focal / zc;
+            (egui::pos2(center.x + x * s, center.y - y2 * s), zc)
+        };
+        // Lineas de contenido por hoja (esquematico), extraidas antes del closure.
+        let body_lines: Vec<usize> = (0..n)
+            .map(|i| self.pages.get(i).map_or(0, |p| p.body.lines().filter(|l| !l.trim().is_empty()).count().min(6)))
+            .collect();
+        let current = self.current_page;
+        struct Card {
+            idx: usize,
+            zc: f32,
+            quad: [egui::Pos2; 4],
+            scenter: f32,
+            facing: bool,
+        }
+        // Separacion angular entre hojas: con pocas hojas no cerramos el circulo (menos escorzo).
+        let step = std::f32::consts::TAU / (n.max(7) as f32);
+        let mut cards: Vec<Card> = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = i as f32 * step + yaw;
+            let (sa, ca) = (a.sin(), a.cos());
+            let (cx3, cz3) = (radius * sa, radius * ca);
+            let (tx, tz) = (ca, -sa); // tangente (direccion del ancho)
+            let corner = |dx: f32, dy: f32| (cx3 + dx * cw * tx, dy * ch, cz3 + dx * cw * tz);
+            let c3 = [corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0)];
+            let mut quad = [egui::Pos2::ZERO; 4];
+            for (k, &(x, y, z)) in c3.iter().enumerate() {
+                quad[k] = project(x, y, z).0;
+            }
+            let (_pc, zcc) = project(cx3, 0.0, cz3);
+            let scenter = focal / zcc;
+            let facing = ca > 0.16; // mira a la camara (incluye las vecinas escorzadas)
+            cards.push(Card { idx: i, zc: zcc, quad, scenter, facing });
+        }
+        cards.sort_by(|a, b| b.zc.partial_cmp(&a.zc).unwrap_or(std::cmp::Ordering::Equal));
+        let area = egui::Area::new(egui::Id::new("cube_view"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(screen); // el overlay cubre TODA la pantalla
+                let resp = ui.interact(screen, egui::Id::new("cube_bg"), egui::Sense::click());
+                let painter = ui.painter();
+                painter.rect_filled(screen, egui::CornerRadius::same(0), egui::Color32::from_black_alpha((t * 208.0) as u8));
+                let pointer = ui.input(|i| i.pointer.interact_pos());
+                let clicked = resp.clicked();
+                let mut goto = None;
+                for card in &cards {
+                    if !card.facing {
+                        continue;
+                    }
+                    let hovered = pointer.is_some_and(|pt| point_in_quad(pt, &card.quad));
+                    let depth = ((dist - card.zc) / (2.0 * radius)).clamp(0.0, 1.0);
+                    let shade = (175.0 + depth * 80.0) as u8;
+                    let paper = if hovered { egui::Color32::from_rgb(255, 251, 232) } else { egui::Color32::from_rgb(shade, shade, shade.saturating_add(2)) };
+                    let mut mesh = egui::Mesh::default();
+                    for &v in &card.quad {
+                        mesh.colored_vertex(v, paper);
+                    }
+                    mesh.add_triangle(0, 1, 2);
+                    mesh.add_triangle(0, 2, 3);
+                    painter.add(egui::Shape::mesh(mesh));
+                    let bcol = if hovered { egui::Color32::from_rgb(110, 155, 225) } else { egui::Color32::from_gray(95) };
+                    painter.add(egui::Shape::closed_line(card.quad.to_vec(), egui::Stroke::new(if hovered { 2.4 } else { 1.2 }, bcol)));
+                    // Interpolacion bilineal en el quad para colocar el contenido en perspectiva.
+                    let at = |u: f32, v: f32| {
+                        let topp = card.quad[0] + (card.quad[1] - card.quad[0]) * u;
+                        let botp = card.quad[3] + (card.quad[2] - card.quad[3]) * u;
+                        topp + (botp - topp) * v
+                    };
+                    let fsize = (card.scenter * 0.20).clamp(9.0, 64.0);
+                    painter.text(at(0.5, 0.2), egui::Align2::CENTER_CENTER, format!("{}", card.idx + 1), egui::FontId::new(fsize, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(70));
+                    let lw = (card.scenter * 0.012).clamp(1.0, 4.0);
+                    for li in 0..body_lines[card.idx] {
+                        let vv = 0.42 + li as f32 * 0.085;
+                        let len = if li % 3 == 2 { 0.48 } else { 0.70 };
+                        painter.line_segment([at(0.16, vv), at(0.16 + len, vv)], egui::Stroke::new(lw, egui::Color32::from_gray(155)));
+                    }
+                    if card.idx == current {
+                        painter.add(egui::Shape::closed_line(card.quad.to_vec(), egui::Stroke::new(2.6, egui::Color32::from_rgb(150, 120, 84))));
+                    }
+                    if clicked && hovered {
+                        goto = Some(card.idx);
+                    }
+                }
+                painter.text(egui::pos2(center.x, screen.bottom() - 26.0), egui::Align2::CENTER_CENTER, "Rueda para girar  ·  clic en una hoja para ir  ·  Esc para salir", egui::FontId::proportional(13.0), egui::Color32::from_white_alpha((t * 200.0) as u8));
+                (clicked, goto)
+            });
+        let (bg_clicked, goto) = area.inner;
+        if goto.is_none() && bg_clicked {
+            self.cube_view = false; // clic fuera de las tarjetas: salir sin cambiar de hoja
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cube_view = false;
+        }
+        goto
+    }
+
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
     /// con el texto); si la tabla supera el ancho de la hoja aparece un DESLIZADOR horizontal.
     /// Celdas editables (clic), Enter pasa a la fila siguiente (creandola), y botones "+".
@@ -4096,7 +4226,10 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                 };
-                if self.app_mode == AppMode::Library && self.preview_idx.is_some() && amount != 0.0 {
+                if self.cube_view {
+                    // En la vista CUBO la rueda GIRA el carrusel de hojas.
+                    self.cube_yaw += amount * 0.30;
+                } else if self.app_mode == AppMode::Library && self.preview_idx.is_some() && amount != 0.0 {
                     // En VISTA PREVIA, la rueda PASA DE PAGINA (arriba = anterior, abajo = siguiente).
                     self.preview_flip(if amount > 0.0 { -1 } else { 1 });
                 } else if self.app_mode == AppMode::Library && !self.creating_nb && amount != 0.0 {
@@ -4116,7 +4249,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                if !egui_consumed && self.app_mode == AppMode::Canvas {
+                if !egui_consumed && self.app_mode == AppMode::Canvas && !self.cube_view {
                     if amount != 0.0 {
                         // Hace zoom el lienzo infinito siempre; en los cuadernos de hojas la
                         // rueda pasa de pagina, salvo con Alt (zoom) cuando la hoja no esta fija.
@@ -4350,6 +4483,9 @@ impl ApplicationHandler for App {
                 self.last_frame = now;
                 // Reloj de animacion de las cartas (acotado para no dar saltos al reanudar).
                 self.clock += dt.min(0.05);
+                // Transicion suave de entrada/salida del cubo (como el bobbing del home, con dt).
+                let cube_target = if self.cube_view { 1.0 } else { 0.0 };
+                self.cube_anim += (cube_target - self.cube_anim) * (1.0 - (-9.0 * dt.min(0.05)).exp());
                 self.fps_timer += dt;
                 self.fps_frames += 1;
                 if self.fps_timer >= 0.5 {
@@ -4468,6 +4604,8 @@ impl ApplicationHandler for App {
                 let mut page_lock_toggle = false;
                 let mut toggle_write = false;
                 let mut toggle_setup = false;
+                let mut toggle_cube = false;
+                let mut cube_goto: Option<usize> = None;
                 let mut md_action: Option<Md> = None;
                 let mut md_color: Option<([u8; 3], bool)> = None;
                 let mut doc_undo_flag = false;
@@ -4678,6 +4816,10 @@ impl ApplicationHandler for App {
                                         if ui.button("➕ Hoja").clicked() {
                                             page_add = true;
                                         }
+                                        // Vista CUBO: carrusel 3D de las hojas para navegar rapido.
+                                        if cube_button(ui, self.cube_view).on_hover_text("Ver las hojas en 3D").clicked() {
+                                            toggle_cube = true;
+                                        }
                                         let lock_lbl = if self.lock_page { "🔒 Fijada" } else { "🔓 Fijar" };
                                         if ui.selectable_label(self.lock_page, lock_lbl).clicked() {
                                             page_lock_toggle = true;
@@ -4696,6 +4838,11 @@ impl ApplicationHandler for App {
                                 });
                             });
                         self.page_nav_rect = Some(nav_resp.response.rect);
+                    }
+
+                    // Vista CUBO 3D de las hojas (overlay por encima de todo).
+                    if self.cube_view || self.cube_anim > 0.003 {
+                        cube_goto = self.draw_cube_view(ctx);
                     }
 
                     // (El selector de pinceles de Photoshop se fusiono con el panel "Mis
@@ -5602,6 +5749,21 @@ impl ApplicationHandler for App {
                 }
                 if toggle_setup {
                     self.show_page_setup = !self.show_page_setup;
+                }
+                if toggle_cube {
+                    self.cube_view = !self.cube_view;
+                    if self.cube_view {
+                        // Abrir el cubo con la hoja ACTUAL al frente.
+                        let step = std::f32::consts::TAU / (self.pages.len().max(7) as f32);
+                        self.cube_yaw = -(self.current_page as f32) * step;
+                    }
+                }
+                // Seleccion de hoja en el cubo: ir a esa hoja y salir de la vista.
+                if let Some(idx) = cube_goto {
+                    if idx != self.current_page {
+                        self.switch_page(idx);
+                    }
+                    self.cube_view = false;
                 }
                 // Tamano de la proxima tabla ajustado en el popup hover (defaults para tablas nuevas).
                 if (table_scale - self.doc_layout.table_scale).abs() > 1e-4 {
@@ -6553,6 +6715,55 @@ fn doc_pencil_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
     p.line_segment([egui::pos2(c.x - 4.0, c.y + 3.4), egui::pos2(c.x + 4.0, c.y + 3.4)], egui::Stroke::new(1.4, col));
     p.text(egui::pos2(rect.left() + 24.0, rect.center().y), egui::Align2::LEFT_CENTER, "Escribir", egui::FontId::proportional(14.0), col);
     resp
+}
+
+/// Boton con un CUBO isometrico (vista 3D de las hojas). Resalta si la vista esta activa.
+fn cube_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 24.0), egui::Sense::click());
+    let p = ui.painter();
+    let bg = if active {
+        egui::Color32::from_rgb(120, 178, 235)
+    } else if resp.hovered() {
+        egui::Color32::from_gray(228)
+    } else {
+        egui::Color32::from_gray(238)
+    };
+    p.rect_filled(rect, egui::CornerRadius::same(5), bg);
+    let col = if active { egui::Color32::WHITE } else { egui::Color32::from_gray(60) };
+    let c = rect.center();
+    let s = 7.5;
+    let h = s * 0.866;
+    let top = egui::pos2(c.x, c.y - s);
+    let ur = egui::pos2(c.x + h, c.y - s * 0.5);
+    let lr = egui::pos2(c.x + h, c.y + s * 0.5);
+    let bot = egui::pos2(c.x, c.y + s);
+    let ll = egui::pos2(c.x - h, c.y + s * 0.5);
+    let ul = egui::pos2(c.x - h, c.y - s * 0.5);
+    let st = egui::Stroke::new(1.5, col);
+    p.add(egui::Shape::closed_line(vec![top, ur, lr, bot, ll, ul], st));
+    p.line_segment([c, ur], st);
+    p.line_segment([c, bot], st);
+    p.line_segment([c, ul], st);
+    resp
+}
+
+/// ¿El punto `p` esta dentro del cuadrilatero convexo `q` (4 vertices en orden)? Por el signo del
+/// producto cruz en cada arista.
+fn point_in_quad(p: egui::Pos2, q: &[egui::Pos2; 4]) -> bool {
+    let mut sign = 0.0_f32;
+    for k in 0..4 {
+        let a = q[k];
+        let b = q[(k + 1) % 4];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross.abs() > 1e-3 {
+            if sign == 0.0 {
+                sign = cross.signum();
+            } else if sign != cross.signum() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Comando de formato Markdown de la toolbar de edicion.
