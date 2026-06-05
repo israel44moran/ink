@@ -386,21 +386,26 @@ fn icon_brush_sample(p: &egui::Painter, c: Pos2, s: f32, col: Color32) {
 }
 
 fn icon_curved_arrow(p: &egui::Painter, c: Pos2, s: f32, col: Color32, mirror: bool) {
-    // Deshacer: flecha curva que apunta a la izquierda. Rehacer (mirror): a la derecha.
+    // Flecha curva de deshacer (mirror=false, estilo ↶) / rehacer (mirror=true, ↷): un arco de
+    // circulo que sube por arriba y baja a un lado, rematado con una punta de flecha clara.
     let g = if mirror { -1.0 } else { 1.0 };
-    let tail = vec![
-        c + egui::vec2(g * s * 0.95, -s * 0.75),
-        c + egui::vec2(g * s * 0.45, -s * 0.25),
-        c + egui::vec2(g * -s * 0.2, s * 0.02),
-        c + egui::vec2(g * -s * 0.8, s * 0.12),
-    ];
-    p.add(Shape::line(tail.clone(), Stroke::new(3.2, col)));
-    let tip = *tail.last().unwrap();
-    let head = vec![
-        tip + egui::vec2(g * -s * 0.55, 0.0),
-        tip + egui::vec2(g * 0.18 * s, -s * 0.5),
-        tip + egui::vec2(g * 0.18 * s, s * 0.5),
-    ];
+    let r = s * 0.72;
+    let (d0, d1) = (320.0_f32.to_radians(), 120.0_f32.to_radians());
+    let n = 22;
+    let mut arc: Vec<Pos2> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        let a = d0 + (d1 - d0) * t;
+        arc.push(c + egui::vec2(g * r * a.cos(), r * a.sin()));
+    }
+    // Punta orientada por la tangente del extremo (antes de mover `arc` al dibujar la linea).
+    let tip = arc[arc.len() - 1];
+    let prev = arc[arc.len() - 3];
+    let dir = (tip - prev).normalized();
+    let normal = egui::vec2(-dir.y, dir.x);
+    let base = tip - dir * s * 0.6;
+    let head = vec![tip, base + normal * s * 0.38, base - normal * s * 0.38];
+    p.add(Shape::line(arc, Stroke::new((s * 0.24).max(2.0), col)));
     p.add(Shape::convex_polygon(head, col, Stroke::NONE));
 }
 
