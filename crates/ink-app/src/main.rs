@@ -2878,8 +2878,9 @@ impl App {
                 }
             });
         // Dibujar las tablas (rejilla + celdas editables + botones +columna/+fila) por ENCIMA.
-        // Se deja un margen a la derecha para que el boton "+columna" quepa dentro de la hoja.
-        let table_w = (rect.width() - 24.0).max(40.0);
+        // El ancho sale del ajuste de tamano de tabla; se deja un margen a la derecha para el
+        // boton "+columna".
+        let table_w = ((rect.width() - 24.0) * self.doc_layout.table_scale.clamp(0.3, 1.0)).max(40.0);
         for (cstart, cend, cells, top) in tables {
             self.render_table(ctx, cstart, cend, &cells, top, table_w, size_pts, fam.clone(), text_col);
         }
@@ -2935,18 +2936,25 @@ impl App {
                         }
                     }
                 }
-                // Botones "+": columna (derecha) y fila (abajo).
-                let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + table_w + 4.0, top.y), egui::vec2(18.0, th));
+                // Botones "+": columna (derecha) y fila (abajo). SOLO se ven al pasar el cursor
+                // por la tabla; sin fondo (la pestaña es transparente, solo se ve el "+").
+                let near = egui::Rect::from_min_size(top, egui::vec2(table_w + 24.0, th + 24.0));
+                let hovering = ui.rect_contains_pointer(near);
+                let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + table_w + 3.0, top.y), egui::vec2(18.0, th));
                 let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
-                painter.rect_filled(cbtn, egui::CornerRadius::same(4), if cr.hovered() { egui::Color32::from_gray(200) } else { egui::Color32::from_gray(228) });
-                painter.text(cbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(16.0), egui::Color32::from_gray(60));
+                if hovering || cr.hovered() {
+                    let col = if cr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
+                    painter.text(cbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
+                }
                 if cr.clicked() {
                     add_col = true;
                 }
-                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 4.0), egui::vec2(table_w, 18.0));
+                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 3.0), egui::vec2(table_w, 18.0));
                 let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
-                painter.rect_filled(rbtn, egui::CornerRadius::same(4), if rr.hovered() { egui::Color32::from_gray(200) } else { egui::Color32::from_gray(228) });
-                painter.text(rbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(16.0), egui::Color32::from_gray(60));
+                if hovering || rr.hovered() {
+                    let col = if rr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
+                    painter.text(rbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
+                }
                 if rr.clicked() {
                     add_row = true;
                 }
@@ -4162,6 +4170,9 @@ impl ApplicationHandler for App {
                 let mut doc_redo_flag = false;
                 let mut toggle_fullscreen = false;
                 let mut md_align: Option<u32> = None;
+                // Tamano (ancho) de tabla: se edita en el popup hover del boton Tabla y se
+                // aplica tras construir la UI.
+                let mut table_scale = self.doc_layout.table_scale;
                 let in_library = self.app_mode == AppMode::Library;
                 let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
                     self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
@@ -4249,7 +4260,35 @@ impl ApplicationHandler for App {
                                             // Estructura.
                                             if md_button(ui, Md::Link, "Enlace").clicked() { md_action = Some(Md::Link); }
                                             if md_button(ui, Md::Image, "Imagen").clicked() { md_action = Some(Md::Image); }
-                                            if md_button(ui, Md::Table, "Tabla").clicked() { md_action = Some(Md::Table); }
+                                            // Tabla: clic = insertar; al pasar el cursor se despliega
+                                            // un control del TAMANO (ancho) de las tablas.
+                                            let table_resp = md_button(ui, Md::Table, "Tabla — pasa el cursor para el tamaño");
+                                            if table_resp.clicked() { md_action = Some(Md::Table); }
+                                            {
+                                                let pop_id = egui::Id::new("tbl_size_pop");
+                                                let was_open = ui.memory(|m| m.data.get_temp::<bool>(pop_id).unwrap_or(false));
+                                                let mut keep = table_resp.hovered();
+                                                if table_resp.hovered() || was_open {
+                                                    let area = egui::Area::new(pop_id)
+                                                        .order(egui::Order::Foreground)
+                                                        .fixed_pos(table_resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                                                        .show(ui.ctx(), |ui| {
+                                                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                                                ui.set_width(170.0);
+                                                                ui.label(egui::RichText::new("Tamaño de la tabla").size(12.0).strong());
+                                                                ui.add(egui::Slider::new(&mut table_scale, 0.3..=1.0).show_value(false));
+                                                                ui.horizontal(|ui| {
+                                                                    if ui.small_button("Pequeña").clicked() { table_scale = 0.45; }
+                                                                    if ui.small_button("Mediana").clicked() { table_scale = 0.7; }
+                                                                    if ui.small_button("Ancha").clicked() { table_scale = 1.0; }
+                                                                });
+                                                                ui.label(egui::RichText::new(format!("{}%", (table_scale * 100.0).round() as i32)).size(11.0).weak());
+                                                            });
+                                                        });
+                                                    if area.response.hovered() { keep = true; }
+                                                }
+                                                ui.memory_mut(|m| m.data.insert_temp(pop_id, keep));
+                                            }
                                             if md_button(ui, Md::Task, "Tarea").clicked() { md_action = Some(Md::Task); }
                                             if md_button(ui, Md::Quote, "Cita").clicked() { md_action = Some(Md::Quote); }
                                             if md_button(ui, Md::Callout, "Callout").clicked() { md_action = Some(Md::Callout); }
@@ -5248,6 +5287,10 @@ impl ApplicationHandler for App {
                 }
                 if toggle_setup {
                     self.show_page_setup = !self.show_page_setup;
+                }
+                // Tamano de tabla ajustado en el popup hover.
+                if (table_scale - self.doc_layout.table_scale).abs() > 1e-4 {
+                    self.doc_layout.table_scale = table_scale.clamp(0.3, 1.0);
                 }
                 if let Some(md) = md_action {
                     let c = self.egui_ctx.clone();

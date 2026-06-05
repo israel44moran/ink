@@ -75,6 +75,13 @@ pub struct DocLayout {
     pub font_size: f32,
     /// Familia: 0 = Sans (Hanken), 1 = Serif (Spectral), 2 = Mono (JetBrains).
     pub font: u32,
+    /// Tamano (ancho) de las tablas como fraccion del ancho disponible (0.3..1.0).
+    #[serde(default = "default_table_scale")]
+    pub table_scale: f32,
+}
+
+fn default_table_scale() -> f32 {
+    1.0
 }
 
 impl Default for DocLayout {
@@ -85,6 +92,7 @@ impl Default for DocLayout {
             para_spacing: 8.0,
             font_size: 16.0,
             font: 0,
+            table_scale: 1.0,
         }
     }
 }
