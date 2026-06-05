@@ -2878,7 +2878,8 @@ impl App {
                 }
             });
         // Dibujar las tablas (rejilla + celdas editables + botones +columna/+fila) por ENCIMA.
-        let table_w = (rect.width() - 2.0).max(40.0);
+        // Se deja un margen a la derecha para que el boton "+columna" quepa dentro de la hoja.
+        let table_w = (rect.width() - 24.0).max(40.0);
         for (cstart, cend, cells, top) in tables {
             self.render_table(ctx, cstart, cend, &cells, top, table_w, size_pts, fam.clone(), text_col);
         }
@@ -6543,9 +6544,11 @@ fn parse_table_row(line: &str) -> Vec<String> {
 }
 
 /// ¿La fila es la SEPARADORA de una tabla (`| --- | :--: |`)?
+/// DEBE contener al menos un `-`; si no, una fila de celdas vacías `|  |  |` se
+/// confundiria con la separadora y las filas de datos no se acumularian.
 fn is_table_separator(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with('|') && t.len() > 1 && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 /// Serializa celdas a un bloque de tabla Markdown (con fila separadora tras el encabezado).
