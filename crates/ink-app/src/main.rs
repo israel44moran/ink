@@ -386,6 +386,13 @@ struct App {
     drag_idx: Option<usize>,
     drag_start: Vec2,
     dragging: bool,
+    /// Seleccion MULTIPLE en el Home: indices de cartas elegidas con Ctrl+clic o con el recuadro de
+    /// seleccion (rubber-band). `lib_rubber` es el recuadro en curso (inicio, fin en px); `lib_sel_base`
+    /// es la seleccion previa sobre la que el recuadro acumula. `ctrl_down`: tecla Ctrl pulsada.
+    lib_selected: std::collections::HashSet<usize>,
+    lib_rubber: Option<(Vec2, Vec2)>,
+    lib_sel_base: std::collections::HashSet<usize>,
+    ctrl_down: bool,
     /// Renombrado en linea: indice del cuaderno cuyo nombre se edita (clic en el nombre).
     renaming: Option<usize>,
     rename_buf: String,
@@ -557,6 +564,10 @@ impl App {
             drag_idx: None,
             drag_start: Vec2::ZERO,
             dragging: false,
+            lib_selected: std::collections::HashSet::new(),
+            lib_rubber: None,
+            lib_sel_base: std::collections::HashSet::new(),
+            ctrl_down: false,
             renaming: None,
             rename_buf: String::new(),
             rename_grace: 0,
@@ -1509,19 +1520,36 @@ impl App {
                     // Tocar durante la vista previa la cierra.
                     self.close_preview();
                 } else if !self.creating_nb && self.renaming.is_none() {
-                    if let Some(i) = self.library_card_at() {
+                    if self.ctrl_down {
+                        // Ctrl: recuadro de seleccion (si no se arrastra, alterna la carta del cursor).
+                        self.lib_sel_base = self.lib_selected.clone();
+                        self.lib_rubber = Some((loc, loc));
+                        self.drag_idx = None;
+                    } else if let Some(i) = self.library_card_at() {
                         if self.alt_down {
                             self.open_preview(i);
                         } else {
+                            // Clic en una carta NO seleccionada: limpiar la seleccion previa (si ya
+                            // estaba seleccionada, se conserva para arrastrar TODO el grupo a la vez).
+                            if !self.lib_selected.contains(&i) {
+                                self.lib_selected.clear();
+                            }
                             self.drag_idx = Some(i);
                             self.drag_start = loc;
                             self.dragging = false;
                         }
+                    } else {
+                        self.lib_selected.clear();
                     }
                 }
             }
             TouchPhase::Moved => {
-                if self.drag_idx.is_some()
+                if let Some((start, _)) = self.lib_rubber {
+                    self.lib_rubber = Some((start, loc));
+                    let mut sel = self.lib_sel_base.clone();
+                    sel.extend(self.cards_in_rect(start, loc));
+                    self.lib_selected = sel;
+                } else if self.drag_idx.is_some()
                     && !self.dragging
                     && (loc - self.drag_start).length() > 8.0
                 {
@@ -1529,9 +1557,24 @@ impl App {
                 }
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
-                if let Some(i) = self.drag_idx.take() {
+                if let Some((start, end)) = self.lib_rubber.take() {
+                    // Ctrl+clic sin arrastrar: alternar la carta del cursor (acumula seleccion).
+                    if (end - start).length() <= 8.0 {
+                        if let Some(i) = self.library_card_at() {
+                            if !self.lib_selected.remove(&i) {
+                                self.lib_selected.insert(i);
+                            }
+                        }
+                    }
+                } else if let Some(i) = self.drag_idx.take() {
                     if self.dragging && self.over_trash_zone() {
-                        self.delete_card(i);
+                        // Si la carta arrastrada es parte de la seleccion, borrar TODO el grupo.
+                        if self.lib_selected.contains(&i) && self.lib_selected.len() > 1 {
+                            let sel = self.lib_selected.clone();
+                            self.delete_cards(&sel);
+                        } else {
+                            self.delete_card(i);
+                        }
                     } else if self.dragging && self.archivero_at_cursor().is_some() {
                         if let Some(name) = self.archivero_at_cursor() {
                             self.assign_archivero(i, name);
@@ -1545,6 +1588,8 @@ impl App {
                             _ => self.drop_card(i),
                         }
                     } else if let Some(nb) = self.notebooks.get(i) {
+                        // Clic simple en una carta: abrir (y limpiar cualquier seleccion).
+                        self.lib_selected.clear();
                         self.open_notebook(nb.path.clone());
                     }
                 }
@@ -1566,6 +1611,37 @@ impl App {
             }
             self.notebooks = notebook::list();
         }
+    }
+
+    /// Borra VARIOS cuadernos a la vez (seleccion multiple). Se borran por RUTA porque al recargar la
+    /// lista los indices cambian. Limpia la seleccion al terminar.
+    fn delete_cards(&mut self, indices: &std::collections::HashSet<usize>) {
+        let paths: Vec<_> = indices.iter().filter_map(|&i| self.notebooks.get(i).map(|n| n.path.clone())).collect();
+        if paths.is_empty() {
+            return;
+        }
+        for p in &paths {
+            notebook::delete(p);
+        }
+        self.notebooks = notebook::list();
+        let n = self.notebooks.len();
+        self.card_anim = vec![[0.0; 3]; n];
+        self.card_flip = vec![0.0; n];
+        self.card_flip_vel = vec![0.0; n];
+        self.lib_selected.clear();
+    }
+
+    /// Indices de las cartas cuyo CENTRO cae dentro del recuadro `a`..`b` (px). Para el recuadro de
+    /// seleccion (rubber-band) del Home.
+    fn cards_in_rect(&self, a: Vec2, b: Vec2) -> Vec<usize> {
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+        self.card_rects
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(cx, cy, _, _))| cx > -9000.0 && cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Suelta la carta arrastrada `from` en el hueco mas cercano al cursor y guarda el nuevo
@@ -2906,10 +2982,15 @@ impl App {
         // para que sus celdas y los botones +columna/+fila reciban los clics (la caja de texto
         // del documento cubre toda la hoja).
         let mut tables: Vec<(usize, usize, Vec<Vec<String>>, egui::Pos2, f32, f32)> = Vec::new();
-        // Paginacion: si una TABLA o IMAGEN no cabe en lo que queda de la hoja, se marca su
-        // inicio para moverla (y lo que le siga) a la pagina siguiente. `body_before` permite
-        // aplicar el corte solo en un frame SIN tecleo (asi el indice no se desfasa).
+        // Paginacion: si una TABLA o IMAGEN no cabe en lo que queda de la hoja, se marca su inicio
+        // para moverla (y lo que le siga) a la pagina siguiente. `body_before` distingue un fotograma
+        // SIN tecleo (cuerpo igual al de la entrada): mover tablas y SUBIR texto solo se hace ahi,
+        // para que el indice no se desfase ni la tabla se corte a media edicion.
         let body_before = self.page_body.clone();
+        // cstart de la tabla cuya celda se esta editando (si hay): ESA tabla no se pagina (no salta de
+        // hoja mientras escribes en ella), pero el resto del contenido (otras tablas, texto) SI se
+        // reacomoda aunque estes editando, para que nada quede rebasando el margen.
+        let editing_cstart = self.editing_cell.map(|(cs, _, _)| cs);
         // (indice de inicio del bloque que no cabe, si el cursor va dentro/despues = debe seguirlo).
         let mut reflow_cut: Option<(usize, bool)> = None;
         // Tab / Shift+Tab sobre una linea de lista la sangra / des-sangra (estilo Obsidian).
@@ -2967,9 +3048,15 @@ impl App {
                         .id(id_te)
                         .frame(egui::Frame::NONE)
                         .desired_width(rect.width())
+                        // Mientras se edita una celda, el editor del documento NO captura clics: asi el
+                        // clic en otra celda llega a la tabla (y no al editor grande, que se los robaba).
+                        .interactive(editing_cstart.is_none())
                         .layouter(&mut layouter);
                     let r = ui.add_sized(rect.size(), te);
-                    if !r.has_focus() && ui.memory(|m| m.focused()).is_none() {
+                    // No robar el foco mientras se edita una celda de tabla: si el editor del documento
+                    // se autoenfoca en ese momento, el clic en la celda a veces NO arranca su edicion
+                    // (de ahi el "a veces si, a veces no"). Con la celda en edicion, el documento cede.
+                    if !r.has_focus() && ui.memory(|m| m.focused()).is_none() && editing_cstart.is_none() {
                         r.request_focus();
                     }
                     // Doble clic DEBAJO del texto ya escrito: rellenar con renglones vacios hasta
@@ -3038,14 +3125,16 @@ impl App {
                     // hace siempre (no solo al escribir) para que tambien se readapte al cambiar los
                     // margenes / el tamano, igual que el flujo de texto.
                     if reflow_cut.is_none() {
-                        let bh = match deco {
-                            Deco::Table { cells, row_scale, .. } => cells.len() as f32 * size_pts * 1.9 * *row_scale,
-                            Deco::Image(_) => size_pts * 9.0,
-                            _ => 0.0,
+                        let (bh, tbl_cs) = match deco {
+                            Deco::Table { cells, cstart, row_scale, .. } => (cells.len() as f32 * size_pts * 1.9 * *row_scale, Some(*cstart)),
+                            Deco::Image(_) => (size_pts * 9.0, None),
+                            _ => (0.0, None),
                         };
+                        // No paginar la tabla que se esta editando (sus celdas): se mueve al salir.
+                        let editing_this = tbl_cs.map_or(false, |cs| editing_cstart == Some(cs));
                         // Mismo umbral (medio renglon) que usa el flujo de texto al SUBIR, para que
                         // una tabla en el limite no oscile (baje y vuelva a subir) entre paginas.
-                        if bh > 1.0 && *cidx > 0 && top.y > rect.top() + size_pts && top.y + bh > rect.bottom() + size_pts * 0.5 {
+                        if !editing_this && bh > 1.0 && *cidx > 0 && top.y > rect.top() + size_pts && top.y + bh > rect.bottom() + size_pts * 0.5 {
                             let cut_line = body.chars().take(*cidx).filter(|&c| c == '\n').count();
                             // Si el cursor esta DENTRO/DESPUES del bloque (p.ej. al recien insertar
                             // la tabla) pasara con el a la pagina siguiente; si esta antes, se queda.
@@ -3055,10 +3144,18 @@ impl App {
                     }
                 }
             });
-        // Paginacion: aplicar el corte SOLO si no se tecleo este frame (indice consistente) y no
-        // se esta editando una celda (no arrancar la tabla mientras escribes en ella).
+        // Paginacion de TABLAS/IMAGENES: la tabla que rebasa el margen pasa ENTERA a la pagina
+        // siguiente, pero SOLO en un fotograma sin tecleo (indice consistente; no se corta a media
+        // edicion) y si no se esta editando una celda. Al soltar la tecla, la cascada de abajo
+        // recorre el contenido de las hojas siguientes y crea las que hagan falta.
         if let Some((cut, follows)) = reflow_cut {
-            if self.page_body == body_before && self.editing_cell.is_none() {
+            // Se puede mover aunque se este editando una celda: reflow_cut ya excluyo la tabla en
+            // edicion. Pero el bloque que se mueve va desde `cut` hasta el FINAL, asi que si la tabla
+            // en edicion queda DENTRO de ese bloque (esta despues del corte) no se mueve nada, para no
+            // arrastrar la tabla que estas escribiendo. Tampoco se sigue al cursor a la otra hoja.
+            let edited_in_block = editing_cstart.map_or(false, |ecs| ecs >= cut);
+            if self.page_body == body_before && !edited_in_block {
+                let follows = follows && self.editing_cell.is_none();
                 self.reflow_block_to_next_page(ctx, cut, follows);
             }
         }
@@ -3104,22 +3201,36 @@ impl App {
             self.doc_layout.line_spacing,
             self.doc_layout.font,
         );
-        if self.page_body == body_before
-            && list_indent.is_none()
+        // Reflujo de texto. Lo que rebasa el margen (overflow) BAJA a la hoja siguiente TAMBIEN
+        // mientras se teclea: asi las hojas se crean y el contador (barra inferior) se actualiza en
+        // tiempo real al escribir seguido, no solo al hacer una pausa. En cambio SUBIR texto (compactar)
+        // solo se hace en un fotograma sin tecleo (`stable`), para que el texto no "salte" hacia arriba
+        // mientras escribes. El cursor que lee el overflow va corregido (el editor ya proceso la tecla
+        // este mismo fotograma). El cache flow_last evita volver a medir en reposo.
+        let stable = self.page_body == body_before;
+        if list_indent.is_none()
             && reflow_cut.is_none()
             && (self.page_body != self.flow_last || flow_sig != self.flow_sig)
         {
             self.flow_last = self.page_body.clone();
             self.flow_sig = flow_sig;
-            self.rebalance_text_flow(ctx, rect, size_pts, ls, &fam, text_col, page_align);
-            // Recorrer el contenido por las paginas siguientes (cascada) hasta que todo quepa.
-            self.cascade_doc_pages(ctx, rect, size_pts, ls, &fam, text_col, page_align);
+            let switch = self.rebalance_text_flow(ctx, rect, size_pts, ls, &fam, text_col, page_align, stable);
+            // Recorrer el contenido por las paginas siguientes (cascada) hasta que todo quepa. Va
+            // ANTES de seguir al cursor a otra pagina: asi reequilibra la pagina que acaba de recibir
+            // contenido (que puede rebasar) y crea las hojas necesarias en este mismo fotograma.
+            self.cascade_doc_pages(ctx, rect, size_pts, ls, &fam, text_col, page_align, stable);
+            // Salto diferido: ahora si seguimos al cursor a la pagina a la que paso el contenido.
+            if let Some((next, pos)) = switch {
+                self.switch_page(next);
+                self.set_doc_cursor(ctx, pos);
+            }
         }
         // Dibujar las tablas por ENCIMA. avail_w deja un margen a la derecha para el boton
         // "+columna" y para que la tabla NUNCA invada el margen derecho de la hoja.
         let avail_w = (rect.width() - 24.0).max(40.0);
         for (cstart, cend, cells, top, col_scale, row_scale) in tables {
-            self.render_table(ctx, cstart, cend, &cells, top, avail_w, rect.top(), rect.bottom(), size_pts, fam.clone(), text_col, col_scale, row_scale);
+            // `writing` (modo escritura con teclado): solo entonces las celdas se pueden editar.
+            self.render_table(ctx, cstart, cend, &cells, top, avail_w, rect.top(), rect.bottom(), size_pts, fam.clone(), text_col, col_scale, row_scale, writing);
         }
         // Vista previa EN LA HOJA (tamaño real) mientras el popup de tamaño esta abierto.
         if preview_active {
@@ -3303,7 +3414,7 @@ impl App {
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
     /// con el texto); si la tabla supera el ancho de la hoja aparece un DESLIZADOR horizontal.
     /// Celdas editables (clic), Enter pasa a la fila siguiente (creandola), y botones "+".
-    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, content_top: f32, content_bottom: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32, col_scale: f32, row_scale: f32) {
+    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, content_top: f32, content_bottom: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32, col_scale: f32, row_scale: f32, editable: bool) {
         if cells.is_empty() {
             return;
         }
@@ -3315,7 +3426,9 @@ impl App {
         let pad = 8.0;
         // Ancho minimo de columna; puede ser muy pequeño (col_scale=0) y crece con el texto.
         let col_min = 16.0 + col_scale.clamp(0.0, 1.0) * 200.0;
-        let editing = self.editing_cell.filter(|&(cs, _, _)| cs == cstart);
+        // Solo en modo escritura (editable) se puede editar una celda; en modo trazo la tabla es
+        // de SOLO lectura (se dibuja, pero ni se enfoca ni cambia con clics).
+        let editing = if editable { self.editing_cell.filter(|&(cs, _, _)| cs == cstart) } else { None };
         let want_focus = self.cell_focus;
         let mut buf = self.cell_buf.clone();
         let mut start_edit: Option<(usize, usize)> = None;
@@ -3407,7 +3520,8 @@ impl App {
                             let txt = cells.get(r).and_then(|row| row.get(c)).map(|s| s.as_str()).unwrap_or("");
                             let fid = egui::FontId::new(size_pts, fam.clone());
                             cellp.text(egui::pos2(crect.left() + pad, crect.center().y), egui::Align2::LEFT_CENTER, txt, fid, text_col);
-                            if ui.interact(crect, egui::Id::new(("tcell", cstart, r, c)), egui::Sense::click()).clicked() {
+                            // El clic solo abre la edicion en modo escritura; en modo trazo no reacciona.
+                            if editable && ui.interact(crect, egui::Id::new(("tcell", cstart, r, c)), egui::Sense::click()).clicked() {
                                 start_edit = Some((r, c));
                             }
                         }
@@ -3416,20 +3530,23 @@ impl App {
                 // Botones "+": solo al pasar el cursor; transparentes (solo el "+").
                 let near = egui::Rect::from_min_size(top, egui::vec2(view_w + 24.0, view_h + if has_vscroll { 4.0 } else { 34.0 }));
                 let hovering = ui.rect_contains_pointer(near);
-                // +columna (derecha); si hay deslizador vertical, se corre para dejarle sitio.
-                let cbtn_x = top.x + view_w + if has_vscroll { 9.0 } else { 3.0 };
-                let cbtn = egui::Rect::from_min_size(egui::pos2(cbtn_x, top.y), egui::vec2(13.0, view_h));
-                let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
-                if hovering || cr.hovered() {
-                    let col = if cr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
-                    painter.text(cbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
-                }
-                if cr.clicked() {
-                    add_col = true;
+                // +columna (derecha); si hay deslizador vertical, se corre para dejarle sitio. Solo en
+                // modo escritura: en modo trazo la tabla no se modifica.
+                if editable {
+                    let cbtn_x = top.x + view_w + if has_vscroll { 9.0 } else { 3.0 };
+                    let cbtn = egui::Rect::from_min_size(egui::pos2(cbtn_x, top.y), egui::vec2(13.0, view_h));
+                    let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
+                    if hovering || cr.hovered() {
+                        let col = if cr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
+                        painter.text(cbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
+                    }
+                    if cr.clicked() {
+                        add_col = true;
+                    }
                 }
                 // +fila (abajo): solo si la tabla NO esta recortada verticalmente (si no, caeria en
-                // el margen inferior; en ese caso se añaden filas con Enter).
-                if !has_vscroll {
+                // el margen inferior; en ese caso se añaden filas con Enter). Solo en modo escritura.
+                if editable && !has_vscroll {
                     let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + view_h + 2.0), egui::vec2(view_w, 13.0));
                     let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
                     if hovering || rr.hovered() {
@@ -3548,15 +3665,15 @@ impl App {
                 nc[r][c] = buf;
                 replace(self, &nc);
             }
-            if lost {
-                // Si el foco se perdio por clic en OTRA celda, saltar directo a editarla.
-                if let Some((sr, sc)) = start_edit {
-                    self.editing_cell = Some((cstart, sr, sc));
-                    self.cell_buf = cells.get(sr).and_then(|row| row.get(sc)).cloned().unwrap_or_default();
-                    self.cell_focus = true;
-                } else {
-                    self.editing_cell = None;
-                }
+            // Si se hizo clic en OTRA celda, ir a editarla AUNQUE la celda actual no dispare
+            // lost_focus (p.ej. tras un Enter, donde el foco queda en transicion, o si la celda
+            // quedo recortada). Si el foco se perdio por clic FUERA de la tabla, salir de la edicion.
+            if let Some((sr, sc)) = start_edit {
+                self.editing_cell = Some((cstart, sr, sc));
+                self.cell_buf = cells.get(sr).and_then(|row| row.get(sc)).cloned().unwrap_or_default();
+                self.cell_focus = true;
+            } else if lost {
+                self.editing_cell = None;
             }
         } else if let Some((r, c)) = start_edit {
             self.editing_cell = Some((cstart, r, c));
@@ -3645,6 +3762,9 @@ impl App {
     /// Coloca el cursor del editor del documento en `pos` (caracteres) y le da foco.
     fn set_doc_cursor(&self, ctx: &egui::Context, pos: usize) {
         let id = egui::Id::new("doc_te");
+        // Clamp al final del cuerpo: un cursor mas alla del texto hace que egui haga panic (resta con
+        // overflow al medir). Puede pasar tras la cascada, que acorta la pagina destino del salto.
+        let pos = pos.min(self.page_body.chars().count());
         let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
         state
             .cursor
@@ -3667,9 +3787,13 @@ impl App {
     /// sube el primer renglon de la siguiente. Asi el texto fluye en AMBOS sentidos al escribir o
     /// borrar (renglon por renglon). Usa CONCATENACION pura, asi subir deshace justo lo que bajo, y
     /// una "zona muerta" entre los dos umbrales evita que oscile. Las tablas las mueve su reflow.
-    fn rebalance_text_flow(&mut self, ctx: &egui::Context, rect: egui::Rect, size_pts: f32, ls: f32, fam: &egui::FontFamily, text_col: egui::Color32, page_align: u32) {
+    /// Devuelve `Some((pagina, cursor))` si tras reequilibrar hay que SEGUIR al cursor a otra pagina.
+    /// El salto se difiere a proposito: lo hace el llamador DESPUES de la cascada, para que esta
+    /// reequilibre primero la pagina que acaba de recibir contenido (si no, la cascada empezaria en
+    /// la pagina de despues y la dejaria sin procesar).
+    fn rebalance_text_flow(&mut self, ctx: &egui::Context, rect: egui::Rect, size_pts: f32, ls: f32, fam: &egui::FontFamily, text_col: egui::Color32, page_align: u32, allow_underflow: bool) -> Option<(usize, usize)> {
         if self.editing_cell.is_some() {
-            return;
+            return None;
         }
         let avail = rect.height();
         let wrap = rect.width().max(1.0);
@@ -3691,7 +3815,7 @@ impl App {
             let n = bchars.len();
             let cut = cur.index.min(n);
             if cut == 0 {
-                return;
+                return None;
             }
             // Si la linea logica del corte es una TABLA, la mueve el reflow de tablas (bloque).
             let mut a = cut;
@@ -3704,7 +3828,7 @@ impl App {
             }
             let lline: String = bchars[a..b].iter().collect();
             if lline.trim_start().starts_with('|') || lline.trim_start().starts_with("<!--tbl") {
-                return;
+                return None;
             }
             let cursor_idx = self.doc_cursor_idx(ctx);
             let follows = cursor_idx.map_or(false, |ci| ci >= cut);
@@ -3715,7 +3839,8 @@ impl App {
             let moved: String = bchars[cut..].iter().collect();
             if moved.trim().is_empty() {
                 // Renglon nuevo vacio (Enter al final): consumir el \n; si el cursor iba ahi, pasar
-                // a la pagina siguiente a escribir el parrafo nuevo.
+                // a la pagina siguiente a escribir el parrafo nuevo. Aqui NO baja contenido real, asi
+                // que el salto puede ser inmediato (no hay nada que la cascada deba reequilibrar).
                 let keep_to = if bchars[cut - 1] == '\n' { cut - 1 } else { cut };
                 let kept: String = bchars[..keep_to].iter().collect();
                 self.set_doc_body(kept);
@@ -3723,7 +3848,7 @@ impl App {
                     self.switch_page(next);
                     self.set_doc_cursor(ctx, 0);
                 }
-                return;
+                return None;
             }
             let kept: String = bchars[..cut].iter().collect(); // SIN trim: conserva el separador
             let existing = self.pages[next].body.clone();
@@ -3731,15 +3856,17 @@ impl App {
             self.pages[next].body = concat_flow(&moved, &existing);
             self.set_doc_body(kept);
             if follows {
+                // El cursor sigue al texto: DIFERIR el salto (lo hace el llamador tras la cascada,
+                // que primero reequilibra `next` por si rebasa al recibir este contenido).
                 let off = cursor_idx.map(|ci| ci.saturating_sub(cut)).unwrap_or(0);
-                self.switch_page(next);
-                self.set_doc_cursor(ctx, off);
+                return Some((next, off));
             }
-        } else if g.size().y + line_h * 0.5 < avail {
+        } else if allow_underflow && g.size().y + line_h * 0.5 < avail {
             // ---- UNDERFLOW: sube el primer renglon de la siguiente pagina mientras quepa entero --
+            // Solo en fotograma sin tecleo: al escribir, el texto no debe "subir" hacia arriba.
             let next = self.current_page + 1;
             if next >= self.pages.len() || self.pages[next].body.is_empty() {
-                return;
+                return None;
             }
             let mut pulled_anything = false;
             let mut guard = 0;
@@ -3808,13 +3935,14 @@ impl App {
                 self.pages.remove(next);
             }
         }
+        None
     }
 
     /// Reequilibra en CASCADA las paginas del documento DESPUES de la actual (no toca el cursor):
     /// cada pagina que rebasa baja su renglon/tabla sobrante a la siguiente (creandola si hace
     /// falta), y la que tiene holgura sube contenido de la siguiente. Asi el contenido "se recorre"
     /// por todas las hojas y se crean las paginas necesarias hasta que TODO quepa.
-    fn cascade_doc_pages(&mut self, ctx: &egui::Context, rect: egui::Rect, size_pts: f32, ls: f32, fam: &egui::FontFamily, text_col: egui::Color32, page_align: u32) {
+    fn cascade_doc_pages(&mut self, ctx: &egui::Context, rect: egui::Rect, size_pts: f32, ls: f32, fam: &egui::FontFamily, text_col: egui::Color32, page_align: u32, allow_underflow: bool) {
         if self.editing_cell.is_some() {
             return;
         }
@@ -3890,8 +4018,9 @@ impl App {
                 let existing = self.pages[i + 1].body.clone();
                 self.pages[i + 1].body = concat_flow(&moved, &existing);
                 i += 1;
-            } else if i + 1 < self.pages.len() && g.size().y + line_h * 0.5 < avail {
+            } else if allow_underflow && i + 1 < self.pages.len() && g.size().y + line_h * 0.5 < avail {
                 // ---- UNDERFLOW: sube de la siguiente lo que quepa (sin partir tablas) ----
+                // Solo en fotograma sin tecleo: al escribir, el contenido no debe subir/compactarse.
                 let next_body = self.pages[i + 1].body.clone();
                 if next_body.trim().is_empty() {
                     i += 1;
@@ -4139,7 +4268,32 @@ impl App {
                 // La tabla guarda SU tamaño (ancho de columna / alto de fila) en una directiva
                 // oculta; asi el tamaño es propio de cada tabla y no afecta a las demas.
                 let dir = format!("<!--tbl c={:.2} r={:.2}-->", self.doc_layout.table_scale.clamp(0.0, 1.0), self.doc_layout.table_row.clamp(0.5, 3.0));
-                let block: Vec<char> = format!("\n{dir}\n|  |  |\n| --- | --- |\n|  |  |\n").chars().collect();
+                // ¿La linea pegada al cursor (antes/despues) es de otra tabla? Si lo es, se deja un
+                // renglon vacio extra para que las dos tablas no queden demasiado juntas (la directiva
+                // <!--tbl--> casi no se ve, asi que sin esto pareceria una sola tabla).
+                let is_tbl_line = |line: &str| {
+                    let lt = line.trim_start();
+                    lt.starts_with('|') || lt.starts_with("<!--tbl")
+                };
+                // Linea que TERMINA en el cursor (solo si el cursor no esta al inicio de su renglon).
+                let before_table = hi > 0 && chars[hi - 1] != '\n' && {
+                    let mut s = hi;
+                    while s > 0 && chars[s - 1] != '\n' {
+                        s -= 1;
+                    }
+                    is_tbl_line(&chars[s..hi].iter().collect::<String>())
+                };
+                // Linea que EMPIEZA en el cursor.
+                let after_table = hi < chars.len() && {
+                    let mut e = hi;
+                    while e < chars.len() && chars[e] != '\n' {
+                        e += 1;
+                    }
+                    is_tbl_line(&chars[hi..e].iter().collect::<String>())
+                };
+                let lead = if before_table { "\n\n" } else { "\n" };
+                let trail = if after_table { "\n\n" } else { "\n" };
+                let block: Vec<char> = format!("{lead}{dir}\n|  |  |\n| --- | --- |\n|  |  |{trail}").chars().collect();
                 for (k, &c) in block.iter().enumerate() {
                     chars.insert(hi + k, c);
                 }
@@ -4597,9 +4751,13 @@ impl ApplicationHandler for App {
                 self.cursor = cur;
                 self.last_cursor = cur;
 
-                // Biblioteca: si hay un arrastre en curso y el cursor se movio lo suficiente,
-                // pasamos a modo "arrastrando" (la carta seguira al cursor para reordenar).
-                if self.drag_idx.is_some() && !self.dragging
+                // Biblioteca: recuadro de seleccion en curso, o paso a modo "arrastrando".
+                if let Some((start, _)) = self.lib_rubber {
+                    self.lib_rubber = Some((start, cur));
+                    let mut sel = self.lib_sel_base.clone();
+                    sel.extend(self.cards_in_rect(start, cur));
+                    self.lib_selected = sel;
+                } else if self.drag_idx.is_some() && !self.dragging
                     && (cur - self.drag_start).length() > 8.0
                 {
                     self.dragging = true;
@@ -4627,14 +4785,25 @@ impl ApplicationHandler for App {
                             // clic normal = posible arrastre (al soltar: abrir / reordenar / borrar).
                             // El NOMBRE se renombra con una zona clicable de egui (ver abajo).
                             if self.renaming.is_none() {
-                                if let Some(i) = self.library_card_at() {
+                                if self.ctrl_down {
+                                    // Ctrl: recuadro de seleccion (rubber-band) o, si no se arrastra,
+                                    // alternar la carta del cursor (elegir/quitar varias del Home).
+                                    self.lib_sel_base = self.lib_selected.clone();
+                                    self.lib_rubber = Some((self.cursor, self.cursor));
+                                    self.drag_idx = None;
+                                } else if let Some(i) = self.library_card_at() {
                                     if self.alt_down {
                                         self.open_preview(i);
                                     } else {
+                                        if !self.lib_selected.contains(&i) {
+                                            self.lib_selected.clear();
+                                        }
                                         self.drag_idx = Some(i);
                                         self.drag_start = self.cursor;
                                         self.dragging = false;
                                     }
+                                } else {
+                                    self.lib_selected.clear();
                                 }
                             }
                         } else if egui_consumed {
@@ -4680,11 +4849,26 @@ impl ApplicationHandler for App {
                         if self.cube_view {
                             // Vista cubo: soltar lo maneja el cubo (egui).
                         } else if self.app_mode == AppMode::Library {
-                            // Soltar en la biblioteca: sobre la papelera = borrar; si se arrastro,
-                            // reordenar; si no se movio, abrir.
-                            if let Some(i) = self.drag_idx.take() {
+                            // Soltar en la biblioteca: recuadro de seleccion / papelera (borra el grupo
+                            // si la carta esta seleccionada) / reordenar / abrir.
+                            if let Some((start, end)) = self.lib_rubber.take() {
+                                // Ctrl+clic sin arrastrar: alternar la carta del cursor.
+                                if (end - start).length() <= 8.0 {
+                                    if let Some(i) = self.library_card_at() {
+                                        if !self.lib_selected.remove(&i) {
+                                            self.lib_selected.insert(i);
+                                        }
+                                    }
+                                }
+                            } else if let Some(i) = self.drag_idx.take() {
                                 if self.dragging && self.over_trash_zone() {
-                                    self.delete_card(i);
+                                    // Si la carta arrastrada es parte de la seleccion, borrar TODO el grupo.
+                                    if self.lib_selected.contains(&i) && self.lib_selected.len() > 1 {
+                                        let sel = self.lib_selected.clone();
+                                        self.delete_cards(&sel);
+                                    } else {
+                                        self.delete_card(i);
+                                    }
                                 } else if self.dragging && self.archivero_at_cursor().is_some() {
                                     // Soltar sobre una fila de la barra lateral = asignar a ese archivero.
                                     if let Some(name) = self.archivero_at_cursor() {
@@ -4702,6 +4886,8 @@ impl ApplicationHandler for App {
                                         _ => self.drop_card(i),
                                     }
                                 } else if let Some(nb) = self.notebooks.get(i) {
+                                    // Clic simple en una carta: abrir (y limpiar cualquier seleccion).
+                                    self.lib_selected.clear();
                                     self.open_notebook(nb.path.clone());
                                 }
                             }
@@ -4760,6 +4946,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::ModifiersChanged(m) => {
                 self.alt_down = m.state().alt_key();
+                self.ctrl_down = m.state().control_key();
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -5797,6 +5984,28 @@ impl ApplicationHandler for App {
                                         });
                                 }
                             }
+                            // Seleccion MULTIPLE: marco azul en las cartas elegidas (Ctrl+clic / recuadro)
+                            // y el recuadro de seleccion en curso.
+                            if !self.lib_selected.is_empty() || self.lib_rubber.is_some() {
+                                let accent = egui::Color32::from_rgb(86, 150, 245);
+                                for &i in &self.lib_selected {
+                                    if let Some((c, h)) = card_layout.get(i) {
+                                        if c.x <= -9000.0 {
+                                            continue; // carta no visible (filtrada/oculta)
+                                        }
+                                        let r = egui::Rect::from_center_size(
+                                            egui::pos2(c.x / ppp, c.y / ppp),
+                                            egui::vec2((2.0 * h.x + 20.0) / ppp, (2.0 * h.y + 20.0) / ppp),
+                                        );
+                                        lp.rect_stroke(r, egui::CornerRadius::same(10), egui::Stroke::new(3.0, accent), egui::StrokeKind::Middle);
+                                    }
+                                }
+                                if let Some((a, b)) = self.lib_rubber {
+                                    let r = egui::Rect::from_two_pos(egui::pos2(a.x / ppp, a.y / ppp), egui::pos2(b.x / ppp, b.y / ppp));
+                                    lp.rect_filled(r, egui::CornerRadius::same(2), egui::Color32::from_rgba_unmultiplied(86, 150, 245, 38));
+                                    lp.rect_stroke(r, egui::CornerRadius::same(2), egui::Stroke::new(1.5, accent), egui::StrokeKind::Middle);
+                                }
+                            }
                             // PAPELERA unica: arrastra una carta aqui (y suelta) para borrarla.
                             let (tzx, tzy, tzr) = self.trash_zone();
                             let drag_on = self.dragging && self.drag_idx.is_some();
@@ -6241,10 +6450,12 @@ impl ApplicationHandler for App {
                 if let Some(a) = lib_set_archivero {
                     self.active_archivero = a;
                     self.card_scroll = 0.0;
+                    self.lib_selected.clear(); // la lista visible cambia: la seleccion ya no aplica
                 }
                 if let Some(s) = lib_set_sort {
                     self.sort_mode = s;
                     self.card_scroll = 0.0;
+                    self.lib_selected.clear();
                 }
                 if lib_new_archivero {
                     self.creating_archivero = true;
@@ -6325,6 +6536,9 @@ impl ApplicationHandler for App {
                         self.center_on_page();
                         // El panel de pincel no tiene sentido escribiendo: cerrarlo.
                         self.ui.show_brush_settings = false;
+                    } else {
+                        // Al salir de escritura, cerrar cualquier celda de tabla en edicion.
+                        self.editing_cell = None;
                     }
                 }
                 if toggle_setup {
@@ -7839,20 +8053,27 @@ fn concat_flow(a: &str, b: &str) -> String {
     if a.is_empty() {
         return b.to_string();
     }
-    if b.is_empty() || a.ends_with('\n') {
-        return format!("{a}{b}");
+    if b.is_empty() {
+        return a.to_string();
     }
     let special = |line: &str| {
         let t = line.trim_start();
         t.starts_with('|') || t.starts_with("<!--tbl")
     };
-    let a_last = a.rsplit('\n').next().unwrap_or(a);
-    let b_first = b.split('\n').next().unwrap_or(b);
-    if special(a_last) || special(b_first) {
-        format!("{a}\n{b}")
-    } else {
-        format!("{a}{b}")
-    }
+    // Ultima linea con contenido de `a` y primera de `b` (saltando renglones vacios).
+    let a_last = a.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let b_first = b.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let a_tbl = special(a_last);
+    let b_tbl = special(b_first);
+    // Saltos de linea que YA hay entre el contenido de `a` y el de `b`.
+    let have = a.chars().rev().take_while(|&c| c == '\n').count()
+        + b.chars().take_while(|&c| c == '\n').count();
+    // Entre DOS tablas se deja SIEMPRE un renglon VACIO (2 saltos) para que nunca se peguen ni se
+    // solapen; si solo una de las lineas pegadas es tabla, 1 salto (su directiva va al inicio del
+    // renglon); texto con texto se concatena sin salto (continua el renglon visual al re-unirse).
+    let want: usize = if a_tbl && b_tbl { 2 } else if a_tbl || b_tbl { 1 } else { 0 };
+    let add = want.saturating_sub(have);
+    format!("{a}{}{b}", "\n".repeat(add))
 }
 
 /// Indice de caracter donde empieza la PRIMERA linea de tabla (directiva `<!--tbl-->` o fila `|`)
