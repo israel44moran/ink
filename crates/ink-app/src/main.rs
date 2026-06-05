@@ -224,6 +224,10 @@ struct App {
     /// Giro horizontal y vertical del cubo (rueda / arrastre del raton).
     cube_yaw: f32,
     cube_pitch: f32,
+    /// Vista previa REAL de cada hoja para el cubo (trazos de tinta + longitudes de las lineas de
+    /// texto), precalculada al abrir la vista para no rehacerla cada fotograma.
+    cube_previews: Vec<PreviewPage>,
+    cube_text: Vec<Vec<f32>>,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -456,6 +460,8 @@ impl App {
             cube_anim: 0.0,
             cube_yaw: 0.0,
             cube_pitch: -0.5,
+            cube_previews: Vec::new(),
+            cube_text: Vec::new(),
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -3039,10 +3045,9 @@ impl App {
         let per_face = n.div_ceil(6).max(1);
         let cols = (per_face as f32).sqrt().ceil() as usize;
         let rows = per_face.div_ceil(cols).max(1);
-        // Lineas de contenido por hoja (esquematico).
-        let body_lines: Vec<usize> = (0..n)
-            .map(|i| self.pages.get(i).map_or(0, |p| p.body.lines().filter(|l| !l.trim().is_empty()).count().min(4)))
-            .collect();
+        // Contenido REAL de cada hoja (precalculado al abrir): trazos + lineas de texto.
+        let previews = &self.cube_previews;
+        let texts = &self.cube_text;
         // Mini-hojas visibles, agrupadas por cara (para dibujarlas con su cara, ordenadas).
         struct FaceDraw {
             z: f32,
@@ -3083,7 +3088,7 @@ impl App {
                 ui.set_clip_rect(screen);
                 let resp = ui.interact(screen, egui::Id::new("cube_bg"), egui::Sense::click_and_drag());
                 let painter = ui.painter();
-                painter.rect_filled(screen, egui::CornerRadius::same(0), egui::Color32::from_black_alpha((t * 210.0) as u8));
+                painter.rect_filled(screen, egui::CornerRadius::same(0), egui::Color32::from_black_alpha((t * 224.0) as u8));
                 let pointer = ui.input(|i| i.pointer.interact_pos());
                 // Arrastrar gira el cubo en dos ejes.
                 let drag = resp.drag_delta();
@@ -3116,15 +3121,36 @@ impl App {
                             let bp = q[3] + (q[2] - q[3]) * u;
                             tp + (bp - tp) * v
                         };
-                        // Numero (esquina) + lineas de contenido (esquematico).
-                        let fs = (sc * 0.16).clamp(8.0, 40.0);
-                        painter.text(at(0.5, 0.16), egui::Align2::CENTER_CENTER, format!("{}", idx + 1), egui::FontId::new(fs, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(80));
-                        let lw = (sc * 0.01).clamp(0.8, 3.0);
-                        for li in 0..body_lines[idx] {
-                            let vv = 0.42 + li as f32 * 0.13;
-                            let len = if li % 2 == 1 { 0.42 } else { 0.66 };
-                            painter.line_segment([at(0.17, vv), at(0.17 + len, vv)], egui::Stroke::new(lw, egui::Color32::from_gray(165)));
+                        // TRAZOS reales de la tinta de esa hoja (mapeados al quad, con proporcion).
+                        if let Some((strokes, Some((mn, mx)))) = previews.get(idx) {
+                            let bw = (mx.x - mn.x).max(1.0);
+                            let bh = (mx.y - mn.y).max(1.0);
+                            let sm = 0.82 / bw.max(bh);
+                            let (ox, oy) = (0.5 - sm * bw * 0.5, 0.5 - sm * bh * 0.5);
+                            let sw = (sc * 0.010).clamp(0.6, 3.0);
+                            for (pts, col, _w) in strokes {
+                                if pts.len() < 2 {
+                                    continue;
+                                }
+                                let c = egui::Color32::from_rgba_unmultiplied((col[0] * 255.0) as u8, (col[1] * 255.0) as u8, (col[2] * 255.0) as u8, (col[3] * 255.0) as u8);
+                                let line: Vec<egui::Pos2> = pts.iter().map(|p| at(ox + sm * (p.x - mn.x), oy + sm * (p.y - mn.y))).collect();
+                                painter.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
+                            }
                         }
+                        // Lineas de TEXTO (esquema con la longitud real de cada renglon).
+                        let lw = (sc * 0.01).clamp(0.8, 3.0);
+                        if let Some(tl) = texts.get(idx) {
+                            for (li, &len) in tl.iter().enumerate() {
+                                let vv = 0.26 + li as f32 * 0.10;
+                                if vv > 0.93 {
+                                    break;
+                                }
+                                painter.line_segment([at(0.14, vv), at(0.14 + len * 0.72, vv)], egui::Stroke::new(lw, egui::Color32::from_gray(150)));
+                            }
+                        }
+                        // Numero de hoja, pequeño, en la esquina (no tapa el contenido).
+                        let fs = (sc * 0.11).clamp(7.0, 24.0);
+                        painter.text(at(0.12, 0.1), egui::Align2::CENTER_CENTER, format!("{}", idx + 1), egui::FontId::new(fs, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(110));
                         let bcol = if hovered {
                             egui::Color32::from_rgb(95, 150, 230)
                         } else if idx == current {
@@ -3153,6 +3179,51 @@ impl App {
             self.cube_view = false;
         }
         goto
+    }
+
+    /// Precalcula el contenido REAL de cada hoja para el cubo: los trazos de tinta (con su bounding
+    /// box) y las longitudes de las primeras lineas de texto. Se llama al abrir la vista.
+    fn build_cube_previews(&mut self) {
+        self.commit_text();
+        self.stash_current_page(); // la hoja actual debe tener su tinta/texto al dia
+        let mut previews: Vec<PreviewPage> = Vec::new();
+        let mut texts: Vec<Vec<f32>> = Vec::new();
+        for pg in &self.pages {
+            let mut strokes: Vec<PreviewStroke> = Vec::new();
+            let mut mn = Vec2::splat(f32::MAX);
+            let mut mx = Vec2::splat(f32::MIN);
+            for layer in &pg.doc.layers {
+                if !layer.visible {
+                    continue;
+                }
+                for st in &layer.strokes {
+                    if st.samples.is_empty() {
+                        continue;
+                    }
+                    let pts: Vec<Vec2> = st.samples.iter().map(|s| s.pos).collect();
+                    for p in &pts {
+                        mn = mn.min(*p);
+                        mx = mx.max(*p);
+                    }
+                    let mut c = st.brush.color;
+                    c[3] *= layer.opacity * st.brush.opacity;
+                    strokes.push((pts, c, st.brush.width));
+                }
+            }
+            let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
+            previews.push((strokes, bounds));
+            let tl: Vec<f32> = pg
+                .body
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('|') && !l.starts_with("<!--"))
+                .take(7)
+                .map(|l| (l.chars().count() as f32 / 30.0).clamp(0.18, 0.95))
+                .collect();
+            texts.push(tl);
+        }
+        self.cube_previews = previews;
+        self.cube_text = texts;
     }
 
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
@@ -4075,6 +4146,12 @@ impl ApplicationHandler for App {
                 }
                 let now = Instant::now();
                 let cur = vec2(position.x as f32, position.y as f32);
+                // En la vista CUBO el raton solo gira el cubo (lo maneja egui): no dibujar/pan/zoom.
+                if self.cube_view {
+                    self.cursor = cur;
+                    self.last_cursor = cur;
+                    return;
+                }
                 let dt_move = (now - self.last_move_time).as_secs_f32().max(1e-4);
                 let speed = (cur - self.last_cursor).length() / dt_move;
                 self.last_move_time = now;
@@ -4124,7 +4201,9 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => match button {
                 MouseButton::Left => match state {
                     ElementState::Pressed => {
-                        if self.app_mode == AppMode::Library && self.preview_idx.is_some() {
+                        if self.cube_view {
+                            // En la vista cubo el clic lo maneja el cubo (egui): no dibujar.
+                        } else if self.app_mode == AppMode::Library && self.preview_idx.is_some() {
                             // Un clic durante la VISTA PREVIA la cierra (vuelve a la biblioteca).
                             self.close_preview();
                         } else if self.app_mode == AppMode::Library && !self.creating_nb {
@@ -4183,7 +4262,9 @@ impl ApplicationHandler for App {
                         }
                     }
                     ElementState::Released => {
-                        if self.app_mode == AppMode::Library {
+                        if self.cube_view {
+                            // Vista cubo: soltar lo maneja el cubo (egui).
+                        } else if self.app_mode == AppMode::Library {
                             // Soltar en la biblioteca: sobre la papelera = borrar; si se arrastro,
                             // reordenar; si no se movio, abrir.
                             if let Some(i) = self.drag_idx.take() {
@@ -4325,6 +4406,10 @@ impl ApplicationHandler for App {
                 // Marca el instante del tacto/lapiz para suprimir el eco de raton sintetico.
                 self.last_touch = Some(Instant::now());
                 let loc = vec2(t.location.x as f32, t.location.y as f32);
+                // En la vista CUBO el lapiz/tacto gira el cubo (egui), no dibuja.
+                if self.cube_view {
+                    return;
+                }
                 // En la BIBLIOTECA el lapiz/tacto navega las cartas (abrir/arrastrar/soltar),
                 // no dibuja. (Con Poll el redibujo es continuo, asi que el `return` es seguro.)
                 if self.app_mode == AppMode::Library {
@@ -5799,6 +5884,7 @@ impl ApplicationHandler for App {
                         // Abrir el cubo en una pose que muestre 3 caras (esquina).
                         self.cube_yaw = 0.6;
                         self.cube_pitch = -0.5;
+                        self.build_cube_previews();
                     }
                 }
                 // Seleccion de hoja en el cubo: ir a esa hoja y salir de la vista.
