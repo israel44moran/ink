@@ -399,6 +399,29 @@ impl Document {
         selected
     }
 
+    /// Elimina de la capa activa los trazos cuyos indices esten en `ids`. Devuelve cuantos
+    /// se quitaron. Se usa para borrar lo seleccionado con la tecla Suprimir.
+    pub fn delete_strokes(&mut self, ids: &[usize]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let set: std::collections::HashSet<usize> = ids.iter().copied().collect();
+        let layer = self.active_layer_mut();
+        let before = layer.strokes.len();
+        let kept = std::mem::take(&mut layer.strokes)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !set.contains(i))
+            .map(|(_, s)| s)
+            .collect();
+        layer.strokes = kept;
+        let removed = before - layer.strokes.len();
+        if removed > 0 {
+            self.rebuild();
+        }
+        removed
+    }
+
     pub fn translate_strokes(&mut self, ids: &[usize], delta: Vec2) {
         if delta == Vec2::ZERO {
             return;
