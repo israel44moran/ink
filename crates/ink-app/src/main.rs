@@ -2931,9 +2931,9 @@ impl App {
                 self.reflow_block_to_next_page(cut);
             }
         }
-        // Dibujar las tablas por ENCIMA. avail_w = ancho de contenido de la hoja; cada columna se
-        // auto-ajusta al texto y, si la tabla excede el ancho, aparece un deslizador horizontal.
-        let avail_w = (rect.width() - 2.0).max(40.0);
+        // Dibujar las tablas por ENCIMA. avail_w deja un margen a la derecha para el boton
+        // "+columna" y para que la tabla NUNCA invada el margen derecho de la hoja.
+        let avail_w = (rect.width() - 24.0).max(40.0);
         for (cstart, cend, cells, top, col_scale, row_scale) in tables {
             self.render_table(ctx, cstart, cend, &cells, top, avail_w, size_pts, fam.clone(), text_col, col_scale, row_scale);
         }
@@ -2947,7 +2947,7 @@ impl App {
     /// Dibuja una tabla de MUESTRA (no editable, color azulado) en la hoja para ver el tamaño
     /// REAL antes de insertarla, mientras el popup de tamaño esta abierto.
     fn draw_table_preview(&self, ctx: &egui::Context, top: egui::Pos2, avail_w: f32, size_pts: f32, col_scale: f32, row_scale: f32) {
-        let (ncols, nrows) = (3usize, 3usize);
+        let (ncols, nrows) = (2usize, 2usize);
         let cell_h = size_pts * 1.9 * row_scale.clamp(0.5, 3.0);
         let cw = 16.0 + col_scale.clamp(0.0, 1.0) * 200.0;
         let total_w = cw * ncols as f32;
@@ -3027,8 +3027,11 @@ impl App {
                 for c in 0..ncols {
                     xstart[c + 1] = xstart[c] + col_w[c];
                 }
-                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 26.0, th + 38.0)));
+                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 21.0, th + 38.0)));
                 let painter = ui.painter().clone();
+                // Painter recortado EXACTO al area de la tabla: el texto de las celdas no se sale
+                // por el borde derecho (al desplazar) ni invade el margen.
+                let cellp = painter.with_clip_rect(egui::Rect::from_min_size(egui::pos2(top.x, top.y - 1.0), egui::vec2(view_w, th + 2.0)));
                 let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
                 let ox = top.x - scroll_x;
                 for r in 0..=nrows {
@@ -3065,7 +3068,7 @@ impl App {
                         } else {
                             let txt = cells.get(r).and_then(|row| row.get(c)).map(|s| s.as_str()).unwrap_or("");
                             let fid = if r == 0 { egui::FontId::new(size_pts, head_fam.clone()) } else { egui::FontId::new(size_pts, fam.clone()) };
-                            painter.text(egui::pos2(crect.left() + pad, crect.center().y), egui::Align2::LEFT_CENTER, txt, fid, text_col);
+                            cellp.text(egui::pos2(crect.left() + pad, crect.center().y), egui::Align2::LEFT_CENTER, txt, fid, text_col);
                             if ui.interact(crect, egui::Id::new(("tcell", cstart, r, c)), egui::Sense::click()).clicked() {
                                 start_edit = Some((r, c));
                             }
@@ -3201,7 +3204,23 @@ impl App {
     /// queda en la pagina actual; el contenido "fluye" hacia adelante y se navega con ▶.
     fn reflow_block_to_next_page(&mut self, cut: usize) {
         let bchars: Vec<char> = self.page_body.chars().collect();
-        let cut = cut.min(bchars.len());
+        let mut cut = cut.min(bchars.len());
+        // Incluir la directiva `<!--tbl ...-->` que precede a la tabla (para que su tamaño viaje
+        // con ella). Se mira la linea inmediatamente anterior al corte.
+        {
+            let mut i = cut;
+            if i > 0 && bchars[i - 1] == '\n' {
+                i -= 1;
+            }
+            let mut ls = i;
+            while ls > 0 && bchars[ls - 1] != '\n' {
+                ls -= 1;
+            }
+            let prev: String = bchars[ls..i].iter().collect();
+            if prev.trim_start().starts_with("<!--tbl") {
+                cut = ls;
+            }
+        }
         if cut == 0 {
             return;
         }
@@ -3405,7 +3424,9 @@ impl App {
                 for (k, &c) in block.iter().enumerate() {
                     chars.insert(hi + k, c);
                 }
-                new_cursor = hi + block.len();
+                // El cursor queda ANTES de la tabla: si no cabe en lo que resta de la hoja, el
+                // reflujo la pasara sola a la pagina siguiente (sin arrastrar el cursor).
+                new_cursor = hi;
             }
             // --- Prefijo de linea (encabezado / lista / cita) ---
             _ => {
