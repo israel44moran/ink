@@ -2811,7 +2811,7 @@ impl App {
         // Tablas: se recogen aqui (con su posicion) y se dibujan DESPUES en una capa por encima,
         // para que sus celdas y los botones +columna/+fila reciban los clics (la caja de texto
         // del documento cubre toda la hoja).
-        let mut tables: Vec<(usize, usize, Vec<Vec<String>>, egui::Pos2)> = Vec::new();
+        let mut tables: Vec<(usize, usize, Vec<Vec<String>>, egui::Pos2, f32, f32)> = Vec::new();
         // Paginacion: si una TABLA o IMAGEN no cabe en lo que queda de la hoja, se marca su
         // inicio para moverla (y lo que le siga) a la pagina siguiente. `body_before` permite
         // aplicar el corte solo en un frame SIN tecleo (asi el indice no se desfasa).
@@ -2881,15 +2881,15 @@ impl App {
                                 painter.text(egui::pos2(top.x + 2.0, top.y + rowh * 0.5), egui::Align2::LEFT_CENTER, "[imagen no encontrada]", egui::FontId::proportional((size_pts * 0.8).max(8.0)), egui::Color32::from_gray(150));
                             }
                         }
-                        Deco::Table { cells, cstart, cend } => {
+                        Deco::Table { cells, cstart, cend, col_scale, row_scale } => {
                             // Se dibuja despues, en una capa por encima (clics funcionan).
-                            tables.push((*cstart, *cend, cells.clone(), top));
+                            tables.push((*cstart, *cend, cells.clone(), top, *col_scale, *row_scale));
                         }
                     }
                     // Paginacion: marcar la PRIMERA tabla/imagen que no cabe y deja algo arriba.
                     if writing && reflow_cut.is_none() {
                         let bh = match deco {
-                            Deco::Table { cells, .. } => cells.len() as f32 * size_pts * 1.9,
+                            Deco::Table { cells, row_scale, .. } => cells.len() as f32 * size_pts * 1.9 * *row_scale,
                             Deco::Image(_) => size_pts * 9.0,
                             _ => 0.0,
                         };
@@ -2913,26 +2913,27 @@ impl App {
         // Dibujar las tablas por ENCIMA. avail_w = ancho de contenido de la hoja; cada columna se
         // auto-ajusta al texto y, si la tabla excede el ancho, aparece un deslizador horizontal.
         let avail_w = (rect.width() - 2.0).max(40.0);
-        for (cstart, cend, cells, top) in tables {
-            self.render_table(ctx, cstart, cend, &cells, top, avail_w, size_pts, fam.clone(), text_col);
+        for (cstart, cend, cells, top, col_scale, row_scale) in tables {
+            self.render_table(ctx, cstart, cend, &cells, top, avail_w, size_pts, fam.clone(), text_col, col_scale, row_scale);
         }
     }
 
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
     /// con el texto); si la tabla supera el ancho de la hoja aparece un DESLIZADOR horizontal.
     /// Celdas editables (clic), Enter pasa a la fila siguiente (creandola), y botones "+".
-    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32) {
+    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32, col_scale: f32, row_scale: f32) {
         if cells.is_empty() {
             return;
         }
         let nrows = cells.len();
         let ncols = cells.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-        let cell_h = size_pts * 1.9;
+        // Alto de fila y ancho minimo de columna: propios de ESTA tabla (de su directiva).
+        let cell_h = size_pts * 1.9 * row_scale.clamp(0.5, 3.0);
         let th = nrows as f32 * cell_h;
         let pad = 8.0;
         let head_fam = egui::FontFamily::Name("head".into());
-        // Ancho minimo de columna (lo regula el popup de tamaño); crece con el texto.
-        let col_min = 46.0 + self.doc_layout.table_scale.clamp(0.3, 1.0) * 150.0;
+        // Ancho minimo de columna; puede ser muy pequeño (col_scale=0) y crece con el texto.
+        let col_min = 16.0 + col_scale.clamp(0.0, 1.0) * 200.0;
         let editing = self.editing_cell.filter(|&(cs, _, _)| cs == cstart);
         let want_focus = self.cell_focus;
         let mut buf = self.cell_buf.clone();
@@ -3334,7 +3335,10 @@ impl App {
             }
             // --- Tabla: esqueleto 2x2 vacio en su propio bloque ---
             Md::Table => {
-                let block: Vec<char> = "\n|  |  |\n| --- | --- |\n|  |  |\n".chars().collect();
+                // La tabla guarda SU tamaño (ancho de columna / alto de fila) en una directiva
+                // oculta; asi el tamaño es propio de cada tabla y no afecta a las demas.
+                let dir = format!("<!--tbl c={:.2} r={:.2}-->", self.doc_layout.table_scale.clamp(0.0, 1.0), self.doc_layout.table_row.clamp(0.5, 3.0));
+                let block: Vec<char> = format!("\n{dir}\n|  |  |\n| --- | --- |\n|  |  |\n").chars().collect();
                 for (k, &c) in block.iter().enumerate() {
                     chars.insert(hi + k, c);
                 }
@@ -4326,9 +4330,10 @@ impl ApplicationHandler for App {
                 let mut doc_redo_flag = false;
                 let mut toggle_fullscreen = false;
                 let mut md_align: Option<u32> = None;
-                // Tamano (ancho) de tabla: se edita en el popup hover del boton Tabla y se
-                // aplica tras construir la UI.
+                // Tamano de la PROXIMA tabla (ancho de columna y alto de fila): se edita en el
+                // popup hover del boton Tabla y se guarda como defaults para tablas nuevas.
                 let mut table_scale = self.doc_layout.table_scale;
+                let mut table_row = self.doc_layout.table_row;
                 let in_library = self.app_mode == AppMode::Library;
                 let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
                     self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
@@ -4431,15 +4436,14 @@ impl ApplicationHandler for App {
                                                         .fixed_pos(table_resp.rect.left_bottom())
                                                         .show(ui.ctx(), |ui| {
                                                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                                ui.set_width(180.0);
-                                                                ui.label(egui::RichText::new("Ancho de columna").size(12.0).strong());
-                                                                ui.add(egui::Slider::new(&mut table_scale, 0.3..=1.0).show_value(false));
-                                                                ui.horizontal(|ui| {
-                                                                    if ui.small_button("Estrecha").clicked() { table_scale = 0.35; }
-                                                                    if ui.small_button("Media").clicked() { table_scale = 0.6; }
-                                                                    if ui.small_button("Amplia").clicked() { table_scale = 1.0; }
-                                                                });
-                                                                ui.label(egui::RichText::new("Las celdas se ensanchan solas con el texto.").size(10.0).weak());
+                                                                ui.set_width(200.0);
+                                                                ui.label(egui::RichText::new("Tamaño de la NUEVA tabla").size(12.0).strong());
+                                                                ui.add_space(2.0);
+                                                                ui.label(egui::RichText::new("Ancho de columna").size(11.0));
+                                                                ui.add(egui::Slider::new(&mut table_scale, 0.0..=1.0).show_value(false));
+                                                                ui.label(egui::RichText::new("Alto de fila").size(11.0));
+                                                                ui.add(egui::Slider::new(&mut table_row, 0.6..=2.5).show_value(false));
+                                                                ui.label(egui::RichText::new("Se aplica solo a la próxima tabla que insertes.").size(10.0).weak());
                                                             });
                                                         });
                                                     // Mantener abierto si el cursor esta sobre el boton, el panel o
@@ -5452,9 +5456,12 @@ impl ApplicationHandler for App {
                 if toggle_setup {
                     self.show_page_setup = !self.show_page_setup;
                 }
-                // Tamano de tabla ajustado en el popup hover.
+                // Tamano de la proxima tabla ajustado en el popup hover (defaults para tablas nuevas).
                 if (table_scale - self.doc_layout.table_scale).abs() > 1e-4 {
-                    self.doc_layout.table_scale = table_scale.clamp(0.3, 1.0);
+                    self.doc_layout.table_scale = table_scale.clamp(0.0, 1.0);
+                }
+                if (table_row - self.doc_layout.table_row).abs() > 1e-4 {
+                    self.doc_layout.table_row = table_row.clamp(0.5, 3.0);
                 }
                 if let Some(md) = md_action {
                     let c = self.egui_ctx.clone();
@@ -6738,8 +6745,9 @@ enum Deco {
     /// Imagen `![alt](ruta)`: se carga y dibuja la textura en una fila alta.
     Image(String),
     /// Tabla Markdown: celdas (fila 0 = encabezado), y rango de CARACTERES del bloque en el
-    /// texto (para editar: añadir columna/fila). Se dibuja como rejilla real.
-    Table { cells: Vec<Vec<String>>, cstart: usize, cend: usize },
+    /// texto (para editar: añadir columna/fila). `col_scale`/`row_scale` salen de la directiva
+    /// `<!--tbl ...-->` que precede a la tabla (tamaño propio de cada tabla). Rejilla real.
+    Table { cells: Vec<Vec<String>>, cstart: usize, cend: usize, col_scale: f32, row_scale: f32 },
 }
 
 /// Divide una fila Markdown `| a | b |` en celdas (sin los `|` de los extremos).
@@ -6978,6 +6986,9 @@ fn markdown_job(
         t.starts_with('|') && t.len() > 1
     };
     let mut tbl: Option<(usize, Vec<Vec<String>>)> = None;
+    // Dimensiones de la SIGUIENTE tabla (de su directiva `<!--tbl c=.. r=..-->`); por defecto
+    // ancho medio y alto normal para tablas sin directiva (las viejas).
+    let mut pending_dims: (f32, f32) = (0.5, 1.0);
     let mut char_pos = 0usize;
     for (li, line) in text.split('\n').enumerate() {
         let lh = base * line_spacing;
@@ -6993,8 +7004,19 @@ fn markdown_job(
         // Si esta linea NO es de tabla, cerrar la tabla pendiente (emitir su rejilla).
         if !is_t(&full) {
             if let Some((cs, cells)) = tbl.take() {
-                decos.push((cs, Deco::Table { cells, cstart: cs, cend: start.saturating_sub(1) }));
+                decos.push((cs, Deco::Table { cells, cstart: cs, cend: start.saturating_sub(1), col_scale: pending_dims.0, row_scale: pending_dims.1 }));
+                pending_dims = (0.5, 1.0);
             }
+        }
+        // --- Directiva de tamaño de tabla `<!--tbl c=.. r=..-->`: oculta; fija las dimensiones
+        //     de la tabla que viene justo despues (cada tabla guarda su propio tamaño) ---
+        if full.trim_start().starts_with("<!--tbl") {
+            job.append(&full, 0.0, TextFormat { font_id: FontId::new(0.01, fam.clone()), color: Color32::TRANSPARENT, line_height: Some(0.01), ..Default::default() });
+            let num = |key: &str| -> Option<f32> {
+                full.find(key).and_then(|i| full[i + key.len()..].split([' ', '>', '-']).next().and_then(|s| s.trim().parse::<f32>().ok()))
+            };
+            pending_dims = (num("c=").unwrap_or(0.5).clamp(0.0, 1.0), num("r=").unwrap_or(1.0).clamp(0.5, 3.0));
+            continue;
         }
         // --- Bloque de codigo: vallas ``` (estado entre lineas) ---
         if full.trim() == "```" {
@@ -7022,7 +7044,9 @@ fn markdown_job(
         // --- Tabla (| ... |): se OCULTA el Markdown y se dibuja la rejilla (decoracion) ---
         if is_t(&full) {
             let is_sep = is_table_separator(&full);
-            let rh = if is_sep { 0.5 } else { base * 1.9 };
+            // Reservar el alto real de fila (segun la directiva) para que el texto que sigue no
+            // se solape con la rejilla.
+            let rh = if is_sep { 0.5 } else { base * 1.9 * pending_dims.1 };
             job.append(&full, 0.0, TextFormat { font_id: FontId::new(0.01, fam.clone()), color: Color32::TRANSPARENT, line_height: Some(rh), ..Default::default() });
             if tbl.is_none() {
                 tbl = Some((start, Vec::new()));
@@ -7116,7 +7140,7 @@ fn markdown_job(
         push_inline(&mut job, &chars, base, lh, &fam, col, false, reveal);
     }
     if let Some((cs, cells)) = tbl {
-        decos.push((cs, Deco::Table { cells, cstart: cs, cend: char_pos }));
+        decos.push((cs, Deco::Table { cells, cstart: cs, cend: char_pos, col_scale: pending_dims.0, row_scale: pending_dims.1 }));
     }
     job.halign = match align {
         1 => egui::Align::Center,
