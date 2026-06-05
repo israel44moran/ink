@@ -221,13 +221,12 @@ struct App {
     cube_view: bool,
     /// Progreso de la transicion de entrada/salida del cubo (0 = fuera, 1 = dentro).
     cube_anim: f32,
-    /// Giro horizontal y vertical del cubo (rueda / arrastre del raton).
-    cube_yaw: f32,
-    cube_pitch: f32,
-    /// Vista previa REAL de cada hoja para el cubo (trazos de tinta + lineas de texto del teclado),
-    /// precalculada al abrir la vista para no rehacerla cada fotograma.
+    /// Desplazamiento vertical de la rejilla de miniaturas (rueda / deslizador).
+    cube_scroll: f32,
+    /// Contenido REAL de cada hoja para las miniaturas: trazos de tinta + cuerpo (texto/markdown),
+    /// precalculado al abrir la vista para no rehacerlo cada fotograma.
     cube_previews: Vec<PreviewPage>,
-    cube_text: Vec<Vec<String>>,
+    cube_bodies: Vec<String>,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -458,10 +457,9 @@ impl App {
             page_nav_rect: None,
             cube_view: false,
             cube_anim: 0.0,
-            cube_yaw: 0.0,
-            cube_pitch: -0.5,
+            cube_scroll: 0.0,
             cube_previews: Vec::new(),
-            cube_text: Vec::new(),
+            cube_bodies: Vec::new(),
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2999,188 +2997,94 @@ impl App {
             });
     }
 
-    /// Vista CUBO: un cubo 3D cuyas 6 caras estan cubiertas de MINI-HOJAS (varias por cara) para
-    /// ver muchas a la vez. Se gira con la rueda o arrastrando, y al hacer CLIC en una mini-hoja
-    /// se va a ella. Devuelve la hoja elegida. `cube_anim` controla la transicion de acercamiento.
-    fn draw_cube_view(&mut self, ctx: &egui::Context) -> Option<usize> {
+    /// Vista REJILLA: todas las hojas en miniatura (filas y columnas) sobre un velo oscuro, con
+    /// desplazamiento vertical (rueda / deslizador). Cada miniatura muestra el contenido REAL de la
+    /// hoja (texto/markdown, tablas y trazos). Clic en una hoja -> ir a ella. Devuelve la elegida.
+    fn draw_pages_grid(&mut self, ctx: &egui::Context) -> Option<usize> {
         let t = self.cube_anim;
         if t <= 0.003 {
             return None;
         }
         let screen = ctx.screen_rect();
-        let center = screen.center();
         let n = self.pages.len().max(1);
         let current = self.current_page;
-        let bob = (self.clock * 1.0).sin() * 0.03; // leve flotacion
-        let yaw = self.cube_yaw;
-        let pitch = self.cube_pitch;
-        let dist = 4.6;
-        let focal = screen.height() * 0.72 * t;
-        let (sy, cy) = yaw.sin_cos();
-        let (sp, cp) = pitch.sin_cos();
-        // Rotacion (yaw sobre Y, luego pitch sobre X) + flotacion.
-        let rot = |p: (f32, f32, f32)| -> (f32, f32, f32) {
-            let (x, y, z) = p;
-            let x1 = x * cy + z * sy;
-            let z1 = -x * sy + z * cy;
-            let y2 = y * cp - z1 * sp;
-            let z2 = y * sp + z1 * cp;
-            (x1, y2 + bob, z2)
-        };
-        let project = |p: (f32, f32, f32)| -> (egui::Pos2, f32) {
-            let (x, y, z) = p;
-            let zc = (dist - z).max(0.3);
-            let s = focal / zc;
-            (egui::pos2(center.x + x * s, center.y - y * s), zc)
-        };
-        // 6 caras del cubo: (origen, borde_u, borde_v, normal). Las hojas se reparten entre ellas.
-        let faces: [((f32, f32, f32), (f32, f32, f32), (f32, f32, f32), (f32, f32, f32)); 6] = [
-            ((-1., -1., 1.), (2., 0., 0.), (0., 2., 0.), (0., 0., 1.)),   // frente
-            ((1., -1., -1.), (-2., 0., 0.), (0., 2., 0.), (0., 0., -1.)), // atras
-            ((1., -1., 1.), (0., 0., -2.), (0., 2., 0.), (1., 0., 0.)),   // derecha
-            ((-1., -1., -1.), (0., 0., 2.), (0., 2., 0.), (-1., 0., 0.)), // izquierda
-            ((-1., 1., 1.), (2., 0., 0.), (0., 0., -2.), (0., 1., 0.)),   // arriba
-            ((-1., -1., -1.), (2., 0., 0.), (0., 0., 2.), (0., -1., 0.)), // abajo
-        ];
-        let per_face = n.div_ceil(6).max(1);
-        let cols = (per_face as f32).sqrt().ceil() as usize;
-        let rows = per_face.div_ceil(cols).max(1);
-        // Contenido REAL de cada hoja (precalculado al abrir): trazos + lineas de texto.
+        let mx = (screen.width() * 0.06).clamp(20.0, 140.0);
+        let area_rect = egui::Rect::from_min_max(egui::pos2(screen.left() + mx, screen.top() + 70.0), egui::pos2(screen.right() - mx - 16.0, screen.bottom() - 24.0));
+        let cols = ((area_rect.width() / 215.0).floor() as usize).clamp(2, 8);
+        let gap = 18.0;
+        let thumb_w = (area_rect.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+        let thumb_h = thumb_w / 0.72; // proporcion de hoja (ancho/alto)
+        let row_h = thumb_h + gap + 16.0; // incluye el numero bajo la miniatura
+        let rows = n.div_ceil(cols);
+        let total_h = rows as f32 * row_h;
+        let visible_h = area_rect.height();
+        let max_scroll = (total_h - visible_h).max(0.0);
+        let mut scroll = self.cube_scroll.clamp(0.0, max_scroll);
         let previews = &self.cube_previews;
-        let texts = &self.cube_text;
-        // Mini-hojas visibles, agrupadas por cara (para dibujarlas con su cara, ordenadas).
-        struct FaceDraw {
-            z: f32,
-            quad: [egui::Pos2; 4],
-            minis: Vec<(usize, [egui::Pos2; 4], f32)>, // idx, quad, escala
-        }
-        let mut fdraws: Vec<FaceDraw> = Vec::new();
-        for (fi, &(o, eu, ev, nrm)) in faces.iter().enumerate() {
-            let nr = rot(nrm);
-            if nr.2 <= 0.04 {
-                continue; // cara que no mira a la camara
-            }
-            let at3 = |u: f32, v: f32| (o.0 + u * eu.0 + v * ev.0, o.1 + u * eu.1 + v * ev.1, o.2 + u * eu.2 + v * ev.2);
-            let fq = [project(rot(at3(0.0, 1.0))).0, project(rot(at3(1.0, 1.0))).0, project(rot(at3(1.0, 0.0))).0, project(rot(at3(0.0, 0.0))).0];
-            let (_c, fz) = project(rot(at3(0.5, 0.5)));
-            let mut minis = Vec::new();
-            for k in 0..per_face {
-                let idx = fi * per_face + k;
-                if idx >= n {
-                    break;
-                }
-                let (col, row) = (k % cols, k / cols);
-                let pad = 0.07;
-                let (u0, u1) = ((col as f32 + pad) / cols as f32, (col as f32 + 1.0 - pad) / cols as f32);
-                let (v0, v1) = ((row as f32 + pad) / rows as f32, (row as f32 + 1.0 - pad) / rows as f32);
-                let q = [project(rot(at3(u0, v1))).0, project(rot(at3(u1, v1))).0, project(rot(at3(u1, v0))).0, project(rot(at3(u0, v0))).0];
-                let (_mc, mz) = project(rot(at3((u0 + u1) * 0.5, (v0 + v1) * 0.5)));
-                minis.push((idx, q, focal / mz));
-            }
-            fdraws.push(FaceDraw { z: fz, quad: fq, minis });
-        }
-        fdraws.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
-
+        let bodies = &self.cube_bodies;
+        let layout = self.doc_layout;
         let area = egui::Area::new(egui::Id::new("cube_view"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 ui.set_clip_rect(screen);
-                let resp = ui.interact(screen, egui::Id::new("cube_bg"), egui::Sense::click_and_drag());
-                let painter = ui.painter();
+                let resp = ui.interact(screen, egui::Id::new("cube_bg"), egui::Sense::click());
+                let painter = ui.painter().clone();
                 painter.rect_filled(screen, egui::CornerRadius::same(0), egui::Color32::from_black_alpha((t * 224.0) as u8));
+                painter.text(egui::pos2(area_rect.left(), screen.top() + 42.0), egui::Align2::LEFT_CENTER, format!("Hojas ({n})   ·   clic en una para abrirla   ·   Esc para salir"), egui::FontId::proportional(15.0), egui::Color32::from_white_alpha((t * 210.0) as u8));
                 let pointer = ui.input(|i| i.pointer.interact_pos());
-                // Arrastrar gira el cubo en dos ejes.
-                let drag = resp.drag_delta();
-                let dragging = resp.dragged() && (drag.x.abs() + drag.y.abs() > 0.2);
                 let clicked = resp.clicked();
                 let mut goto = None;
-                for fd in &fdraws {
-                    // Cara del cubo (cartulina de fondo).
-                    let mut fm = egui::Mesh::default();
-                    for &v in &fd.quad {
-                        fm.colored_vertex(v, egui::Color32::from_rgb(54, 54, 60));
+                let cp = painter.with_clip_rect(area_rect); // recorta las miniaturas al area (scroll)
+                for i in 0..n {
+                    let (col, row) = (i % cols, i / cols);
+                    let x = area_rect.left() + col as f32 * (thumb_w + gap);
+                    let y = area_rect.top() + row as f32 * row_h - scroll;
+                    let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(thumb_w, thumb_h));
+                    if r.bottom() < area_rect.top() - 2.0 || r.top() > area_rect.bottom() + 2.0 {
+                        continue; // fuera del area visible
                     }
-                    fm.add_triangle(0, 1, 2);
-                    fm.add_triangle(0, 2, 3);
-                    painter.add(egui::Shape::mesh(fm));
-                    painter.add(egui::Shape::closed_line(fd.quad.to_vec(), egui::Stroke::new(1.5, egui::Color32::from_gray(30))));
-                    // Mini-hojas de la cara.
-                    for &(idx, q, sc) in &fd.minis {
-                        let hovered = !dragging && pointer.is_some_and(|pt| point_in_quad(pt, &q));
-                        let paper = if hovered { egui::Color32::from_rgb(255, 250, 228) } else { egui::Color32::from_rgb(232, 232, 230) };
-                        let mut m = egui::Mesh::default();
-                        for &v in &q {
-                            m.colored_vertex(v, paper);
-                        }
-                        m.add_triangle(0, 1, 2);
-                        m.add_triangle(0, 2, 3);
-                        painter.add(egui::Shape::mesh(m));
-                        let at = |u: f32, v: f32| {
-                            let tp = q[0] + (q[1] - q[0]) * u;
-                            let bp = q[3] + (q[2] - q[3]) * u;
-                            tp + (bp - tp) * v
-                        };
-                        // TRAZOS reales de la tinta de esa hoja (mapeados al quad, con proporcion).
-                        if let Some((strokes, Some((mn, mx)))) = previews.get(idx) {
-                            let bw = (mx.x - mn.x).max(1.0);
-                            let bh = (mx.y - mn.y).max(1.0);
-                            let sm = 0.82 / bw.max(bh);
-                            let (ox, oy) = (0.5 - sm * bw * 0.5, 0.5 - sm * bh * 0.5);
-                            let sw = (sc * 0.010).clamp(0.6, 3.0);
-                            for (pts, col, _w) in strokes {
-                                if pts.len() < 2 {
-                                    continue;
-                                }
-                                let c = egui::Color32::from_rgba_unmultiplied((col[0] * 255.0) as u8, (col[1] * 255.0) as u8, (col[2] * 255.0) as u8, (col[3] * 255.0) as u8);
-                                let line: Vec<egui::Pos2> = pts.iter().map(|p| at(ox + sm * (p.x - mn.x), oy + sm * (p.y - mn.y))).collect();
-                                painter.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
-                            }
-                        }
-                        // TEXTO real del teclado: cada renglon como texto pequeño, recortado a la
-                        // mini-hoja (clip a su caja). El tamaño se ajusta al ancho de la celda.
-                        if let Some(tl) = texts.get(idx) {
-                            if !tl.is_empty() {
-                                let cellw = (at(1.0, 0.5) - at(0.0, 0.5)).length().max(8.0);
-                                let ts = (cellw * 0.052).clamp(5.0, 18.0);
-                                let bb = egui::Rect::from_points(&q);
-                                let tp = painter.with_clip_rect(bb);
-                                let lh = 0.118;
-                                for (li, line) in tl.iter().enumerate() {
-                                    let vv = 0.14 + li as f32 * lh;
-                                    if vv > 0.94 {
-                                        break;
-                                    }
-                                    tp.text(at(0.1, vv), egui::Align2::LEFT_CENTER, line, egui::FontId::proportional(ts), egui::Color32::from_gray(55));
-                                }
-                            }
-                        }
-                        // Numero de hoja, pequeño y tenue, en la esquina (no tapa el contenido).
-                        let fs = (sc * 0.085).clamp(6.0, 18.0);
-                        painter.text(at(0.94, 0.05), egui::Align2::RIGHT_TOP, format!("{}", idx + 1), egui::FontId::new(fs, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(150));
-                        let bcol = if hovered {
-                            egui::Color32::from_rgb(95, 150, 230)
-                        } else if idx == current {
-                            egui::Color32::from_rgb(150, 120, 84)
-                        } else {
-                            egui::Color32::from_gray(120)
-                        };
-                        painter.add(egui::Shape::closed_line(q.to_vec(), egui::Stroke::new(if hovered || idx == current { 2.2 } else { 1.0 }, bcol)));
-                        if clicked && hovered {
-                            goto = Some(idx);
-                        }
+                    let hovered = pointer.is_some_and(|p| r.contains(p) && area_rect.contains(p));
+                    cp.rect_filled(r, egui::CornerRadius::same(2), if hovered { egui::Color32::from_rgb(255, 253, 244) } else { egui::Color32::WHITE });
+                    if let (Some(prev), Some(body)) = (previews.get(i), bodies.get(i)) {
+                        draw_page_mini(&cp, ui, r, prev, body, &layout);
+                    }
+                    let bcol = if hovered {
+                        egui::Color32::from_rgb(95, 150, 230)
+                    } else if i == current {
+                        egui::Color32::from_rgb(150, 120, 84)
+                    } else {
+                        egui::Color32::from_gray(185)
+                    };
+                    cp.rect_stroke(r, egui::CornerRadius::same(2), egui::Stroke::new(if hovered || i == current { 2.5 } else { 1.0 }, bcol), egui::StrokeKind::Outside);
+                    cp.text(egui::pos2(r.center().x, r.bottom() + 9.0), egui::Align2::CENTER_CENTER, format!("{}", i + 1), egui::FontId::proportional(12.0), if i == current { egui::Color32::from_rgb(190, 160, 120) } else { egui::Color32::from_gray(205) });
+                    if clicked && hovered {
+                        goto = Some(i);
                     }
                 }
-                painter.text(egui::pos2(center.x, screen.bottom() - 26.0), egui::Align2::CENTER_CENTER, "Arrastra o usa la rueda para girar  ·  clic en una hoja para abrirla  ·  Esc para salir", egui::FontId::proportional(13.0), egui::Color32::from_white_alpha((t * 200.0) as u8));
-                (clicked, goto, drag, dragging)
+                // Deslizador vertical a la derecha.
+                if max_scroll > 0.0 {
+                    let tx = screen.right() - 12.0;
+                    let track = egui::Rect::from_min_size(egui::pos2(tx, area_rect.top()), egui::vec2(7.0, visible_h));
+                    let sresp = ui.interact(track, egui::Id::new("cube_vscroll"), egui::Sense::click_and_drag());
+                    let th = (visible_h * visible_h / total_h).clamp(36.0, visible_h);
+                    let active = sresp.dragged() || sresp.is_pointer_button_down_on();
+                    if active {
+                        if let Some(py) = pointer.map(|p| p.y) {
+                            scroll = (((py - area_rect.top() - th * 0.5) / (visible_h - th)).clamp(0.0, 1.0)) * max_scroll;
+                        }
+                    }
+                    painter.rect_filled(track, egui::CornerRadius::same(4), egui::Color32::from_white_alpha(30));
+                    let frac = scroll / max_scroll;
+                    let ty = area_rect.top() + frac * (visible_h - th);
+                    painter.rect_filled(egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(7.0, th)), egui::CornerRadius::same(4), egui::Color32::from_white_alpha(if active { 180 } else { 110 }));
+                }
+                (clicked, goto, scroll)
             });
-        let (bg_clicked, goto, drag, dragging) = area.inner;
-        if dragging {
-            self.cube_yaw += drag.x * 0.008;
-            self.cube_pitch = (self.cube_pitch - drag.y * 0.008).clamp(-1.2, 1.2);
-        }
-        if goto.is_none() && bg_clicked && !dragging {
-            self.cube_view = false; // clic en el vacio: salir
+        let (bg_clicked, goto, scroll) = area.inner;
+        self.cube_scroll = scroll;
+        if goto.is_none() && bg_clicked {
+            self.cube_view = false; // clic fuera de las miniaturas: salir
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cube_view = false;
@@ -3188,13 +3092,14 @@ impl App {
         goto
     }
 
-    /// Precalcula el contenido REAL de cada hoja para el cubo: los trazos de tinta (con su bounding
-    /// box) y las longitudes de las primeras lineas de texto. Se llama al abrir la vista.
+
+    /// Precalcula el contenido REAL de cada hoja para las miniaturas: los trazos de tinta (con su
+    /// bounding box) y el cuerpo (texto/markdown). Se llama al abrir la vista.
     fn build_cube_previews(&mut self) {
         self.commit_text();
         self.stash_current_page(); // la hoja actual debe tener su tinta/texto al dia
         let mut previews: Vec<PreviewPage> = Vec::new();
-        let mut texts: Vec<Vec<String>> = Vec::new();
+        let mut bodies: Vec<String> = Vec::new();
         for pg in &self.pages {
             let mut strokes: Vec<PreviewStroke> = Vec::new();
             let mut mn = Vec2::splat(f32::MAX);
@@ -3219,27 +3124,10 @@ impl App {
             }
             let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
             previews.push((strokes, bounds));
-            // Texto del teclado: las primeras lineas (sin marcas de tabla/directivas), recortadas
-            // para no desbordar la mini-hoja.
-            let tl: Vec<String> = pg
-                .body
-                .lines()
-                .map(|l| l.trim_end())
-                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('|') && !l.trim_start().starts_with("<!--"))
-                .take(12)
-                .map(|l| {
-                    let s = strip_md(l);
-                    if s.chars().count() > 40 {
-                        s.chars().take(40).collect::<String>() + "…"
-                    } else {
-                        s
-                    }
-                })
-                .collect();
-            texts.push(tl);
+            bodies.push(pg.body.clone());
         }
         self.cube_previews = previews;
-        self.cube_text = texts;
+        self.cube_bodies = bodies;
     }
 
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
@@ -4367,8 +4255,8 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
                 };
                 if self.cube_view {
-                    // En la vista CUBO la rueda GIRA el carrusel de hojas.
-                    self.cube_yaw += amount * 0.30;
+                    // En la vista REJILLA la rueda desplaza verticalmente las miniaturas.
+                    self.cube_scroll = (self.cube_scroll - amount * 70.0).max(0.0);
                 } else if self.app_mode == AppMode::Library && self.preview_idx.is_some() && amount != 0.0 {
                     // En VISTA PREVIA, la rueda PASA DE PAGINA (arriba = anterior, abajo = siguiente).
                     self.preview_flip(if amount > 0.0 { -1 } else { 1 });
@@ -4984,9 +4872,9 @@ impl ApplicationHandler for App {
                         self.page_nav_rect = Some(nav_resp.response.rect);
                     }
 
-                    // Vista CUBO 3D de las hojas (overlay por encima de todo).
+                    // Vista REJILLA de miniaturas de las hojas (overlay por encima de todo).
                     if self.cube_view || self.cube_anim > 0.003 {
-                        cube_goto = self.draw_cube_view(ctx);
+                        cube_goto = self.draw_pages_grid(ctx);
                     }
 
                     // (El selector de pinceles de Photoshop se fusiono con el panel "Mis
@@ -5897,9 +5785,8 @@ impl ApplicationHandler for App {
                 if toggle_cube {
                     self.cube_view = !self.cube_view;
                     if self.cube_view {
-                        // Abrir el cubo en una pose que muestre 3 caras (esquina).
-                        self.cube_yaw = 0.6;
-                        self.cube_pitch = -0.5;
+                        // Abrir la rejilla desde arriba y precalcular las miniaturas.
+                        self.cube_scroll = 0.0;
                         self.build_cube_previews();
                     }
                 }
@@ -6862,7 +6749,7 @@ fn doc_pencil_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
     resp
 }
 
-/// Boton con un CUBO isometrico (vista 3D de las hojas). Resalta si la vista esta activa.
+/// Boton "ver todas las hojas": una CUADRICULA de mini-paginas. Resalta si la vista esta activa.
 fn cube_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 24.0), egui::Sense::click());
     let p = ui.painter();
@@ -6875,20 +6762,16 @@ fn cube_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
     };
     p.rect_filled(rect, egui::CornerRadius::same(5), bg);
     let col = if active { egui::Color32::WHITE } else { egui::Color32::from_gray(60) };
+    let st = egui::Stroke::new(1.3, col);
     let c = rect.center();
-    let s = 7.5;
-    let h = s * 0.866;
-    let top = egui::pos2(c.x, c.y - s);
-    let ur = egui::pos2(c.x + h, c.y - s * 0.5);
-    let lr = egui::pos2(c.x + h, c.y + s * 0.5);
-    let bot = egui::pos2(c.x, c.y + s);
-    let ll = egui::pos2(c.x - h, c.y + s * 0.5);
-    let ul = egui::pos2(c.x - h, c.y - s * 0.5);
-    let st = egui::Stroke::new(1.5, col);
-    p.add(egui::Shape::closed_line(vec![top, ur, lr, bot, ll, ul], st));
-    p.line_segment([c, ur], st);
-    p.line_segment([c, bot], st);
-    p.line_segment([c, ul], st);
+    let (gx, gy) = (6.2, 8.4);
+    for row in 0..2 {
+        for cc in 0..3 {
+            let x = c.x + (cc as f32 - 1.0) * gx;
+            let y = c.y + (row as f32 - 0.5) * gy;
+            p.rect_stroke(egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(4.4, 6.2)), egui::CornerRadius::same(1), st, egui::StrokeKind::Inside);
+        }
+    }
     resp
 }
 
@@ -6909,6 +6792,70 @@ fn point_in_quad(p: egui::Pos2, q: &[egui::Pos2; 4]) -> bool {
         }
     }
     true
+}
+
+/// Dibuja en miniatura el contenido REAL de una hoja dentro del rect `r`: el cuerpo (texto/markdown
+/// y tablas como rejilla) en la parte superior y los trazos de tinta escalados encima.
+fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview: &PreviewPage, body: &str, layout: &notebook::DocLayout) {
+    let text_col = egui::Color32::from_rgb(34, 32, 36);
+    let pad = (r.width() * 0.07).clamp(2.0, 10.0);
+    let inner = egui::Rect::from_min_max(r.min + egui::vec2(pad, pad), r.max - egui::vec2(pad, pad));
+    let mp = painter.with_clip_rect(r); // el contenido no se sale de la miniatura
+    // --- Texto del teclado (markdown) + tablas ---
+    if !body.trim().is_empty() {
+        let fam = match layout.font {
+            1 => egui::FontFamily::Name("serif".into()),
+            2 => egui::FontFamily::Monospace,
+            3 => egui::FontFamily::Name("doc_lora".into()),
+            4 => egui::FontFamily::Name("doc_merri".into()),
+            5 => egui::FontFamily::Name("doc_garamond".into()),
+            6 => egui::FontFamily::Name("doc_atkinson".into()),
+            7 => egui::FontFamily::Name("doc_sourcesans".into()),
+            _ => egui::FontFamily::Proportional,
+        };
+        let fsize = (r.width() * 0.058).clamp(3.5, 8.5);
+        let (mut job, decos) = markdown_job(body, fsize, layout.line_spacing.max(1.0), fam, text_col, None, 0);
+        job.wrap.max_width = inner.width();
+        let galley = ui.painter().layout_job(job);
+        mp.galley(inner.min, galley.clone(), text_col);
+        for (cidx, deco) in &decos {
+            if let Deco::Table { cells, .. } = deco {
+                let cr = galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
+                let top = inner.min + cr.min.to_vec2();
+                let nrows = cells.len().max(1);
+                let ncols = cells.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+                let cellh = fsize * 1.5;
+                let tw = (inner.width() * 0.9).min(ncols as f32 * fsize * 5.0).max(8.0);
+                let th = nrows as f32 * cellh;
+                let g = egui::Stroke::new(0.7, egui::Color32::from_gray(150));
+                for ri in 0..=nrows {
+                    let y = top.y + ri as f32 * cellh;
+                    mp.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + tw, y)], g);
+                }
+                for ci in 0..=ncols {
+                    let x = top.x + ci as f32 * (tw / ncols as f32);
+                    mp.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], g);
+                }
+            }
+        }
+    }
+    // --- Trazos de tinta (escalados al rect, manteniendo proporcion) ---
+    if let Some((mn, mx)) = preview.1 {
+        let bw = (mx.x - mn.x).max(1.0);
+        let bh = (mx.y - mn.y).max(1.0);
+        let s = (inner.width() / bw).min(inner.height() / bh);
+        let (bcx, bcy) = ((mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5);
+        let rc = inner.center();
+        for (pts, col, w) in &preview.0 {
+            if pts.len() < 2 {
+                continue;
+            }
+            let c = egui::Color32::from_rgba_unmultiplied((col[0] * 255.0) as u8, (col[1] * 255.0) as u8, (col[2] * 255.0) as u8, (col[3] * 255.0) as u8);
+            let sw = (w * s).max(0.5);
+            let line: Vec<egui::Pos2> = pts.iter().map(|q| egui::pos2(rc.x + (q.x - bcx) * s, rc.y + (q.y - bcy) * s)).collect();
+            mp.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
+        }
+    }
 }
 
 /// Comando de formato Markdown de la toolbar de edicion.
