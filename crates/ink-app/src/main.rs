@@ -6866,32 +6866,53 @@ fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview
         mp.galley(content.min, galley.clone(), text_col);
         let head = egui::FontFamily::Name("head".into());
         for (cidx, deco) in &decos {
-            if let Deco::Table { cells, .. } = deco {
+            if let Deco::Table { cells, col_scale, row_scale, .. } = deco {
                 let cr = galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
                 let top = content.min + cr.min.to_vec2();
                 let nrows = cells.len().max(1);
                 let ncols = cells.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
-                let cellh = fsize * 1.9;
-                let tw = (content.width() * 0.9).max(6.0);
-                let cw = tw / ncols as f32;
-                let th = nrows as f32 * cellh;
-                let g = egui::Stroke::new(0.7, egui::Color32::from_gray(150));
+                // Mismas reglas que la tabla real: alto de fila por `row_scale`, ANCHO DE COLUMNA
+                // AUTOMATICO (segun el texto) con un minimo por `col_scale`.
+                let cell_h = fsize * 1.9 * row_scale.clamp(0.5, 3.0);
+                let pad = fsize * 0.5;
+                let col_min = fsize * (2.0 + col_scale.clamp(0.0, 1.0) * 11.0);
+                let col_w: Vec<f32> = (0..ncols)
+                    .map(|c| {
+                        let mut w = col_min;
+                        for (ri, row) in cells.iter().enumerate() {
+                            if let Some(cell) = row.get(c) {
+                                if !cell.trim().is_empty() {
+                                    let fid = egui::FontId::new(fsize, if ri == 0 { head.clone() } else { fam.clone() });
+                                    let tw = ui.painter().layout_no_wrap(cell.clone(), fid, text_col).size().x;
+                                    w = w.max(tw + pad * 2.0);
+                                }
+                            }
+                        }
+                        w
+                    })
+                    .collect();
+                let mut xs = vec![0.0f32; ncols + 1];
+                for c in 0..ncols {
+                    xs[c + 1] = xs[c] + col_w[c];
+                }
+                let tw = xs[ncols];
+                let th = nrows as f32 * cell_h;
+                let g = egui::Stroke::new((fsize * 0.06).max(0.5), egui::Color32::from_gray(150));
                 for ri in 0..=nrows {
-                    let y = top.y + ri as f32 * cellh;
+                    let y = top.y + ri as f32 * cell_h;
                     mp.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + tw, y)], g);
                 }
                 for ci in 0..=ncols {
-                    let x = top.x + ci as f32 * cw;
+                    let x = top.x + xs[ci];
                     mp.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], g);
                 }
-                // Texto de cada celda (cabecera en negrita).
                 for (ri, row) in cells.iter().enumerate() {
                     for (ci, cell) in row.iter().enumerate() {
                         if cell.trim().is_empty() {
                             continue;
                         }
                         let fid = egui::FontId::new(fsize, if ri == 0 { head.clone() } else { fam.clone() });
-                        mp.text(egui::pos2(top.x + ci as f32 * cw + fsize * 0.4, top.y + ri as f32 * cellh + cellh * 0.5), egui::Align2::LEFT_CENTER, cell, fid, text_col);
+                        mp.text(egui::pos2(top.x + xs[ci] + pad, top.y + ri as f32 * cell_h + cell_h * 0.5), egui::Align2::LEFT_CENTER, cell, fid, text_col);
                     }
                 }
             }
