@@ -209,6 +209,9 @@ struct App {
     cell_focus: bool,
     /// Desplazamiento horizontal de la tabla ancha (cuando excede el ancho de la hoja).
     table_hscroll: f32,
+    /// El popup de tamaño de tabla esta abierto: se dibuja una tabla de muestra en la hoja
+    /// (tamaño real) para decidir el tamaño antes de insertar.
+    table_size_popup: bool,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -434,6 +437,7 @@ impl App {
             cell_buf: String::new(),
             cell_focus: false,
             table_hscroll: 0.0,
+            table_size_popup: false,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2779,6 +2783,15 @@ impl App {
         } else {
             None
         };
+        // Indice del cursor (para anclar la vista previa de tabla) y si su popup esta abierto.
+        let cursor_idx = if writing {
+            egui::TextEdit::load_state(ctx, id_te).and_then(|st| st.cursor.char_range()).map(|r| r.primary.index)
+        } else {
+            None
+        };
+        let preview_active = writing && self.table_size_popup;
+        let (pre_col, pre_row) = (self.doc_layout.table_scale, self.doc_layout.table_row);
+        let mut preview_top: Option<egui::Pos2> = None;
         let accent = egui::Color32::from_rgb(150, 120, 84);
         let check_col = egui::Color32::from_rgb(60, 160, 90);
         let page_align = self.page_align;
@@ -2824,6 +2837,14 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_clip_rect(rect);
                 let galley = ui.painter().layout_job(job0);
+                // Ancla de la vista previa de tabla: la linea del cursor (donde se insertaria).
+                if preview_active {
+                    if let Some(ci) = cursor_idx {
+                        let cr = galley.pos_from_cursor(egui::text::CCursor::new(ci.min(galley.text().chars().count())));
+                        // Empieza en el margen izquierdo (como una tabla real), bajo la linea del cursor.
+                        preview_top = Some(egui::pos2(rect.min.x, rect.min.y + cr.min.y + cr.height().max(size_pts)));
+                    }
+                }
                 if writing {
                     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
                         let (mut j, _) = markdown_job(buf.as_str(), size_pts, ls, fam.clone(), text_col, reveal_line, page_align);
@@ -2916,6 +2937,42 @@ impl App {
         for (cstart, cend, cells, top, col_scale, row_scale) in tables {
             self.render_table(ctx, cstart, cend, &cells, top, avail_w, size_pts, fam.clone(), text_col, col_scale, row_scale);
         }
+        // Vista previa EN LA HOJA (tamaño real) mientras el popup de tamaño esta abierto.
+        if preview_active {
+            let ptop = preview_top.unwrap_or(rect.min);
+            self.draw_table_preview(ctx, ptop, avail_w, size_pts, pre_col, pre_row);
+        }
+    }
+
+    /// Dibuja una tabla de MUESTRA (no editable, color azulado) en la hoja para ver el tamaño
+    /// REAL antes de insertarla, mientras el popup de tamaño esta abierto.
+    fn draw_table_preview(&self, ctx: &egui::Context, top: egui::Pos2, avail_w: f32, size_pts: f32, col_scale: f32, row_scale: f32) {
+        let (ncols, nrows) = (3usize, 3usize);
+        let cell_h = size_pts * 1.9 * row_scale.clamp(0.5, 3.0);
+        let cw = 16.0 + col_scale.clamp(0.0, 1.0) * 200.0;
+        let total_w = cw * ncols as f32;
+        let view_w = total_w.min(avail_w);
+        let th = nrows as f32 * cell_h;
+        let accent = egui::Color32::from_rgb(120, 150, 210);
+        egui::Area::new(egui::Id::new("table_preview"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(top)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 14.0), egui::vec2(view_w + 4.0, th + 20.0)));
+                let p = ui.painter().clone();
+                let stroke = egui::Stroke::new(1.2, accent);
+                p.text(egui::pos2(top.x, top.y - 3.0), egui::Align2::LEFT_BOTTOM, "Vista previa del tamaño", egui::FontId::proportional(11.0), accent);
+                for r in 0..=nrows {
+                    let y = top.y + r as f32 * cell_h;
+                    p.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + view_w, y)], stroke);
+                }
+                for c in 0..=ncols {
+                    let x = top.x + c as f32 * cw;
+                    if x <= top.x + view_w + 0.5 {
+                        p.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], stroke);
+                    }
+                }
+            });
     }
 
     /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
@@ -2970,7 +3027,7 @@ impl App {
                 for c in 0..ncols {
                     xstart[c + 1] = xstart[c] + col_w[c];
                 }
-                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 26.0, th + 30.0)));
+                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 26.0, th + 38.0)));
                 let painter = ui.painter().clone();
                 let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
                 let ox = top.x - scroll_x;
@@ -3016,7 +3073,7 @@ impl App {
                     }
                 }
                 // Botones "+": solo al pasar el cursor; transparentes (solo el "+").
-                let near = egui::Rect::from_min_size(top, egui::vec2(view_w + 24.0, th + 24.0));
+                let near = egui::Rect::from_min_size(top, egui::vec2(view_w + 24.0, th + 34.0));
                 let hovering = ui.rect_contains_pointer(near);
                 let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + view_w + 3.0, top.y), egui::vec2(18.0, th));
                 let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
@@ -3027,7 +3084,7 @@ impl App {
                 if cr.clicked() {
                     add_col = true;
                 }
-                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 2.0), egui::vec2(view_w, 14.0));
+                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 2.0), egui::vec2(view_w, 13.0));
                 let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
                 if hovering || rr.hovered() {
                     let col = if rr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
@@ -3036,21 +3093,27 @@ impl App {
                 if rr.clicked() {
                     add_row = true;
                 }
-                // Deslizador horizontal cuando la tabla excede el ancho de la hoja.
+                // Deslizador horizontal: SOLO al acercar el cursor; se arrastra siguiendo el
+                // puntero (interact_pos es mas fiable que drag_delta para una barra propia).
                 if has_scroll {
-                    let track_y = top.y + th + 18.0;
-                    let track = egui::Rect::from_min_size(egui::pos2(top.x, track_y), egui::vec2(view_w, 6.0));
-                    painter.rect_filled(track, egui::CornerRadius::same(3), egui::Color32::from_gray(70));
-                    let thumb_w = (view_w * (view_w / total_w)).clamp(28.0, view_w);
-                    let frac = if max_scroll > 0.0 { scroll_x / max_scroll } else { 0.0 };
-                    let thumb_x = top.x + frac * (view_w - thumb_w);
-                    let thumb = egui::Rect::from_min_size(egui::pos2(thumb_x, track_y - 1.0), egui::vec2(thumb_w, 8.0));
+                    let sy = top.y + th + 18.0;
+                    let track = egui::Rect::from_min_size(egui::pos2(top.x, sy), egui::vec2(view_w, 10.0));
                     let sresp = ui.interact(track, egui::Id::new(("tscroll", cstart)), egui::Sense::click_and_drag());
-                    if sresp.dragged() && (view_w - thumb_w) > 0.0 {
-                        scroll_x = (scroll_x + sresp.drag_delta().x / (view_w - thumb_w) * max_scroll).clamp(0.0, max_scroll);
+                    let thumb_w = (view_w * view_w / total_w).clamp(30.0, view_w);
+                    let active = sresp.dragged() || sresp.is_pointer_button_down_on();
+                    if active {
+                        if let Some(px) = ui.input(|i| i.pointer.interact_pos().map(|p| p.x)) {
+                            let denom = (view_w - thumb_w).max(1.0);
+                            scroll_x = (((px - top.x - thumb_w * 0.5) / denom).clamp(0.0, 1.0)) * max_scroll;
+                        }
                     }
-                    let tc = if sresp.hovered() || sresp.dragged() { egui::Color32::from_gray(160) } else { egui::Color32::from_gray(110) };
-                    painter.rect_filled(thumb, egui::CornerRadius::same(4), tc);
+                    if hovering || sresp.hovered() || active {
+                        painter.rect_filled(track, egui::CornerRadius::same(5), egui::Color32::from_gray(80));
+                        let frac = if max_scroll > 0.0 { scroll_x / max_scroll } else { 0.0 };
+                        let thumb_x = top.x + frac * (view_w - thumb_w);
+                        let thumb = egui::Rect::from_min_size(egui::pos2(thumb_x, sy), egui::vec2(thumb_w, 10.0));
+                        painter.rect_filled(thumb, egui::CornerRadius::same(5), if active { egui::Color32::from_gray(190) } else { egui::Color32::from_gray(135) });
+                    }
                 }
             });
         self.table_hscroll = scroll_x;
@@ -4334,6 +4397,7 @@ impl ApplicationHandler for App {
                 // popup hover del boton Tabla y se guarda como defaults para tablas nuevas.
                 let mut table_scale = self.doc_layout.table_scale;
                 let mut table_row = self.doc_layout.table_row;
+                let mut table_popup_open = false;
                 let in_library = self.app_mode == AppMode::Library;
                 let nb_list: Vec<(String, bool, PathBuf)> = if in_library {
                     self.notebooks.iter().map(|n| (n.name.clone(), n.infinite, n.path.clone())).collect()
@@ -4430,50 +4494,18 @@ impl ApplicationHandler for App {
                                                 let was_open = ui.memory(|m| m.data.get_temp::<bool>(pop_id).unwrap_or(false));
                                                 if table_resp.hovered() || was_open {
                                                     // Panel PEGADO al boton (sin hueco) para que el cursor pueda
-                                                    // pasar del boton al panel sin que se cierre.
+                                                    // pasar del boton al panel sin que se cierre. La vista previa
+                                                    // real se dibuja en la HOJA (no aqui), con el tamaño verdadero.
                                                     let area = egui::Area::new(pop_id)
                                                         .order(egui::Order::Foreground)
                                                         .fixed_pos(table_resp.rect.left_bottom())
                                                         .show(ui.ctx(), |ui| {
                                                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                                ui.set_width(200.0);
-                                                                ui.label(egui::RichText::new("Tamaño de la NUEVA tabla").size(12.0).strong());
-                                                                ui.add_space(2.0);
+                                                                ui.set_width(190.0);
                                                                 ui.label(egui::RichText::new("Ancho de columna").size(11.0));
                                                                 ui.add(egui::Slider::new(&mut table_scale, 0.0..=1.0).show_value(false));
                                                                 ui.label(egui::RichText::new("Alto de fila").size(11.0));
                                                                 ui.add(egui::Slider::new(&mut table_row, 0.6..=2.5).show_value(false));
-                                                                // Vista previa EN VIVO: mini-tabla 2x2 que cambia de ancho/alto
-                                                                // con los sliders, para decidir el tamaño antes de insertar.
-                                                                ui.add_space(4.0);
-                                                                ui.label(egui::RichText::new("Vista previa").size(10.0).weak());
-                                                                let cwp = 22.0 + table_scale * 74.0;
-                                                                let chp = 13.0 + (table_row - 0.6) * 16.0;
-                                                                let (pw, ph) = (cwp * 2.0, chp * 2.0);
-                                                                let (presp, p) = ui.allocate_painter(egui::vec2(196.0, ph + 4.0), egui::Sense::hover());
-                                                                let ox = presp.rect.center().x - pw * 0.5;
-                                                                let oy = presp.rect.top() + 2.0;
-                                                                let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(130));
-                                                                for i in 0..=2 {
-                                                                    let y = oy + i as f32 * chp;
-                                                                    p.line_segment([egui::pos2(ox, y), egui::pos2(ox + pw, y)], grid);
-                                                                }
-                                                                for j in 0..=2 {
-                                                                    let x = ox + j as f32 * cwp;
-                                                                    p.line_segment([egui::pos2(x, oy), egui::pos2(x, oy + ph)], grid);
-                                                                }
-                                                                for rr in 0..2 {
-                                                                    for cc in 0..2 {
-                                                                        let cc2 = egui::pos2(ox + cc as f32 * cwp + 4.0, oy + rr as f32 * chp + chp * 0.5);
-                                                                        let (txt, fid) = if rr == 0 {
-                                                                            ("Aa", egui::FontId::new(11.0, egui::FontFamily::Name("head".into())))
-                                                                        } else {
-                                                                            ("12", egui::FontId::proportional(10.0))
-                                                                        };
-                                                                        p.text(cc2, egui::Align2::LEFT_CENTER, txt, fid, egui::Color32::from_gray(90));
-                                                                    }
-                                                                }
-                                                                ui.label(egui::RichText::new("Se aplica solo a la próxima tabla que insertes.").size(10.0).weak());
                                                             });
                                                         });
                                                     // Mantener abierto si el cursor esta sobre el boton, el panel o
@@ -4483,6 +4515,9 @@ impl ApplicationHandler for App {
                                                     let dragging = ui.input(|i| i.pointer.any_down());
                                                     let keep = pp.map_or(false, |p| union.contains(p)) || (was_open && dragging);
                                                     ui.memory_mut(|m| m.data.insert_temp(pop_id, keep));
+                                                    if keep {
+                                                        table_popup_open = true;
+                                                    }
                                                 } else {
                                                     ui.memory_mut(|m| m.data.insert_temp(pop_id, false));
                                                 }
@@ -5493,6 +5528,7 @@ impl ApplicationHandler for App {
                 if (table_row - self.doc_layout.table_row).abs() > 1e-4 {
                     self.doc_layout.table_row = table_row.clamp(0.5, 3.0);
                 }
+                self.table_size_popup = table_popup_open;
                 if let Some(md) = md_action {
                     let c = self.egui_ctx.clone();
                     self.apply_md(&c, md);
