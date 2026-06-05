@@ -3021,8 +3021,8 @@ impl App {
         let btn = self.cube_btn_rect.unwrap_or_else(|| egui::Rect::from_center_size(egui::pos2(screen.center().x, screen.bottom() - 40.0), egui::vec2(30.0, 24.0)));
         let mxn = (screen.width() * 0.06).clamp(20.0, 140.0);
         let area_rect = egui::Rect::from_min_max(egui::pos2(screen.left() + mxn, screen.top() + 74.0), egui::pos2(screen.right() - mxn - 16.0, screen.bottom() - 26.0));
-        let base = 200.0 * self.grid_thumb_scale.clamp(0.5, 2.5);
-        let cols = ((area_rect.width() / base).floor() as usize).clamp(1, 9);
+        let base = 200.0 * self.grid_thumb_scale.clamp(0.3, 2.5);
+        let cols = ((area_rect.width() / base).floor() as usize).clamp(1, 14);
         let gap = 16.0;
         let thumb_w = (area_rect.width() - gap * (cols as f32 - 1.0)) / cols as f32;
         let thumb_h = thumb_w * aspect;
@@ -3117,7 +3117,7 @@ impl App {
         let (bg_clicked, goto, scroll, scale_delta) = area.inner;
         self.cube_scroll = scroll;
         if scale_delta != 0.0 {
-            self.grid_thumb_scale = (self.grid_thumb_scale + scale_delta).clamp(0.5, 2.5);
+            self.grid_thumb_scale = (self.grid_thumb_scale + scale_delta).clamp(0.3, 2.5);
         }
         if goto.is_none() && bg_clicked && interactive {
             self.cube_view = false; // clic en el vacio: salir
@@ -6860,10 +6860,11 @@ fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview
             _ => egui::FontFamily::Proportional,
         };
         let fsize = (layout.font_size * f).max(1.0);
-        let (mut job, decos) = markdown_job(body, fsize, layout.line_spacing.max(1.0), fam, text_col, None, 0);
+        let (mut job, decos) = markdown_job(body, fsize, layout.line_spacing.max(1.0), fam.clone(), text_col, None, 0);
         job.wrap.max_width = content.width();
         let galley = ui.painter().layout_job(job);
         mp.galley(content.min, galley.clone(), text_col);
+        let head = egui::FontFamily::Name("head".into());
         for (cidx, deco) in &decos {
             if let Deco::Table { cells, .. } = deco {
                 let cr = galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
@@ -6872,6 +6873,7 @@ fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview
                 let ncols = cells.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
                 let cellh = fsize * 1.9;
                 let tw = (content.width() * 0.9).max(6.0);
+                let cw = tw / ncols as f32;
                 let th = nrows as f32 * cellh;
                 let g = egui::Stroke::new(0.7, egui::Color32::from_gray(150));
                 for ri in 0..=nrows {
@@ -6879,8 +6881,18 @@ fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview
                     mp.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + tw, y)], g);
                 }
                 for ci in 0..=ncols {
-                    let x = top.x + ci as f32 * (tw / ncols as f32);
+                    let x = top.x + ci as f32 * cw;
                     mp.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], g);
+                }
+                // Texto de cada celda (cabecera en negrita).
+                for (ri, row) in cells.iter().enumerate() {
+                    for (ci, cell) in row.iter().enumerate() {
+                        if cell.trim().is_empty() {
+                            continue;
+                        }
+                        let fid = egui::FontId::new(fsize, if ri == 0 { head.clone() } else { fam.clone() });
+                        mp.text(egui::pos2(top.x + ci as f32 * cw + fsize * 0.4, top.y + ri as f32 * cellh + cellh * 0.5), egui::Align2::LEFT_CENTER, cell, fid, text_col);
+                    }
                 }
             }
         }
