@@ -2806,6 +2806,11 @@ impl App {
         // para que sus celdas y los botones +columna/+fila reciban los clics (la caja de texto
         // del documento cubre toda la hoja).
         let mut tables: Vec<(usize, usize, Vec<Vec<String>>, egui::Pos2)> = Vec::new();
+        // Paginacion: si una TABLA o IMAGEN no cabe en lo que queda de la hoja, se marca su
+        // inicio para moverla (y lo que le siga) a la pagina siguiente. `body_before` permite
+        // aplicar el corte solo en un frame SIN tecleo (asi el indice no se desfasa).
+        let body_before = self.page_body.clone();
+        let mut reflow_cut: Option<usize> = None;
         let body = &mut self.page_body;
         egui::Area::new(egui::Id::new("doc_editor"))
             .order(egui::Order::Middle)
@@ -2875,8 +2880,29 @@ impl App {
                             tables.push((*cstart, *cend, cells.clone(), top));
                         }
                     }
+                    // Paginacion: marcar la PRIMERA tabla/imagen que no cabe y deja algo arriba.
+                    if writing && reflow_cut.is_none() {
+                        let bh = match deco {
+                            Deco::Table { cells, .. } => cells.len() as f32 * size_pts * 1.9,
+                            Deco::Image(_) => size_pts * 9.0,
+                            _ => 0.0,
+                        };
+                        if bh > 1.0 && *cidx > 0 && top.y > rect.top() + size_pts && top.y + bh > rect.bottom() + 1.0 {
+                            let cut_line = body.chars().take(*cidx).filter(|&c| c == '\n').count();
+                            // Solo si el cursor esta ANTES del bloque (no arrastrarlo de pagina).
+                            if reveal_line.map_or(true, |rl| rl < cut_line) {
+                                reflow_cut = Some(*cidx);
+                            }
+                        }
+                    }
                 }
             });
+        // Paginacion: aplicar el corte SOLO si no se tecleo este frame (indice consistente).
+        if let Some(cut) = reflow_cut {
+            if self.page_body == body_before {
+                self.reflow_block_to_next_page(cut);
+            }
+        }
         // Dibujar las tablas (rejilla + celdas editables + botones +columna/+fila) por ENCIMA.
         // El ancho sale del ajuste de tamano de tabla; se deja un margen a la derecha para el
         // boton "+columna".
@@ -3009,6 +3035,41 @@ impl App {
             self.editing_cell = Some((cstart, r, c));
             self.cell_buf = cells.get(r).and_then(|row| row.get(c)).cloned().unwrap_or_default();
         }
+    }
+
+    /// Mueve el bloque que empieza en el caracter `cut` (una tabla/imagen que no cabe) y todo lo
+    /// que le sigue al INICIO de la pagina siguiente (creandola si hace falta). El usuario se
+    /// queda en la pagina actual; el contenido "fluye" hacia adelante y se navega con ▶.
+    fn reflow_block_to_next_page(&mut self, cut: usize) {
+        let bchars: Vec<char> = self.page_body.chars().collect();
+        let cut = cut.min(bchars.len());
+        if cut == 0 {
+            return;
+        }
+        let kept: String = bchars[..cut].iter().collect::<String>().trim_end().to_string();
+        let moved: String = bchars[cut..]
+            .iter()
+            .collect::<String>()
+            .trim_start_matches(|c| c == '\n' || c == ' ')
+            .to_string();
+        if moved.is_empty() {
+            return;
+        }
+        let next = self.current_page + 1;
+        if next >= self.pages.len() {
+            self.pages.push(notebook::PageData::empty());
+        }
+        let existing = self.pages[next].body.clone();
+        self.pages[next].body = if existing.trim().is_empty() {
+            moved
+        } else {
+            format!("{moved}\n\n{existing}")
+        };
+        self.page_body = kept;
+        if let Some(pg) = self.pages.get_mut(self.current_page) {
+            pg.body = self.page_body.clone();
+        }
+        self.doc_snap = self.page_body.clone();
     }
 
     /// Carga (cacheada por ruta) la textura de una imagen del documento.
