@@ -221,8 +221,9 @@ struct App {
     cube_view: bool,
     /// Progreso de la transicion de entrada/salida del cubo (0 = fuera, 1 = dentro).
     cube_anim: f32,
-    /// Giro horizontal del cubo (rueda del raton).
+    /// Giro horizontal y vertical del cubo (rueda / arrastre del raton).
     cube_yaw: f32,
+    cube_pitch: f32,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -454,6 +455,7 @@ impl App {
             cube_view: false,
             cube_anim: 0.0,
             cube_yaw: 0.0,
+            cube_pitch: -0.5,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2991,120 +2993,161 @@ impl App {
             });
     }
 
-    /// Vista CUBO: carrusel 3D con las hojas del cuaderno en las caras de un prisma que flota y
-    /// gira con la rueda. Devuelve la hoja sobre la que se hizo clic (para ir a ella). Sale si se
-    /// hace clic fuera de las tarjetas. La transicion de entrada/salida la controla `cube_anim`.
+    /// Vista CUBO: un cubo 3D cuyas 6 caras estan cubiertas de MINI-HOJAS (varias por cara) para
+    /// ver muchas a la vez. Se gira con la rueda o arrastrando, y al hacer CLIC en una mini-hoja
+    /// se va a ella. Devuelve la hoja elegida. `cube_anim` controla la transicion de acercamiento.
     fn draw_cube_view(&mut self, ctx: &egui::Context) -> Option<usize> {
         let t = self.cube_anim;
         if t <= 0.003 {
             return None;
         }
         let screen = ctx.screen_rect();
-        let center = egui::pos2(screen.center().x, screen.center().y - screen.height() * 0.08);
+        let center = screen.center();
         let n = self.pages.len().max(1);
-        let yaw = self.cube_yaw;
-        let pitch = 0.16_f32;
-        let radius = ((n as f32) * 0.5).clamp(1.5, 7.0);
-        let dist = radius + 4.5;
-        let focal = screen.height() * 0.82 * t;
-        let bob = (self.clock * 1.1).sin() * 0.06; // flotacion como las cartas del home
-        let (cw, ch) = (0.62, 0.86); // semi-ancho/alto de tarjeta (proporcion hoja)
-        let (sp, cp) = (pitch.sin(), pitch.cos());
-        let project = |x: f32, y: f32, z: f32| -> (egui::Pos2, f32) {
-            let y = y + bob;
-            let y2 = y * cp - z * sp;
-            let z2 = y * sp + z * cp;
-            let zc = (dist - z2).max(0.35);
-            let s = focal / zc;
-            (egui::pos2(center.x + x * s, center.y - y2 * s), zc)
-        };
-        // Lineas de contenido por hoja (esquematico), extraidas antes del closure.
-        let body_lines: Vec<usize> = (0..n)
-            .map(|i| self.pages.get(i).map_or(0, |p| p.body.lines().filter(|l| !l.trim().is_empty()).count().min(6)))
-            .collect();
         let current = self.current_page;
-        struct Card {
-            idx: usize,
-            zc: f32,
+        let bob = (self.clock * 1.0).sin() * 0.03; // leve flotacion
+        let yaw = self.cube_yaw;
+        let pitch = self.cube_pitch;
+        let dist = 4.6;
+        let focal = screen.height() * 0.72 * t;
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        // Rotacion (yaw sobre Y, luego pitch sobre X) + flotacion.
+        let rot = |p: (f32, f32, f32)| -> (f32, f32, f32) {
+            let (x, y, z) = p;
+            let x1 = x * cy + z * sy;
+            let z1 = -x * sy + z * cy;
+            let y2 = y * cp - z1 * sp;
+            let z2 = y * sp + z1 * cp;
+            (x1, y2 + bob, z2)
+        };
+        let project = |p: (f32, f32, f32)| -> (egui::Pos2, f32) {
+            let (x, y, z) = p;
+            let zc = (dist - z).max(0.3);
+            let s = focal / zc;
+            (egui::pos2(center.x + x * s, center.y - y * s), zc)
+        };
+        // 6 caras del cubo: (origen, borde_u, borde_v, normal). Las hojas se reparten entre ellas.
+        let faces: [((f32, f32, f32), (f32, f32, f32), (f32, f32, f32), (f32, f32, f32)); 6] = [
+            ((-1., -1., 1.), (2., 0., 0.), (0., 2., 0.), (0., 0., 1.)),   // frente
+            ((1., -1., -1.), (-2., 0., 0.), (0., 2., 0.), (0., 0., -1.)), // atras
+            ((1., -1., 1.), (0., 0., -2.), (0., 2., 0.), (1., 0., 0.)),   // derecha
+            ((-1., -1., -1.), (0., 0., 2.), (0., 2., 0.), (-1., 0., 0.)), // izquierda
+            ((-1., 1., 1.), (2., 0., 0.), (0., 0., -2.), (0., 1., 0.)),   // arriba
+            ((-1., -1., -1.), (2., 0., 0.), (0., 0., 2.), (0., -1., 0.)), // abajo
+        ];
+        let per_face = n.div_ceil(6).max(1);
+        let cols = (per_face as f32).sqrt().ceil() as usize;
+        let rows = per_face.div_ceil(cols).max(1);
+        // Lineas de contenido por hoja (esquematico).
+        let body_lines: Vec<usize> = (0..n)
+            .map(|i| self.pages.get(i).map_or(0, |p| p.body.lines().filter(|l| !l.trim().is_empty()).count().min(4)))
+            .collect();
+        // Mini-hojas visibles, agrupadas por cara (para dibujarlas con su cara, ordenadas).
+        struct FaceDraw {
+            z: f32,
             quad: [egui::Pos2; 4],
-            scenter: f32,
-            facing: bool,
+            minis: Vec<(usize, [egui::Pos2; 4], f32)>, // idx, quad, escala
         }
-        // Separacion angular entre hojas: con pocas hojas no cerramos el circulo (menos escorzo).
-        let step = std::f32::consts::TAU / (n.max(7) as f32);
-        let mut cards: Vec<Card> = Vec::with_capacity(n);
-        for i in 0..n {
-            let a = i as f32 * step + yaw;
-            let (sa, ca) = (a.sin(), a.cos());
-            let (cx3, cz3) = (radius * sa, radius * ca);
-            let (tx, tz) = (ca, -sa); // tangente (direccion del ancho)
-            let corner = |dx: f32, dy: f32| (cx3 + dx * cw * tx, dy * ch, cz3 + dx * cw * tz);
-            let c3 = [corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0)];
-            let mut quad = [egui::Pos2::ZERO; 4];
-            for (k, &(x, y, z)) in c3.iter().enumerate() {
-                quad[k] = project(x, y, z).0;
+        let mut fdraws: Vec<FaceDraw> = Vec::new();
+        for (fi, &(o, eu, ev, nrm)) in faces.iter().enumerate() {
+            let nr = rot(nrm);
+            if nr.2 <= 0.04 {
+                continue; // cara que no mira a la camara
             }
-            let (_pc, zcc) = project(cx3, 0.0, cz3);
-            let scenter = focal / zcc;
-            let facing = ca > 0.16; // mira a la camara (incluye las vecinas escorzadas)
-            cards.push(Card { idx: i, zc: zcc, quad, scenter, facing });
+            let at3 = |u: f32, v: f32| (o.0 + u * eu.0 + v * ev.0, o.1 + u * eu.1 + v * ev.1, o.2 + u * eu.2 + v * ev.2);
+            let fq = [project(rot(at3(0.0, 1.0))).0, project(rot(at3(1.0, 1.0))).0, project(rot(at3(1.0, 0.0))).0, project(rot(at3(0.0, 0.0))).0];
+            let (_c, fz) = project(rot(at3(0.5, 0.5)));
+            let mut minis = Vec::new();
+            for k in 0..per_face {
+                let idx = fi * per_face + k;
+                if idx >= n {
+                    break;
+                }
+                let (col, row) = (k % cols, k / cols);
+                let pad = 0.07;
+                let (u0, u1) = ((col as f32 + pad) / cols as f32, (col as f32 + 1.0 - pad) / cols as f32);
+                let (v0, v1) = ((row as f32 + pad) / rows as f32, (row as f32 + 1.0 - pad) / rows as f32);
+                let q = [project(rot(at3(u0, v1))).0, project(rot(at3(u1, v1))).0, project(rot(at3(u1, v0))).0, project(rot(at3(u0, v0))).0];
+                let (_mc, mz) = project(rot(at3((u0 + u1) * 0.5, (v0 + v1) * 0.5)));
+                minis.push((idx, q, focal / mz));
+            }
+            fdraws.push(FaceDraw { z: fz, quad: fq, minis });
         }
-        cards.sort_by(|a, b| b.zc.partial_cmp(&a.zc).unwrap_or(std::cmp::Ordering::Equal));
+        fdraws.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
+
         let area = egui::Area::new(egui::Id::new("cube_view"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                ui.set_clip_rect(screen); // el overlay cubre TODA la pantalla
-                let resp = ui.interact(screen, egui::Id::new("cube_bg"), egui::Sense::click());
+                ui.set_clip_rect(screen);
+                let resp = ui.interact(screen, egui::Id::new("cube_bg"), egui::Sense::click_and_drag());
                 let painter = ui.painter();
-                painter.rect_filled(screen, egui::CornerRadius::same(0), egui::Color32::from_black_alpha((t * 208.0) as u8));
+                painter.rect_filled(screen, egui::CornerRadius::same(0), egui::Color32::from_black_alpha((t * 210.0) as u8));
                 let pointer = ui.input(|i| i.pointer.interact_pos());
+                // Arrastrar gira el cubo en dos ejes.
+                let drag = resp.drag_delta();
+                let dragging = resp.dragged() && (drag.x.abs() + drag.y.abs() > 0.2);
                 let clicked = resp.clicked();
                 let mut goto = None;
-                for card in &cards {
-                    if !card.facing {
-                        continue;
+                for fd in &fdraws {
+                    // Cara del cubo (cartulina de fondo).
+                    let mut fm = egui::Mesh::default();
+                    for &v in &fd.quad {
+                        fm.colored_vertex(v, egui::Color32::from_rgb(54, 54, 60));
                     }
-                    let hovered = pointer.is_some_and(|pt| point_in_quad(pt, &card.quad));
-                    let depth = ((dist - card.zc) / (2.0 * radius)).clamp(0.0, 1.0);
-                    let shade = (175.0 + depth * 80.0) as u8;
-                    let paper = if hovered { egui::Color32::from_rgb(255, 251, 232) } else { egui::Color32::from_rgb(shade, shade, shade.saturating_add(2)) };
-                    let mut mesh = egui::Mesh::default();
-                    for &v in &card.quad {
-                        mesh.colored_vertex(v, paper);
-                    }
-                    mesh.add_triangle(0, 1, 2);
-                    mesh.add_triangle(0, 2, 3);
-                    painter.add(egui::Shape::mesh(mesh));
-                    let bcol = if hovered { egui::Color32::from_rgb(110, 155, 225) } else { egui::Color32::from_gray(95) };
-                    painter.add(egui::Shape::closed_line(card.quad.to_vec(), egui::Stroke::new(if hovered { 2.4 } else { 1.2 }, bcol)));
-                    // Interpolacion bilineal en el quad para colocar el contenido en perspectiva.
-                    let at = |u: f32, v: f32| {
-                        let topp = card.quad[0] + (card.quad[1] - card.quad[0]) * u;
-                        let botp = card.quad[3] + (card.quad[2] - card.quad[3]) * u;
-                        topp + (botp - topp) * v
-                    };
-                    let fsize = (card.scenter * 0.20).clamp(9.0, 64.0);
-                    painter.text(at(0.5, 0.2), egui::Align2::CENTER_CENTER, format!("{}", card.idx + 1), egui::FontId::new(fsize, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(70));
-                    let lw = (card.scenter * 0.012).clamp(1.0, 4.0);
-                    for li in 0..body_lines[card.idx] {
-                        let vv = 0.42 + li as f32 * 0.085;
-                        let len = if li % 3 == 2 { 0.48 } else { 0.70 };
-                        painter.line_segment([at(0.16, vv), at(0.16 + len, vv)], egui::Stroke::new(lw, egui::Color32::from_gray(155)));
-                    }
-                    if card.idx == current {
-                        painter.add(egui::Shape::closed_line(card.quad.to_vec(), egui::Stroke::new(2.6, egui::Color32::from_rgb(150, 120, 84))));
-                    }
-                    if clicked && hovered {
-                        goto = Some(card.idx);
+                    fm.add_triangle(0, 1, 2);
+                    fm.add_triangle(0, 2, 3);
+                    painter.add(egui::Shape::mesh(fm));
+                    painter.add(egui::Shape::closed_line(fd.quad.to_vec(), egui::Stroke::new(1.5, egui::Color32::from_gray(30))));
+                    // Mini-hojas de la cara.
+                    for &(idx, q, sc) in &fd.minis {
+                        let hovered = !dragging && pointer.is_some_and(|pt| point_in_quad(pt, &q));
+                        let paper = if hovered { egui::Color32::from_rgb(255, 250, 228) } else { egui::Color32::from_rgb(232, 232, 230) };
+                        let mut m = egui::Mesh::default();
+                        for &v in &q {
+                            m.colored_vertex(v, paper);
+                        }
+                        m.add_triangle(0, 1, 2);
+                        m.add_triangle(0, 2, 3);
+                        painter.add(egui::Shape::mesh(m));
+                        let at = |u: f32, v: f32| {
+                            let tp = q[0] + (q[1] - q[0]) * u;
+                            let bp = q[3] + (q[2] - q[3]) * u;
+                            tp + (bp - tp) * v
+                        };
+                        // Numero (esquina) + lineas de contenido (esquematico).
+                        let fs = (sc * 0.16).clamp(8.0, 40.0);
+                        painter.text(at(0.5, 0.16), egui::Align2::CENTER_CENTER, format!("{}", idx + 1), egui::FontId::new(fs, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(80));
+                        let lw = (sc * 0.01).clamp(0.8, 3.0);
+                        for li in 0..body_lines[idx] {
+                            let vv = 0.42 + li as f32 * 0.13;
+                            let len = if li % 2 == 1 { 0.42 } else { 0.66 };
+                            painter.line_segment([at(0.17, vv), at(0.17 + len, vv)], egui::Stroke::new(lw, egui::Color32::from_gray(165)));
+                        }
+                        let bcol = if hovered {
+                            egui::Color32::from_rgb(95, 150, 230)
+                        } else if idx == current {
+                            egui::Color32::from_rgb(150, 120, 84)
+                        } else {
+                            egui::Color32::from_gray(120)
+                        };
+                        painter.add(egui::Shape::closed_line(q.to_vec(), egui::Stroke::new(if hovered || idx == current { 2.2 } else { 1.0 }, bcol)));
+                        if clicked && hovered {
+                            goto = Some(idx);
+                        }
                     }
                 }
-                painter.text(egui::pos2(center.x, screen.bottom() - 26.0), egui::Align2::CENTER_CENTER, "Rueda para girar  ·  clic en una hoja para ir  ·  Esc para salir", egui::FontId::proportional(13.0), egui::Color32::from_white_alpha((t * 200.0) as u8));
-                (clicked, goto)
+                painter.text(egui::pos2(center.x, screen.bottom() - 26.0), egui::Align2::CENTER_CENTER, "Arrastra o usa la rueda para girar  ·  clic en una hoja para abrirla  ·  Esc para salir", egui::FontId::proportional(13.0), egui::Color32::from_white_alpha((t * 200.0) as u8));
+                (clicked, goto, drag, dragging)
             });
-        let (bg_clicked, goto) = area.inner;
-        if goto.is_none() && bg_clicked {
-            self.cube_view = false; // clic fuera de las tarjetas: salir sin cambiar de hoja
+        let (bg_clicked, goto, drag, dragging) = area.inner;
+        if dragging {
+            self.cube_yaw += drag.x * 0.008;
+            self.cube_pitch = (self.cube_pitch - drag.y * 0.008).clamp(-1.2, 1.2);
+        }
+        if goto.is_none() && bg_clicked && !dragging {
+            self.cube_view = false; // clic en el vacio: salir
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cube_view = false;
@@ -5753,9 +5796,9 @@ impl ApplicationHandler for App {
                 if toggle_cube {
                     self.cube_view = !self.cube_view;
                     if self.cube_view {
-                        // Abrir el cubo con la hoja ACTUAL al frente.
-                        let step = std::f32::consts::TAU / (self.pages.len().max(7) as f32);
-                        self.cube_yaw = -(self.current_page as f32) * step;
+                        // Abrir el cubo en una pose que muestre 3 caras (esquina).
+                        self.cube_yaw = 0.6;
+                        self.cube_pitch = -0.5;
                     }
                 }
                 // Seleccion de hoja en el cubo: ir a esa hoja y salir de la vista.
