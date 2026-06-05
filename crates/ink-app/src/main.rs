@@ -205,6 +205,10 @@ struct App {
     /// Celda de tabla en edicion: (char inicio del bloque, fila, columna) + su texto.
     editing_cell: Option<(usize, usize, usize)>,
     cell_buf: String,
+    /// Pedir foco a la celda en edicion SOLO el primer frame (si no, queda atrapada).
+    cell_focus: bool,
+    /// Desplazamiento horizontal de la tabla ancha (cuando excede el ancho de la hoja).
+    table_hscroll: f32,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -428,6 +432,8 @@ impl App {
             doc_img_cache: std::collections::HashMap::new(),
             editing_cell: None,
             cell_buf: String::new(),
+            cell_focus: false,
+            table_hscroll: 0.0,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2897,76 +2903,121 @@ impl App {
                     }
                 }
             });
-        // Paginacion: aplicar el corte SOLO si no se tecleo este frame (indice consistente).
+        // Paginacion: aplicar el corte SOLO si no se tecleo este frame (indice consistente) y no
+        // se esta editando una celda (no arrancar la tabla mientras escribes en ella).
         if let Some(cut) = reflow_cut {
-            if self.page_body == body_before {
+            if self.page_body == body_before && self.editing_cell.is_none() {
                 self.reflow_block_to_next_page(cut);
             }
         }
-        // Dibujar las tablas (rejilla + celdas editables + botones +columna/+fila) por ENCIMA.
-        // El ancho sale del ajuste de tamano de tabla; se deja un margen a la derecha para el
-        // boton "+columna".
-        let table_w = ((rect.width() - 24.0) * self.doc_layout.table_scale.clamp(0.3, 1.0)).max(40.0);
+        // Dibujar las tablas por ENCIMA. avail_w = ancho de contenido de la hoja; cada columna se
+        // auto-ajusta al texto y, si la tabla excede el ancho, aparece un deslizador horizontal.
+        let avail_w = (rect.width() - 2.0).max(40.0);
         for (cstart, cend, cells, top) in tables {
-            self.render_table(ctx, cstart, cend, &cells, top, table_w, size_pts, fam.clone(), text_col);
+            self.render_table(ctx, cstart, cend, &cells, top, avail_w, size_pts, fam.clone(), text_col);
         }
     }
 
-    /// Dibuja UNA tabla en una capa por encima del editor: rejilla simple, celdas editables al
-    /// hacer clic, y botones "+" para añadir columna (derecha) o fila (abajo). Edita `page_body`.
-    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, table_w: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32) {
+    /// Dibuja UNA tabla en una capa por encima del editor. Columnas con ANCHO AUTOMATICO (crecen
+    /// con el texto); si la tabla supera el ancho de la hoja aparece un DESLIZADOR horizontal.
+    /// Celdas editables (clic), Enter pasa a la fila siguiente (creandola), y botones "+".
+    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, avail_w: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32) {
         if cells.is_empty() {
             return;
         }
         let nrows = cells.len();
         let ncols = cells.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
         let cell_h = size_pts * 1.9;
-        let cw = table_w / ncols as f32;
         let th = nrows as f32 * cell_h;
+        let pad = 8.0;
+        let head_fam = egui::FontFamily::Name("head".into());
+        // Ancho minimo de columna (lo regula el popup de tamaño); crece con el texto.
+        let col_min = 46.0 + self.doc_layout.table_scale.clamp(0.3, 1.0) * 150.0;
         let editing = self.editing_cell.filter(|&(cs, _, _)| cs == cstart);
+        let want_focus = self.cell_focus;
         let mut buf = self.cell_buf.clone();
         let mut start_edit: Option<(usize, usize)> = None;
-        let (mut add_col, mut add_row, mut lost) = (false, false, false);
+        let (mut add_col, mut add_row, mut lost, mut enter_row) = (false, false, false, false);
+        let mut scroll_x = self.table_hscroll.max(0.0);
         egui::Area::new(egui::Id::new(("doc_table", cstart)))
             .order(egui::Order::Foreground)
             .fixed_pos(top)
             .show(ctx, |ui| {
-                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(4.0, 4.0), egui::vec2(table_w + 40.0, th + 40.0)));
+                // Ancho de cada columna = max(min, texto mas ancho + relleno). Se mide con el
+                // painter (layout_no_wrap es &self; ctx.fonts no sirve aqui por ser &mut).
+                let col_w: Vec<f32> = (0..ncols)
+                    .map(|c| {
+                        let mut w = col_min;
+                        for (r, row) in cells.iter().enumerate() {
+                            if let Some(t) = row.get(c) {
+                                if !t.is_empty() {
+                                    let fid = if r == 0 { egui::FontId::new(size_pts, head_fam.clone()) } else { egui::FontId::new(size_pts, fam.clone()) };
+                                    let tw = ui.painter().layout_no_wrap(t.clone(), fid, text_col).size().x;
+                                    w = w.max(tw + pad * 2.0);
+                                }
+                            }
+                        }
+                        w
+                    })
+                    .collect();
+                let total_w = col_w.iter().sum::<f32>();
+                let has_scroll = total_w > avail_w + 1.0;
+                let max_scroll = (total_w - avail_w).max(0.0);
+                scroll_x = scroll_x.clamp(0.0, max_scroll);
+                let view_w = if has_scroll { avail_w } else { total_w };
+                let mut xstart = vec![0.0f32; ncols + 1];
+                for c in 0..ncols {
+                    xstart[c + 1] = xstart[c] + col_w[c];
+                }
+                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(2.0, 2.0), egui::vec2(view_w + 26.0, th + 30.0)));
                 let painter = ui.painter().clone();
                 let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
+                let ox = top.x - scroll_x;
                 for r in 0..=nrows {
                     let y = top.y + r as f32 * cell_h;
-                    painter.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + table_w, y)], grid);
+                    painter.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + view_w, y)], grid);
                 }
                 for c in 0..=ncols {
-                    let x = top.x + c as f32 * cw;
-                    painter.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], grid);
+                    let x = ox + xstart[c];
+                    if x >= top.x - 0.5 && x <= top.x + view_w + 0.5 {
+                        painter.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], grid);
+                    }
                 }
                 for r in 0..nrows {
                     for c in 0..ncols {
-                        let crect = egui::Rect::from_min_size(egui::pos2(top.x + c as f32 * cw, top.y + r as f32 * cell_h), egui::vec2(cw, cell_h));
+                        let cx = ox + xstart[c];
+                        let crect = egui::Rect::from_min_size(egui::pos2(cx, top.y + r as f32 * cell_h), egui::vec2(col_w[c], cell_h));
+                        if crect.right() < top.x - 0.5 || crect.left() > top.x + view_w + 0.5 {
+                            continue; // fuera del area visible (scroll)
+                        }
                         if editing == Some((cstart, r, c)) {
                             let inner = crect.shrink(3.0);
-                            let resp = ui.put(inner, egui::TextEdit::singleline(&mut buf).frame(egui::Frame::NONE).desired_width(inner.width()).font(egui::FontId::new(size_pts, fam.clone())).text_color(text_col));
-                            resp.request_focus();
+                            let resp = ui.put(inner, egui::TextEdit::singleline(&mut buf).frame(egui::Frame::NONE).desired_width(inner.width().max(20.0)).font(egui::FontId::new(size_pts, fam.clone())).text_color(text_col));
+                            if want_focus {
+                                resp.request_focus(); // SOLO el primer frame (si no, queda atrapada)
+                            }
                             if resp.lost_focus() {
-                                lost = true;
+                                // Enter -> fila siguiente; Escape o clic fuera -> salir.
+                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    enter_row = true;
+                                } else {
+                                    lost = true;
+                                }
                             }
                         } else {
                             let txt = cells.get(r).and_then(|row| row.get(c)).map(|s| s.as_str()).unwrap_or("");
-                            let fid = if r == 0 { egui::FontId::new(size_pts, egui::FontFamily::Name("head".into())) } else { egui::FontId::new(size_pts, fam.clone()) };
-                            painter.text(egui::pos2(crect.left() + 6.0, crect.center().y), egui::Align2::LEFT_CENTER, txt, fid, text_col);
+                            let fid = if r == 0 { egui::FontId::new(size_pts, head_fam.clone()) } else { egui::FontId::new(size_pts, fam.clone()) };
+                            painter.text(egui::pos2(crect.left() + pad, crect.center().y), egui::Align2::LEFT_CENTER, txt, fid, text_col);
                             if ui.interact(crect, egui::Id::new(("tcell", cstart, r, c)), egui::Sense::click()).clicked() {
                                 start_edit = Some((r, c));
                             }
                         }
                     }
                 }
-                // Botones "+": columna (derecha) y fila (abajo). SOLO se ven al pasar el cursor
-                // por la tabla; sin fondo (la pestaña es transparente, solo se ve el "+").
-                let near = egui::Rect::from_min_size(top, egui::vec2(table_w + 24.0, th + 24.0));
+                // Botones "+": solo al pasar el cursor; transparentes (solo el "+").
+                let near = egui::Rect::from_min_size(top, egui::vec2(view_w + 24.0, th + 24.0));
                 let hovering = ui.rect_contains_pointer(near);
-                let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + table_w + 3.0, top.y), egui::vec2(18.0, th));
+                let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + view_w + 3.0, top.y), egui::vec2(18.0, th));
                 let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
                 if hovering || cr.hovered() {
                     let col = if cr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
@@ -2975,16 +3026,37 @@ impl App {
                 if cr.clicked() {
                     add_col = true;
                 }
-                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 3.0), egui::vec2(table_w, 18.0));
+                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 2.0), egui::vec2(view_w, 14.0));
                 let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
                 if hovering || rr.hovered() {
                     let col = if rr.hovered() { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(120) };
-                    painter.text(rbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
+                    painter.text(egui::pos2(top.x + view_w * 0.5, rbtn.center().y), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), col);
                 }
                 if rr.clicked() {
                     add_row = true;
                 }
+                // Deslizador horizontal cuando la tabla excede el ancho de la hoja.
+                if has_scroll {
+                    let track_y = top.y + th + 18.0;
+                    let track = egui::Rect::from_min_size(egui::pos2(top.x, track_y), egui::vec2(view_w, 6.0));
+                    painter.rect_filled(track, egui::CornerRadius::same(3), egui::Color32::from_gray(70));
+                    let thumb_w = (view_w * (view_w / total_w)).clamp(28.0, view_w);
+                    let frac = if max_scroll > 0.0 { scroll_x / max_scroll } else { 0.0 };
+                    let thumb_x = top.x + frac * (view_w - thumb_w);
+                    let thumb = egui::Rect::from_min_size(egui::pos2(thumb_x, track_y - 1.0), egui::vec2(thumb_w, 8.0));
+                    let sresp = ui.interact(track, egui::Id::new(("tscroll", cstart)), egui::Sense::click_and_drag());
+                    if sresp.dragged() && (view_w - thumb_w) > 0.0 {
+                        scroll_x = (scroll_x + sresp.drag_delta().x / (view_w - thumb_w) * max_scroll).clamp(0.0, max_scroll);
+                    }
+                    let tc = if sresp.hovered() || sresp.dragged() { egui::Color32::from_gray(160) } else { egui::Color32::from_gray(110) };
+                    painter.rect_filled(thumb, egui::CornerRadius::same(4), tc);
+                }
             });
+        self.table_hscroll = scroll_x;
+        // Consumir la peticion de foco (ya se pidio este frame).
+        if want_focus {
+            self.cell_focus = false;
+        }
         // Aplicar cambios al Markdown de la tabla.
         let replace = |me: &mut Self, nc: &[Vec<String>]| {
             let new_text = serialize_table(nc);
@@ -3009,6 +3081,27 @@ impl App {
             nc.push(vec![String::new(); ncols]);
             replace(self, &nc);
             self.editing_cell = None;
+        } else if enter_row {
+            // Enter en una celda: guardar y bajar a la misma columna de la fila siguiente,
+            // creando una fila nueva si estabamos en la ultima.
+            if let Some((_, r, c)) = editing {
+                let mut nc = cells.to_vec();
+                while nc.len() <= r {
+                    nc.push(vec![String::new(); ncols]);
+                }
+                while nc[r].len() <= c {
+                    nc[r].push(String::new());
+                }
+                nc[r][c] = buf.clone();
+                if r + 1 >= nc.len() {
+                    nc.push(vec![String::new(); ncols]);
+                }
+                replace(self, &nc);
+                let nr = r + 1;
+                self.cell_buf = nc.get(nr).and_then(|row| row.get(c)).cloned().unwrap_or_default();
+                self.editing_cell = Some((cstart, nr, c));
+                self.cell_focus = true;
+            }
         } else if let Some((_, r, c)) = editing {
             self.cell_buf = buf.clone();
             let mut nc = cells.to_vec();
@@ -3027,6 +3120,7 @@ impl App {
                 if let Some((sr, sc)) = start_edit {
                     self.editing_cell = Some((cstart, sr, sc));
                     self.cell_buf = cells.get(sr).and_then(|row| row.get(sc)).cloned().unwrap_or_default();
+                    self.cell_focus = true;
                 } else {
                     self.editing_cell = None;
                 }
@@ -3034,6 +3128,7 @@ impl App {
         } else if let Some((r, c)) = start_edit {
             self.editing_cell = Some((cstart, r, c));
             self.cell_buf = cells.get(r).and_then(|row| row.get(c)).cloned().unwrap_or_default();
+            self.cell_focus = true;
         }
     }
 
@@ -4328,27 +4423,35 @@ impl ApplicationHandler for App {
                                             {
                                                 let pop_id = egui::Id::new("tbl_size_pop");
                                                 let was_open = ui.memory(|m| m.data.get_temp::<bool>(pop_id).unwrap_or(false));
-                                                let mut keep = table_resp.hovered();
                                                 if table_resp.hovered() || was_open {
+                                                    // Panel PEGADO al boton (sin hueco) para que el cursor pueda
+                                                    // pasar del boton al panel sin que se cierre.
                                                     let area = egui::Area::new(pop_id)
                                                         .order(egui::Order::Foreground)
-                                                        .fixed_pos(table_resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                                                        .fixed_pos(table_resp.rect.left_bottom())
                                                         .show(ui.ctx(), |ui| {
                                                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                                ui.set_width(170.0);
-                                                                ui.label(egui::RichText::new("Tamaño de la tabla").size(12.0).strong());
+                                                                ui.set_width(180.0);
+                                                                ui.label(egui::RichText::new("Ancho de columna").size(12.0).strong());
                                                                 ui.add(egui::Slider::new(&mut table_scale, 0.3..=1.0).show_value(false));
                                                                 ui.horizontal(|ui| {
-                                                                    if ui.small_button("Pequeña").clicked() { table_scale = 0.45; }
-                                                                    if ui.small_button("Mediana").clicked() { table_scale = 0.7; }
-                                                                    if ui.small_button("Ancha").clicked() { table_scale = 1.0; }
+                                                                    if ui.small_button("Estrecha").clicked() { table_scale = 0.35; }
+                                                                    if ui.small_button("Media").clicked() { table_scale = 0.6; }
+                                                                    if ui.small_button("Amplia").clicked() { table_scale = 1.0; }
                                                                 });
-                                                                ui.label(egui::RichText::new(format!("{}%", (table_scale * 100.0).round() as i32)).size(11.0).weak());
+                                                                ui.label(egui::RichText::new("Las celdas se ensanchan solas con el texto.").size(10.0).weak());
                                                             });
                                                         });
-                                                    if area.response.hovered() { keep = true; }
+                                                    // Mantener abierto si el cursor esta sobre el boton, el panel o
+                                                    // el espacio entre ambos; o si se esta arrastrando el slider.
+                                                    let union = table_resp.rect.union(area.response.rect).expand(6.0);
+                                                    let pp = ui.input(|i| i.pointer.hover_pos());
+                                                    let dragging = ui.input(|i| i.pointer.any_down());
+                                                    let keep = pp.map_or(false, |p| union.contains(p)) || (was_open && dragging);
+                                                    ui.memory_mut(|m| m.data.insert_temp(pop_id, keep));
+                                                } else {
+                                                    ui.memory_mut(|m| m.data.insert_temp(pop_id, false));
                                                 }
-                                                ui.memory_mut(|m| m.data.insert_temp(pop_id, keep));
                                             }
                                             if md_button(ui, Md::Task, "Tarea").clicked() { md_action = Some(Md::Task); }
                                             if md_button(ui, Md::Quote, "Cita").clicked() { md_action = Some(Md::Quote); }
