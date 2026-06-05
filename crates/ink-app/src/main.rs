@@ -224,10 +224,10 @@ struct App {
     /// Giro horizontal y vertical del cubo (rueda / arrastre del raton).
     cube_yaw: f32,
     cube_pitch: f32,
-    /// Vista previa REAL de cada hoja para el cubo (trazos de tinta + longitudes de las lineas de
-    /// texto), precalculada al abrir la vista para no rehacerla cada fotograma.
+    /// Vista previa REAL de cada hoja para el cubo (trazos de tinta + lineas de texto del teclado),
+    /// precalculada al abrir la vista para no rehacerla cada fotograma.
     cube_previews: Vec<PreviewPage>,
-    cube_text: Vec<Vec<f32>>,
+    cube_text: Vec<Vec<String>>,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -3137,20 +3137,27 @@ impl App {
                                 painter.add(egui::Shape::line(line, egui::Stroke::new(sw, c)));
                             }
                         }
-                        // Lineas de TEXTO (esquema con la longitud real de cada renglon).
-                        let lw = (sc * 0.01).clamp(0.8, 3.0);
+                        // TEXTO real del teclado: cada renglon como texto pequeño, recortado a la
+                        // mini-hoja (clip a su caja). El tamaño se ajusta al ancho de la celda.
                         if let Some(tl) = texts.get(idx) {
-                            for (li, &len) in tl.iter().enumerate() {
-                                let vv = 0.26 + li as f32 * 0.10;
-                                if vv > 0.93 {
-                                    break;
+                            if !tl.is_empty() {
+                                let cellw = (at(1.0, 0.5) - at(0.0, 0.5)).length().max(8.0);
+                                let ts = (cellw * 0.052).clamp(5.0, 18.0);
+                                let bb = egui::Rect::from_points(&q);
+                                let tp = painter.with_clip_rect(bb);
+                                let lh = 0.118;
+                                for (li, line) in tl.iter().enumerate() {
+                                    let vv = 0.14 + li as f32 * lh;
+                                    if vv > 0.94 {
+                                        break;
+                                    }
+                                    tp.text(at(0.1, vv), egui::Align2::LEFT_CENTER, line, egui::FontId::proportional(ts), egui::Color32::from_gray(55));
                                 }
-                                painter.line_segment([at(0.14, vv), at(0.14 + len * 0.72, vv)], egui::Stroke::new(lw, egui::Color32::from_gray(150)));
                             }
                         }
-                        // Numero de hoja, pequeño, en la esquina (no tapa el contenido).
-                        let fs = (sc * 0.11).clamp(7.0, 24.0);
-                        painter.text(at(0.12, 0.1), egui::Align2::CENTER_CENTER, format!("{}", idx + 1), egui::FontId::new(fs, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(110));
+                        // Numero de hoja, pequeño y tenue, en la esquina (no tapa el contenido).
+                        let fs = (sc * 0.085).clamp(6.0, 18.0);
+                        painter.text(at(0.94, 0.05), egui::Align2::RIGHT_TOP, format!("{}", idx + 1), egui::FontId::new(fs, egui::FontFamily::Name("head".into())), egui::Color32::from_gray(150));
                         let bcol = if hovered {
                             egui::Color32::from_rgb(95, 150, 230)
                         } else if idx == current {
@@ -3187,7 +3194,7 @@ impl App {
         self.commit_text();
         self.stash_current_page(); // la hoja actual debe tener su tinta/texto al dia
         let mut previews: Vec<PreviewPage> = Vec::new();
-        let mut texts: Vec<Vec<f32>> = Vec::new();
+        let mut texts: Vec<Vec<String>> = Vec::new();
         for pg in &self.pages {
             let mut strokes: Vec<PreviewStroke> = Vec::new();
             let mut mn = Vec2::splat(f32::MAX);
@@ -3212,13 +3219,22 @@ impl App {
             }
             let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
             previews.push((strokes, bounds));
-            let tl: Vec<f32> = pg
+            // Texto del teclado: las primeras lineas (sin marcas de tabla/directivas), recortadas
+            // para no desbordar la mini-hoja.
+            let tl: Vec<String> = pg
                 .body
                 .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty() && !l.starts_with('|') && !l.starts_with("<!--"))
-                .take(7)
-                .map(|l| (l.chars().count() as f32 / 30.0).clamp(0.18, 0.95))
+                .map(|l| l.trim_end())
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('|') && !l.trim_start().starts_with("<!--"))
+                .take(12)
+                .map(|l| {
+                    let s = strip_md(l);
+                    if s.chars().count() > 40 {
+                        s.chars().take(40).collect::<String>() + "…"
+                    } else {
+                        s
+                    }
+                })
                 .collect();
             texts.push(tl);
         }
