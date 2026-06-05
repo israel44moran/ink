@@ -18,6 +18,11 @@ Para escribir textos con teclado en la hoja. Todas **OFL 1.1**:
 - **EB Garamond** (EBGaramond-Regular.ttf) — serif clasica/literaria. © Georg Duffner / Octavio Pardo.
 - **Atkinson Hyperlegible** (AtkinsonHyperlegible-Regular.ttf) — sans de alta legibilidad. © Braille Institute.
 - **Source Sans 3** (SourceSans3-Regular.ttf) — sans humanista limpia. © Adobe.
+- **Montserrat** (Montserrat-Regular.ttf) — sans geometrica urbana. © Julieta Ulanovsky.
+- **Roboto** (Roboto-Regular.ttf) — sans neogrotesca de Google. © Christian Robertson.
+- **Inter** (Inter-Regular.ttf) — sans para pantallas. © Rasmus Andersson.
+- **Josefin Sans** (JosefinSans-Regular.ttf) — sans geometrica elegante. © Santiago Orozco.
+- **Nunito** (Nunito-Regular.ttf) — sans de terminales redondeados. © Vernon Adams / Cyreal.
 
 Subconjunto latino (TTF estatico) via Fontsource. Se incrustan con `include_bytes!` (ver
 `setup_fonts` en `main.rs`); el sistema (Segoe UI / DejaVu) queda como respaldo.

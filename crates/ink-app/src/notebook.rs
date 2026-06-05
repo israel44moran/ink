@@ -73,7 +73,8 @@ pub struct DocLayout {
     pub para_spacing: f32,
     /// Tamano de fuente base, en puntos.
     pub font_size: f32,
-    /// Familia: 0 = Sans (Hanken), 1 = Serif (Spectral), 2 = Mono (JetBrains).
+    /// Familia: 0=Sans (Hanken), 1=Serif (Spectral), 2=Mono (JetBrains), 3=Lora, 4=Merriweather,
+    /// 5=Garamond, 6=Atkinson, 7=Source Sans, 8=Montserrat, 9=Roboto, 10=Inter, 11=Josefin, 12=Nunito.
     pub font: u32,
     /// Ancho de columna BASE para las tablas NUEVAS (0.0..1.0). Cada tabla guarda el suyo al
     /// crearse (en su directiva), asi que cambiar esto NO afecta a las tablas ya puestas.

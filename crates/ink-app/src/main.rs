@@ -59,6 +59,10 @@ enum Gesture {
     Smudge { last: Vec2 },
 }
 
+/// Tope del historial unificado de tinta (deshacer/rehacer). Limita la memoria: al pasarse,
+/// se descartan las operaciones mas antiguas (su contenido permanece, solo deja de ser deshacible).
+const UNDO_LIMIT: usize = 200;
+
 /// Operacion de dibujo en el historial unificado de deshacer.
 enum DrawOp {
     /// Un trazo procedural (vive en el Document, se deshace con doc.undo).
@@ -764,7 +768,7 @@ impl App {
                     }
                     g.set_active(&[]);
                 }
-                self.undo_stack.push(DrawOp::Procedural);
+                self.push_undo(DrawOp::Procedural);
                 self.redo_stack.clear();
                 self.tick += 1.0;
             }
@@ -1815,29 +1819,7 @@ impl App {
         // Precalcular TODAS las paginas (para poder pasarlas en la vista previa).
         let mut pages: Vec<PreviewPage> = Vec::new();
         for pg in &nb.pages {
-            let mut strokes: Vec<PreviewStroke> = Vec::new();
-            let mut mn = Vec2::splat(f32::MAX);
-            let mut mx = Vec2::splat(f32::MIN);
-            for layer in &pg.doc.layers {
-                if !layer.visible {
-                    continue;
-                }
-                for st in &layer.strokes {
-                    if st.samples.is_empty() {
-                        continue;
-                    }
-                    let pts: Vec<Vec2> = st.samples.iter().map(|s| s.pos).collect();
-                    for p in &pts {
-                        mn = mn.min(*p);
-                        mx = mx.max(*p);
-                    }
-                    let mut c = st.brush.color;
-                    c[3] *= layer.opacity * st.brush.opacity;
-                    strokes.push((pts, c, st.brush.width));
-                }
-            }
-            let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
-            pages.push((strokes, bounds));
+            pages.push(preview_page_from(pg));
         }
         if pages.is_empty() {
             pages.push((Vec::new(), None));
@@ -1964,6 +1946,16 @@ impl App {
         }
     }
 
+    /// Apila una operacion en el historial de deshacer, recortando las mas antiguas si se
+    /// supera `UNDO_LIMIT` (asi el historial no crece sin tope y no consume memoria de mas).
+    fn push_undo(&mut self, op: DrawOp) {
+        self.undo_stack.push(op);
+        if self.undo_stack.len() > UNDO_LIMIT {
+            let drop = self.undo_stack.len() - UNDO_LIMIT;
+            self.undo_stack.drain(0..drop);
+        }
+    }
+
     /// Deshace la ULTIMA operacion de dibujo (procedural, de pincel PS o de goma), en orden.
     fn undo_op(&mut self) {
         match self.undo_stack.pop() {
@@ -2001,7 +1993,7 @@ impl App {
             Some(RedoOp::Procedural) => {
                 self.doc.redo();
                 self.sync_committed();
-                self.undo_stack.push(DrawOp::Procedural);
+                self.push_undo(DrawOp::Procedural);
             }
             Some(RedoOp::Ps { tip, verts }) => {
                 let count = verts.len();
@@ -2011,14 +2003,14 @@ impl App {
                 if let Some(g) = self.gpu.as_mut() {
                     g.set_committed_stamps(tip, &vc);
                 }
-                self.undo_stack.push(DrawOp::Ps { tip, count });
+                self.push_undo(DrawOp::Ps { tip, count });
             }
             Some(RedoOp::EraseMask) => {
                 if let Some(discs) = self.erase_redo.pop() {
                     self.erase_strokes.push(discs);
                     self.rebuild_mask();
                 }
-                self.undo_stack.push(DrawOp::EraseMask);
+                self.push_undo(DrawOp::EraseMask);
             }
             None => {}
         }
@@ -2389,7 +2381,7 @@ impl App {
         if let Some(es) = stroke {
             self.erase_strokes.push(es);
             self.erase_redo.clear();
-            self.undo_stack.push(DrawOp::EraseMask);
+            self.push_undo(DrawOp::EraseMask);
             self.redo_stack.clear();
             self.tick += 1.0;
         }
@@ -2518,7 +2510,7 @@ impl App {
             if let Some(g) = self.gpu.as_mut() {
                 g.set_committed_stamps(tip, &verts);
             }
-            self.undo_stack.push(DrawOp::Ps { tip, count });
+            self.push_undo(DrawOp::Ps { tip, count });
             self.redo_stack.clear();
             self.tick += 1.0;
         }
@@ -2793,6 +2785,11 @@ impl App {
             5 => egui::FontFamily::Name("doc_garamond".into()),
             6 => egui::FontFamily::Name("doc_atkinson".into()),
             7 => egui::FontFamily::Name("doc_sourcesans".into()),
+            8 => egui::FontFamily::Name("doc_montserrat".into()),
+            9 => egui::FontFamily::Name("doc_roboto".into()),
+            10 => egui::FontFamily::Name("doc_inter".into()),
+            11 => egui::FontFamily::Name("doc_josefin".into()),
+            12 => egui::FontFamily::Name("doc_nunito".into()),
             _ => egui::FontFamily::Proportional,               // 0 = Hanken (Sans)
         };
         let ls = self.doc_layout.line_spacing.max(0.5);
@@ -3137,29 +3134,7 @@ impl App {
         let mut previews: Vec<PreviewPage> = Vec::new();
         let mut bodies: Vec<String> = Vec::new();
         for pg in &self.pages {
-            let mut strokes: Vec<PreviewStroke> = Vec::new();
-            let mut mn = Vec2::splat(f32::MAX);
-            let mut mx = Vec2::splat(f32::MIN);
-            for layer in &pg.doc.layers {
-                if !layer.visible {
-                    continue;
-                }
-                for st in &layer.strokes {
-                    if st.samples.is_empty() {
-                        continue;
-                    }
-                    let pts: Vec<Vec2> = st.samples.iter().map(|s| s.pos).collect();
-                    for p in &pts {
-                        mn = mn.min(*p);
-                        mx = mx.max(*p);
-                    }
-                    let mut c = st.brush.color;
-                    c[3] *= layer.opacity * st.brush.opacity;
-                    strokes.push((pts, c, st.brush.width));
-                }
-            }
-            let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
-            previews.push((strokes, bounds));
+            previews.push(preview_page_from(pg));
             bodies.push(pg.body.clone());
         }
         self.cube_previews = previews;
@@ -3529,6 +3504,11 @@ impl App {
                     ui.selectable_value(&mut layout.font, 5, "Garamond");
                     ui.selectable_value(&mut layout.font, 6, "Atkinson");
                     ui.selectable_value(&mut layout.font, 7, "Source Sans");
+                    ui.selectable_value(&mut layout.font, 8, "Montserrat");
+                    ui.selectable_value(&mut layout.font, 9, "Roboto");
+                    ui.selectable_value(&mut layout.font, 10, "Inter");
+                    ui.selectable_value(&mut layout.font, 11, "Josefin Sans");
+                    ui.selectable_value(&mut layout.font, 12, "Nunito");
                 });
             });
         self.doc_layout = layout;
@@ -6188,6 +6168,12 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.font_data.insert("garamond".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/EBGaramond-Regular.ttf"))));
     fonts.font_data.insert("atkinson".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/AtkinsonHyperlegible-Regular.ttf"))));
     fonts.font_data.insert("sourcesans".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/SourceSans3-Regular.ttf"))));
+    // Mas sans (OFL): Montserrat, Roboto, Inter, Josefin Sans (geometrica), Nunito (redondeada).
+    fonts.font_data.insert("montserrat".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Montserrat-Regular.ttf"))));
+    fonts.font_data.insert("roboto".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Roboto-Regular.ttf"))));
+    fonts.font_data.insert("inter".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))));
+    fonts.font_data.insert("josefin".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/JosefinSans-Regular.ttf"))));
+    fonts.font_data.insert("nunito".to_owned(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Nunito-Regular.ttf"))));
     // Respaldo del sistema (acentos/glifos que falten): Segoe UI / Calibri / DejaVu.
     let fallback = ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/calibri.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
         .iter()
@@ -6218,6 +6204,11 @@ fn setup_fonts(ctx: &egui::Context) {
         ("doc_garamond", "garamond"),
         ("doc_atkinson", "atkinson"),
         ("doc_sourcesans", "sourcesans"),
+        ("doc_montserrat", "montserrat"),
+        ("doc_roboto", "roboto"),
+        ("doc_inter", "inter"),
+        ("doc_josefin", "josefin"),
+        ("doc_nunito", "nunito"),
     ] {
         fonts.families.insert(egui::FontFamily::Name(name.into()), vec![data.to_owned(), "hanken".to_owned()]);
     }
@@ -6836,6 +6827,60 @@ fn point_in_quad(p: egui::Pos2, q: &[egui::Pos2; 4]) -> bool {
     true
 }
 
+/// Construye la vista previa de UNA pagina: sus trazos de tinta con el BORRADO ya aplicado
+/// (los discos de la goma redonda recortan los trazos) y su bounding box en mundo. La comparten
+/// la portada de la biblioteca y las miniaturas de la rejilla, para que ambas muestren solo lo
+/// que de verdad queda visible en la hoja (no los trazos que ya se borraron).
+fn preview_page_from(pg: &notebook::PageData) -> PreviewPage {
+    // Todos los discos de goma de la hoja [cx, cy, radio, t], en coordenadas de mundo.
+    let discs: Vec<[f32; 4]> = pg.erase_strokes.iter().flatten().copied().collect();
+    let mut strokes: Vec<PreviewStroke> = Vec::new();
+    let mut mn = Vec2::splat(f32::MAX);
+    let mut mx = Vec2::splat(f32::MIN);
+    for layer in &pg.doc.layers {
+        if !layer.visible {
+            continue;
+        }
+        for st in &layer.strokes {
+            if st.samples.is_empty() {
+                continue;
+            }
+            let mut c = st.brush.color;
+            c[3] *= layer.opacity * st.brush.opacity;
+            let w = st.brush.width;
+            // El borrado parte el trazo: los puntos dentro de algun disco se omiten, dejando
+            // solo los segmentos visibles (>= 2 puntos seguidos sin borrar).
+            let mut seg: Vec<Vec2> = Vec::new();
+            for s in &st.samples {
+                let p = s.pos;
+                let erased = discs.iter().any(|d| (p.x - d[0]).hypot(p.y - d[1]) <= d[2]);
+                if erased {
+                    if seg.len() >= 2 {
+                        for q in &seg {
+                            mn = mn.min(*q);
+                            mx = mx.max(*q);
+                        }
+                        strokes.push((std::mem::take(&mut seg), c, w));
+                    } else {
+                        seg.clear();
+                    }
+                } else {
+                    seg.push(p);
+                }
+            }
+            if seg.len() >= 2 {
+                for q in &seg {
+                    mn = mn.min(*q);
+                    mx = mx.max(*q);
+                }
+                strokes.push((seg, c, w));
+            }
+        }
+    }
+    let bounds = if mx.x >= mn.x { Some((mn, mx)) } else { None };
+    (strokes, bounds)
+}
+
 /// Dibuja la PAGINA COMPLETA en miniatura dentro del rect `r`: representa la hoja A4 entera y
 /// coloca el contenido (texto/markdown + tablas + trazos) en su posicion y tamaño reales, a escala.
 /// `page` es el tamaño de la hoja en puntos (ancho, alto).
@@ -6857,6 +6902,11 @@ fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview
             5 => egui::FontFamily::Name("doc_garamond".into()),
             6 => egui::FontFamily::Name("doc_atkinson".into()),
             7 => egui::FontFamily::Name("doc_sourcesans".into()),
+            8 => egui::FontFamily::Name("doc_montserrat".into()),
+            9 => egui::FontFamily::Name("doc_roboto".into()),
+            10 => egui::FontFamily::Name("doc_inter".into()),
+            11 => egui::FontFamily::Name("doc_josefin".into()),
+            12 => egui::FontFamily::Name("doc_nunito".into()),
             _ => egui::FontFamily::Proportional,
         };
         let fsize = (layout.font_size * f).max(1.0);
