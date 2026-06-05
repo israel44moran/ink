@@ -4443,6 +4443,36 @@ impl ApplicationHandler for App {
                                                                 ui.add(egui::Slider::new(&mut table_scale, 0.0..=1.0).show_value(false));
                                                                 ui.label(egui::RichText::new("Alto de fila").size(11.0));
                                                                 ui.add(egui::Slider::new(&mut table_row, 0.6..=2.5).show_value(false));
+                                                                // Vista previa EN VIVO: mini-tabla 2x2 que cambia de ancho/alto
+                                                                // con los sliders, para decidir el tamaño antes de insertar.
+                                                                ui.add_space(4.0);
+                                                                ui.label(egui::RichText::new("Vista previa").size(10.0).weak());
+                                                                let cwp = 22.0 + table_scale * 74.0;
+                                                                let chp = 13.0 + (table_row - 0.6) * 16.0;
+                                                                let (pw, ph) = (cwp * 2.0, chp * 2.0);
+                                                                let (presp, p) = ui.allocate_painter(egui::vec2(196.0, ph + 4.0), egui::Sense::hover());
+                                                                let ox = presp.rect.center().x - pw * 0.5;
+                                                                let oy = presp.rect.top() + 2.0;
+                                                                let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(130));
+                                                                for i in 0..=2 {
+                                                                    let y = oy + i as f32 * chp;
+                                                                    p.line_segment([egui::pos2(ox, y), egui::pos2(ox + pw, y)], grid);
+                                                                }
+                                                                for j in 0..=2 {
+                                                                    let x = ox + j as f32 * cwp;
+                                                                    p.line_segment([egui::pos2(x, oy), egui::pos2(x, oy + ph)], grid);
+                                                                }
+                                                                for rr in 0..2 {
+                                                                    for cc in 0..2 {
+                                                                        let cc2 = egui::pos2(ox + cc as f32 * cwp + 4.0, oy + rr as f32 * chp + chp * 0.5);
+                                                                        let (txt, fid) = if rr == 0 {
+                                                                            ("Aa", egui::FontId::new(11.0, egui::FontFamily::Name("head".into())))
+                                                                        } else {
+                                                                            ("12", egui::FontId::proportional(10.0))
+                                                                        };
+                                                                        p.text(cc2, egui::Align2::LEFT_CENTER, txt, fid, egui::Color32::from_gray(90));
+                                                                    }
+                                                                }
                                                                 ui.label(egui::RichText::new("Se aplica solo a la próxima tabla que insertes.").size(10.0).weak());
                                                             });
                                                         });
