@@ -214,6 +214,9 @@ struct App {
     /// El popup de tamaño de tabla esta abierto: se dibuja una tabla de muestra en la hoja
     /// (tamaño real) para decidir el tamaño antes de insertar.
     table_size_popup: bool,
+    /// Rect de la barra "page_nav" (donde esta el boton "Página…"): para no cerrar el panel de
+    /// Diseño de pagina con el mismo clic que lo abre.
+    page_nav_rect: Option<egui::Rect>,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -441,6 +444,7 @@ impl App {
             table_hscroll: 0.0,
             table_vscroll: 0.0,
             table_size_popup: false,
+            page_nav_rect: None,
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -3316,7 +3320,7 @@ impl App {
         }
         let mut layout = self.doc_layout;
         let mut open = true;
-        egui::Window::new("Diseño de página")
+        let win = egui::Window::new("Diseño de página")
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -3346,6 +3350,17 @@ impl App {
         self.doc_layout = layout;
         if !open {
             self.show_page_setup = false;
+        }
+        // Cerrar al hacer clic FUERA del panel (y fuera de la barra que lo abre, para que el
+        // mismo clic no lo reabra).
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                let in_panel = win.as_ref().map_or(false, |r| r.response.rect.contains(pos));
+                let in_nav = self.page_nav_rect.map_or(false, |r| r.contains(pos));
+                if !in_panel && !in_nav {
+                    self.show_page_setup = false;
+                }
+            }
         }
     }
 
@@ -4647,7 +4662,7 @@ impl ApplicationHandler for App {
                     if !matches!(self.settings.artboard, settings::Artboard::Infinite) {
                         let cur = self.current_page + 1;
                         let total = self.pages.len();
-                        egui::Area::new(egui::Id::new("page_nav"))
+                        let nav_resp = egui::Area::new(egui::Id::new("page_nav"))
                             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -14.0))
                             .show(ctx, |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -4680,6 +4695,7 @@ impl ApplicationHandler for App {
                                     });
                                 });
                             });
+                        self.page_nav_rect = Some(nav_resp.response.rect);
                     }
 
                     // (El selector de pinceles de Photoshop se fusiono con el panel "Mis
