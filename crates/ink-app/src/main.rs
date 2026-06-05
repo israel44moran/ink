@@ -202,6 +202,9 @@ struct App {
     fullscreen: bool,
     /// Texturas de las imagenes del documento, cacheadas por ruta.
     doc_img_cache: std::collections::HashMap<String, egui::TextureHandle>,
+    /// Celda de tabla en edicion: (char inicio del bloque, fila, columna) + su texto.
+    editing_cell: Option<(usize, usize, usize)>,
+    cell_buf: String,
 
     // --- Pinceles texturizados estilo Photoshop (estampados) ---
     /// Catalogo de puntas cargadas de los .abr (mascara alfa de cada una).
@@ -423,6 +426,8 @@ impl App {
             doc_snap_at: 0.0,
             fullscreen: false,
             doc_img_cache: std::collections::HashMap::new(),
+            editing_cell: None,
+            cell_buf: String::new(),
             ps_brushes: Vec::new(),
             ps_cat_names: Vec::new(),
             ps_cat_members: Vec::new(),
@@ -2797,6 +2802,10 @@ impl App {
                 }
             }
         }
+        // Tablas: se recogen aqui (con su posicion) y se dibujan DESPUES en una capa por encima,
+        // para que sus celdas y los botones +columna/+fila reciban los clics (la caja de texto
+        // del documento cubre toda la hoja).
+        let mut tables: Vec<(usize, usize, Vec<Vec<String>>, egui::Pos2)> = Vec::new();
         let body = &mut self.page_body;
         egui::Area::new(egui::Id::new("doc_editor"))
             .order(egui::Order::Middle)
@@ -2861,9 +2870,136 @@ impl App {
                                 painter.text(egui::pos2(top.x + 2.0, top.y + rowh * 0.5), egui::Align2::LEFT_CENTER, "[imagen no encontrada]", egui::FontId::proportional((size_pts * 0.8).max(8.0)), egui::Color32::from_gray(150));
                             }
                         }
+                        Deco::Table { cells, cstart, cend } => {
+                            // Se dibuja despues, en una capa por encima (clics funcionan).
+                            tables.push((*cstart, *cend, cells.clone(), top));
+                        }
                     }
                 }
             });
+        // Dibujar las tablas (rejilla + celdas editables + botones +columna/+fila) por ENCIMA.
+        let table_w = (rect.width() - 2.0).max(40.0);
+        for (cstart, cend, cells, top) in tables {
+            self.render_table(ctx, cstart, cend, &cells, top, table_w, size_pts, fam.clone(), text_col);
+        }
+    }
+
+    /// Dibuja UNA tabla en una capa por encima del editor: rejilla simple, celdas editables al
+    /// hacer clic, y botones "+" para añadir columna (derecha) o fila (abajo). Edita `page_body`.
+    fn render_table(&mut self, ctx: &egui::Context, cstart: usize, cend: usize, cells: &[Vec<String>], top: egui::Pos2, table_w: f32, size_pts: f32, fam: egui::FontFamily, text_col: egui::Color32) {
+        if cells.is_empty() {
+            return;
+        }
+        let nrows = cells.len();
+        let ncols = cells.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+        let cell_h = size_pts * 1.9;
+        let cw = table_w / ncols as f32;
+        let th = nrows as f32 * cell_h;
+        let editing = self.editing_cell.filter(|&(cs, _, _)| cs == cstart);
+        let mut buf = self.cell_buf.clone();
+        let mut start_edit: Option<(usize, usize)> = None;
+        let (mut add_col, mut add_row, mut lost) = (false, false, false);
+        egui::Area::new(egui::Id::new(("doc_table", cstart)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(top)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(egui::Rect::from_min_size(top - egui::vec2(4.0, 4.0), egui::vec2(table_w + 40.0, th + 40.0)));
+                let painter = ui.painter().clone();
+                let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
+                for r in 0..=nrows {
+                    let y = top.y + r as f32 * cell_h;
+                    painter.line_segment([egui::pos2(top.x, y), egui::pos2(top.x + table_w, y)], grid);
+                }
+                for c in 0..=ncols {
+                    let x = top.x + c as f32 * cw;
+                    painter.line_segment([egui::pos2(x, top.y), egui::pos2(x, top.y + th)], grid);
+                }
+                for r in 0..nrows {
+                    for c in 0..ncols {
+                        let crect = egui::Rect::from_min_size(egui::pos2(top.x + c as f32 * cw, top.y + r as f32 * cell_h), egui::vec2(cw, cell_h));
+                        if editing == Some((cstart, r, c)) {
+                            let inner = crect.shrink(3.0);
+                            let resp = ui.put(inner, egui::TextEdit::singleline(&mut buf).frame(egui::Frame::NONE).desired_width(inner.width()).font(egui::FontId::new(size_pts, fam.clone())).text_color(text_col));
+                            resp.request_focus();
+                            if resp.lost_focus() {
+                                lost = true;
+                            }
+                        } else {
+                            let txt = cells.get(r).and_then(|row| row.get(c)).map(|s| s.as_str()).unwrap_or("");
+                            let fid = if r == 0 { egui::FontId::new(size_pts, egui::FontFamily::Name("head".into())) } else { egui::FontId::new(size_pts, fam.clone()) };
+                            painter.text(egui::pos2(crect.left() + 6.0, crect.center().y), egui::Align2::LEFT_CENTER, txt, fid, text_col);
+                            if ui.interact(crect, egui::Id::new(("tcell", cstart, r, c)), egui::Sense::click()).clicked() {
+                                start_edit = Some((r, c));
+                            }
+                        }
+                    }
+                }
+                // Botones "+": columna (derecha) y fila (abajo).
+                let cbtn = egui::Rect::from_min_size(egui::pos2(top.x + table_w + 4.0, top.y), egui::vec2(18.0, th));
+                let cr = ui.interact(cbtn, egui::Id::new(("tcol", cstart)), egui::Sense::click());
+                painter.rect_filled(cbtn, egui::CornerRadius::same(4), if cr.hovered() { egui::Color32::from_gray(200) } else { egui::Color32::from_gray(228) });
+                painter.text(cbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(16.0), egui::Color32::from_gray(60));
+                if cr.clicked() {
+                    add_col = true;
+                }
+                let rbtn = egui::Rect::from_min_size(egui::pos2(top.x, top.y + th + 4.0), egui::vec2(table_w, 18.0));
+                let rr = ui.interact(rbtn, egui::Id::new(("trow", cstart)), egui::Sense::click());
+                painter.rect_filled(rbtn, egui::CornerRadius::same(4), if rr.hovered() { egui::Color32::from_gray(200) } else { egui::Color32::from_gray(228) });
+                painter.text(rbtn.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(16.0), egui::Color32::from_gray(60));
+                if rr.clicked() {
+                    add_row = true;
+                }
+            });
+        // Aplicar cambios al Markdown de la tabla.
+        let replace = |me: &mut Self, nc: &[Vec<String>]| {
+            let new_text = serialize_table(nc);
+            let mut bchars: Vec<char> = me.page_body.chars().collect();
+            let cs = cstart.min(bchars.len());
+            let ce = cend.min(bchars.len()).max(cs);
+            bchars.splice(cs..ce, new_text.chars());
+            me.page_body = bchars.into_iter().collect();
+        };
+        if add_col {
+            let mut nc = cells.to_vec();
+            for row in &mut nc {
+                while row.len() < ncols {
+                    row.push(String::new());
+                }
+                row.push(String::new());
+            }
+            replace(self, &nc);
+            self.editing_cell = None;
+        } else if add_row {
+            let mut nc = cells.to_vec();
+            nc.push(vec![String::new(); ncols]);
+            replace(self, &nc);
+            self.editing_cell = None;
+        } else if let Some((_, r, c)) = editing {
+            self.cell_buf = buf.clone();
+            let mut nc = cells.to_vec();
+            while nc.len() <= r {
+                nc.push(vec![String::new(); ncols]);
+            }
+            while nc[r].len() <= c {
+                nc[r].push(String::new());
+            }
+            if nc[r][c] != buf {
+                nc[r][c] = buf;
+                replace(self, &nc);
+            }
+            if lost {
+                // Si el foco se perdio por clic en OTRA celda, saltar directo a editarla.
+                if let Some((sr, sc)) = start_edit {
+                    self.editing_cell = Some((cstart, sr, sc));
+                    self.cell_buf = cells.get(sr).and_then(|row| row.get(sc)).cloned().unwrap_or_default();
+                } else {
+                    self.editing_cell = None;
+                }
+            }
+        } else if let Some((r, c)) = start_edit {
+            self.editing_cell = Some((cstart, r, c));
+            self.cell_buf = cells.get(r).and_then(|row| row.get(c)).cloned().unwrap_or_default();
+        }
     }
 
     /// Carga (cacheada por ruta) la textura de una imagen del documento.
@@ -3031,9 +3167,9 @@ impl App {
                 }
                 new_cursor = hi + 10; // tras "![imagen]("
             }
-            // --- Tabla: esqueleto Markdown en su propio bloque ---
+            // --- Tabla: esqueleto 2x2 vacio en su propio bloque ---
             Md::Table => {
-                let block: Vec<char> = "\n| Columna 1 | Columna 2 |\n| --- | --- |\n| a | b |\n".chars().collect();
+                let block: Vec<char> = "\n|  |  |\n| --- | --- |\n|  |  |\n".chars().collect();
                 for (k, &c) in block.iter().enumerate() {
                     chars.insert(hi + k, c);
                 }
@@ -6393,6 +6529,52 @@ enum Deco {
     Hr,
     /// Imagen `![alt](ruta)`: se carga y dibuja la textura en una fila alta.
     Image(String),
+    /// Tabla Markdown: celdas (fila 0 = encabezado), y rango de CARACTERES del bloque en el
+    /// texto (para editar: añadir columna/fila). Se dibuja como rejilla real.
+    Table { cells: Vec<Vec<String>>, cstart: usize, cend: usize },
+}
+
+/// Divide una fila Markdown `| a | b |` en celdas (sin los `|` de los extremos).
+fn parse_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// ¿La fila es la SEPARADORA de una tabla (`| --- | :--: |`)?
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.len() > 1 && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Serializa celdas a un bloque de tabla Markdown (con fila separadora tras el encabezado).
+fn serialize_table(cells: &[Vec<String>]) -> String {
+    if cells.is_empty() {
+        return String::new();
+    }
+    let ncols = cells.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let mut out = String::new();
+    for (i, row) in cells.iter().enumerate() {
+        let mut line = String::from("|");
+        for c in 0..ncols {
+            let cell = row.get(c).map(|s| s.as_str()).unwrap_or("");
+            line.push_str(&format!(" {cell} |"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+        if i == 0 {
+            // fila separadora tras el encabezado
+            let mut sep = String::from("|");
+            for _ in 0..ncols {
+                sep.push_str(" --- |");
+            }
+            out.push_str(&sep);
+            out.push('\n');
+        }
+    }
+    out.pop(); // quitar el ultimo '\n'
+    out
 }
 
 fn push_inline(
@@ -6580,6 +6762,12 @@ fn markdown_job(
     };
     let code_bg = Color32::from_rgba_unmultiplied(130, 130, 140, 40);
     let mut in_code = false;
+    // Las TABLAS siempre se dibujan como rejilla (nunca se ve el Markdown).
+    let is_t = |s: &str| {
+        let t = s.trim_start();
+        t.starts_with('|') && t.len() > 1
+    };
+    let mut tbl: Option<(usize, Vec<Vec<String>>)> = None;
     let mut char_pos = 0usize;
     for (li, line) in text.split('\n').enumerate() {
         let lh = base * line_spacing;
@@ -6591,8 +6779,14 @@ fn markdown_job(
         let start = char_pos;
         let chars: Vec<char> = line.chars().collect();
         char_pos += chars.len();
-        // --- Bloque de codigo: vallas ``` (estado entre lineas) ---
         let full: String = chars.iter().collect();
+        // Si esta linea NO es de tabla, cerrar la tabla pendiente (emitir su rejilla).
+        if !is_t(&full) {
+            if let Some((cs, cells)) = tbl.take() {
+                decos.push((cs, Deco::Table { cells, cstart: cs, cend: start.saturating_sub(1) }));
+            }
+        }
+        // --- Bloque de codigo: vallas ``` (estado entre lineas) ---
         if full.trim() == "```" {
             if reveal {
                 plain(&mut job, &full, base, lh, dim);
@@ -6615,12 +6809,19 @@ fn markdown_job(
                 continue;
             }
         }
-        // --- Fila de tabla (| ... |): monoespaciada; la fila separadora atenuada ---
-        let tl = full.trim_start();
-        if tl.starts_with('|') && tl.len() > 1 {
-            let is_sep = tl.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
-            let color = if is_sep { dim } else { col };
-            job.append(&full, 0.0, TextFormat { font_id: FontId::new(base, FontFamily::Monospace), color, line_height: Some(lh), ..Default::default() });
+        // --- Tabla (| ... |): se OCULTA el Markdown y se dibuja la rejilla (decoracion) ---
+        if is_t(&full) {
+            let is_sep = is_table_separator(&full);
+            let rh = if is_sep { 0.5 } else { base * 1.9 };
+            job.append(&full, 0.0, TextFormat { font_id: FontId::new(0.01, fam.clone()), color: Color32::TRANSPARENT, line_height: Some(rh), ..Default::default() });
+            if tbl.is_none() {
+                tbl = Some((start, Vec::new()));
+            }
+            if !is_sep {
+                if let Some((_, cells)) = tbl.as_mut() {
+                    cells.push(parse_table_row(&full));
+                }
+            }
             continue;
         }
         // --- Encabezado ---
@@ -6703,6 +6904,9 @@ fn markdown_job(
         }
         // --- Linea normal ---
         push_inline(&mut job, &chars, base, lh, &fam, col, false, reveal);
+    }
+    if let Some((cs, cells)) = tbl {
+        decos.push((cs, Deco::Table { cells, cstart: cs, cend: char_pos }));
     }
     job.halign = match align {
         1 => egui::Align::Center,
