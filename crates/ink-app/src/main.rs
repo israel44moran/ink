@@ -13,6 +13,10 @@
 //!   - 1..8: color | [ ]: grosor | Z: deshacer | Y: rehacer | C: limpiar | V: present mode | Esc: salir.
 //!   - El panel de la derecha se puede ocultar/mostrar con su boton.
 
+// En release (la version distribuible) no abrir ventana de consola: solo la ventana de la app.
+// En debug se mantiene la consola para ver los logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod copic;
 mod notebook;
 #[cfg(windows)]
@@ -167,6 +171,10 @@ struct App {
 
     // FPS
     last_frame: Instant,
+    /// Limitador de FPS: `next_frame` es cuando toca renderizar el siguiente fotograma; `last_input`
+    /// es la ultima vez que hubo actividad. En reposo la tasa baja para no exprimir GPU/CPU (laptop).
+    next_frame: Instant,
+    last_input: Instant,
     fps_timer: f32,
     fps_frames: u32,
     last_fps: f32,
@@ -216,10 +224,11 @@ struct App {
     cell_buf: String,
     /// Pedir foco a la celda en edicion SOLO el primer frame (si no, queda atrapada).
     cell_focus: bool,
-    /// Desplazamiento horizontal de la tabla ancha (cuando excede el ancho de la hoja).
-    table_hscroll: f32,
-    /// Desplazamiento vertical de la tabla alta (cuando es mas alta que una hoja entera).
-    table_vscroll: f32,
+    /// Desplazamiento (horizontal, vertical) de CADA tabla, indexado por su inicio (cstart) en el
+    /// cuerpo. Asi cada tabla conserva su propio scroll (antes era global y una tabla reseteaba el de
+    /// otra). Se purga en cada fotograma a las tablas realmente presentes.
+    table_scroll: std::collections::HashMap<usize, (f32, f32)>,
+    table_scroll_seen: std::collections::HashSet<usize>,
     /// El popup de tamaño de tabla esta abierto: se dibuja una tabla de muestra en la hoja
     /// (tamaño real) para decidir el tamaño antes de insertar.
     table_size_popup: bool,
@@ -393,6 +402,8 @@ struct App {
     lib_rubber: Option<(Vec2, Vec2)>,
     lib_sel_base: std::collections::HashSet<usize>,
     ctrl_down: bool,
+    /// Aviso flotante temporal en el Home (texto, segundos restantes). P.ej. "Cuaderno importado".
+    lib_toast: Option<(String, f32)>,
     /// Renombrado en linea: indice del cuaderno cuyo nombre se edita (clic en el nombre).
     renaming: Option<usize>,
     rename_buf: String,
@@ -452,6 +463,8 @@ impl App {
             last_sample_pos: Vec2::ZERO,
             last_sample_time: now,
             last_frame: now,
+            next_frame: now,
+            last_input: now,
             fps_timer: 0.0,
             fps_frames: 0,
             last_fps: 0.0,
@@ -478,8 +491,8 @@ impl App {
             editing_cell: None,
             cell_buf: String::new(),
             cell_focus: false,
-            table_hscroll: 0.0,
-            table_vscroll: 0.0,
+            table_scroll: std::collections::HashMap::new(),
+            table_scroll_seen: std::collections::HashSet::new(),
             table_size_popup: false,
             page_nav_rect: None,
             cube_view: false,
@@ -568,6 +581,7 @@ impl App {
             lib_rubber: None,
             lib_sel_base: std::collections::HashSet::new(),
             ctrl_down: false,
+            lib_toast: None,
             renaming: None,
             rename_buf: String::new(),
             rename_grace: 0,
@@ -1629,6 +1643,92 @@ impl App {
         self.card_flip = vec![0.0; n];
         self.card_flip_vel = vec![0.0; n];
         self.lib_selected.clear();
+    }
+
+    /// Muestra un aviso flotante temporal en el Home (unos segundos).
+    fn set_toast(&mut self, msg: impl Into<String>) {
+        self.lib_toast = Some((msg.into(), 3.2));
+    }
+
+    /// Recarga la biblioteca desde disco tras importar (lista, archiveros y arreglos de animacion).
+    fn reload_library(&mut self) {
+        self.notebooks = notebook::list();
+        self.archiveros = notebook::load_archiveros();
+        let n = self.notebooks.len();
+        self.card_anim = vec![[0.0; 3]; n];
+        self.card_flip = vec![0.0; n];
+        self.card_flip_vel = vec![0.0; n];
+        self.lib_selected.clear();
+    }
+
+    /// Nombre de archivo sugerido (sin caracteres invalidos) para el dialogo de exportar.
+    fn safe_stem(name: &str) -> String {
+        let s: String = name
+            .chars()
+            .map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c })
+            .collect();
+        let s = s.trim().to_string();
+        if s.is_empty() { "Cuaderno".to_string() } else { s }
+    }
+
+    /// Exporta el cuaderno `idx` a un archivo `.inknote` elegido por el usuario (Guardar como).
+    fn export_one_dialog(&mut self, idx: usize) {
+        let Some(entry) = self.notebooks.get(idx) else { return };
+        let path = entry.path.clone();
+        let name = entry.name.clone();
+        let Some(nb) = notebook::load(&path) else {
+            self.set_toast("No se pudo leer el cuaderno");
+            return;
+        };
+        let fname = format!("{}.{}", Self::safe_stem(&name), notebook::EXT_NOTE);
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_title("Exportar cuaderno")
+            .add_filter("Cuaderno Ink", &[notebook::EXT_NOTE])
+            .set_file_name(fname)
+            .save_file()
+        {
+            match notebook::export_notebook(&nb, &dest) {
+                Ok(()) => self.set_toast(format!("Cuaderno \"{name}\" exportado")),
+                Err(_) => self.set_toast("Error al exportar el cuaderno"),
+            }
+        }
+    }
+
+    /// Exporta TODA la biblioteca a un archivo `.inklib` (respaldo / mudanza de PC).
+    fn export_library_dialog(&mut self) {
+        let fname = format!("Biblioteca Ink.{}", notebook::EXT_LIB);
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_title("Exportar biblioteca completa")
+            .add_filter("Biblioteca Ink", &[notebook::EXT_LIB])
+            .set_file_name(fname)
+            .save_file()
+        {
+            match notebook::export_library(&dest) {
+                Ok(n) => self.set_toast(format!("Biblioteca exportada ({n} cuadernos)")),
+                Err(_) => self.set_toast("Error al exportar la biblioteca"),
+            }
+        }
+    }
+
+    /// Abre un archivo `.inknote` / `.inklib` y lo importa a la biblioteca (Abrir).
+    fn import_data_dialog(&mut self) {
+        if let Some(src) = rfd::FileDialog::new()
+            .set_title("Importar cuaderno o biblioteca")
+            .add_filter("Ink (cuaderno o biblioteca)", &[notebook::EXT_NOTE, notebook::EXT_LIB, "json"])
+            .pick_file()
+        {
+            match notebook::import_auto(&src) {
+                Some((n, true)) => {
+                    self.reload_library();
+                    self.set_toast(format!("Biblioteca importada ({n} cuadernos)"));
+                }
+                Some((_, false)) => {
+                    self.reload_library();
+                    self.set_toast("Cuaderno importado");
+                }
+                None => self.set_toast("No se pudo importar ese archivo"),
+            }
+        }
     }
 
     /// Indices de las cartas cuyo CENTRO cae dentro del recuadro `a`..`b` (px). Para el recuadro de
@@ -3232,6 +3332,9 @@ impl App {
             // `writing` (modo escritura con teclado): solo entonces las celdas se pueden editar.
             self.render_table(ctx, cstart, cend, &cells, top, avail_w, rect.top(), rect.bottom(), size_pts, fam.clone(), text_col, col_scale, row_scale, writing);
         }
+        // Olvidar el scroll de tablas que ya no estan en esta hoja (evita acumular memoria).
+        let seen = std::mem::take(&mut self.table_scroll_seen);
+        self.table_scroll.retain(|k, _| seen.contains(k));
         // Vista previa EN LA HOJA (tamaño real) mientras el popup de tamaño esta abierto.
         if preview_active {
             let ptop = preview_top.unwrap_or(rect.min);
@@ -3433,8 +3536,11 @@ impl App {
         let mut buf = self.cell_buf.clone();
         let mut start_edit: Option<(usize, usize)> = None;
         let (mut add_col, mut add_row, mut lost, mut enter_row) = (false, false, false, false);
-        let mut scroll_x = self.table_hscroll.max(0.0);
-        let mut scroll_y = self.table_vscroll.max(0.0);
+        // Scroll PROPIO de esta tabla (por su cstart): cada tabla conserva el suyo.
+        let (sx0, sy0) = self.table_scroll.get(&cstart).copied().unwrap_or((0.0, 0.0));
+        self.table_scroll_seen.insert(cstart);
+        let mut scroll_x = sx0.max(0.0);
+        let mut scroll_y = sy0.max(0.0);
         egui::Area::new(egui::Id::new(("doc_table", cstart)))
             .order(egui::Order::Foreground)
             .fixed_pos(top)
@@ -3601,8 +3707,7 @@ impl App {
                     }
                 }
             });
-        self.table_hscroll = scroll_x;
-        self.table_vscroll = scroll_y;
+        self.table_scroll.insert(cstart, (scroll_x, scroll_y));
         // Consumir la peticion de foco (ya se pidio este frame).
         if want_focus {
             self.cell_focus = false;
@@ -4615,6 +4720,16 @@ impl App {
     }
 }
 
+/// Icono de la app (PNG incrustado) para la ventana y la barra de tareas de Windows.
+/// Carga el icono de la app (la salpicadura de tinta) para la ventana / barra de tareas.
+/// El PNG va incrustado en el binario; si fallara la decodificacion, la ventana usa el icono
+/// por defecto del sistema.
+fn load_app_icon() -> Option<winit::window::Icon> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -4622,6 +4737,7 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Ink v0.2 — motor de tinta + panel")
+            .with_window_icon(load_app_icon())
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_maximized(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("crear ventana"));
@@ -4637,6 +4753,9 @@ impl ApplicationHandler for App {
                     // Barra de titulo segun el tema: Tinta (RGB 14,15,20) / Cuaderno (#1c1813).
                     let cap = if self.lib_tweaks.theme == 1 { 0x0013_181C } else { 0x0014_0F0E };
                     set_dark_titlebar(w.hwnd.get(), cap);
+                    // Asignar el icono "grande" para que el logo aparezca en la barra de tareas
+                    // (winit solo pone el pequeno, el de la barra de titulo).
+                    set_taskbar_icon(w.hwnd.get());
                 }
             }
         }
@@ -4679,6 +4798,11 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Cualquier evento que no sea el propio repintado cuenta como actividad: sube la tasa de
+        // FPS para responder con baja latencia (dibujar/navegar). En reposo baja sola (about_to_wait).
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.last_input = Instant::now();
+        }
         // Pasar el evento a egui primero. Si egui lo consume (interaccion con el panel),
         // no lo usamos para dibujar/navegar el lienzo.
         let egui_consumed = if let (Some(state), Some(window)) =
@@ -5223,6 +5347,13 @@ impl ApplicationHandler for App {
                 self.last_frame = now;
                 // Reloj de animacion de las cartas (acotado para no dar saltos al reanudar).
                 self.clock += dt.min(0.05);
+                // Aviso flotante del Home (toast): descontar su tiempo y descartarlo al expirar.
+                if let Some((_, t)) = self.lib_toast.as_mut() {
+                    *t -= dt;
+                    if *t <= 0.0 {
+                        self.lib_toast = None;
+                    }
+                }
                 // Transicion suave de entrada/salida del cubo (como el bobbing del home, con dt).
                 let cube_target = if self.cube_view { 1.0 } else { 0.0 };
                 self.cube_anim += (cube_target - self.cube_anim) * (1.0 - (-9.0 * dt.min(0.05)).exp());
@@ -5319,6 +5450,9 @@ impl ApplicationHandler for App {
                 let mut lib_save_cover = false;
                 let mut lib_open_new = false;
                 let mut lib_quick_note = false;
+                let mut lib_import = false;
+                let mut lib_export_all = false;
+                let mut lib_export_one = false;
                 let mut lib_merge_save = false;
                 let mut lib_merge_swap = false;
                 let mut lib_merge_cancel = false;
@@ -5381,6 +5515,27 @@ impl ApplicationHandler for App {
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
+                  // Aviso flotante (toast) del Home: banda centrada abajo que se desvanece al final.
+                  if in_library {
+                      if let Some((msg, t)) = self.lib_toast.clone() {
+                          let fade = t.clamp(0.0, 1.0);
+                          egui::Area::new(egui::Id::new("lib_toast"))
+                              .order(egui::Order::Foreground)
+                              .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -44.0))
+                              .interactable(false)
+                              .show(ctx, |ui| {
+                                  let font = egui::FontId::proportional(14.5);
+                                  let galley = ui.painter().layout_no_wrap(msg.clone(), font.clone(), egui::Color32::PLACEHOLDER);
+                                  let size = galley.size() + egui::vec2(40.0, 26.0);
+                                  let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                  let p = ui.painter();
+                                  let a = |v: u8| (v as f32 * fade) as u8;
+                                  p.rect_filled(rect, egui::CornerRadius::same(10), egui::Color32::from_rgba_unmultiplied(24, 26, 33, a(238)));
+                                  p.rect_stroke(rect, egui::CornerRadius::same(10), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 150, 230, a(120))), egui::StrokeKind::Inside);
+                                  p.text(rect.center(), egui::Align2::CENTER_CENTER, &msg, font, egui::Color32::from_rgba_unmultiplied(244, 245, 250, a(255)));
+                              });
+                      }
+                  }
                   if self.app_mode == AppMode::Canvas {
                     actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
                     // Conectar las acciones del panel "Mis pinceles" (pincel PS elegido y
@@ -5635,7 +5790,14 @@ impl ApplicationHandler for App {
                                 if pill_button(ui, "Nuevo cuaderno", BtnIcon::Plus, th.primary, fw).clicked() { lib_open_new = true; }
                                 ui.add_space(9.0);
                                 if pill_button(ui, "Nota rápida", BtnIcon::Note, th.secondary, fw).clicked() { lib_quick_note = true; }
-                                ui.add_space(22.0);
+                                ui.add_space(14.0);
+                                // Llevar cuadernos a otra PC: importar / exportar (un cuaderno o toda la biblioteca).
+                                if io_action_row(ui, "Importar...", false, &th).clicked() { lib_import = true; }
+                                if self.lib_selected.len() == 1 && io_action_row(ui, "Exportar cuaderno...", true, &th).clicked() {
+                                    lib_export_one = true;
+                                }
+                                if io_action_row(ui, "Exportar biblioteca...", true, &th).clicked() { lib_export_all = true; }
+                                ui.add_space(20.0);
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Label::new(egui::RichText::new("ARCHIVEROS").font(egui::FontId::new(10.5, egui::FontFamily::Monospace)).color(th.kicker)).selectable(false));
                                 });
@@ -6160,11 +6322,17 @@ impl ApplicationHandler for App {
                             let gray = egui::Color32::from_gray(180);
                             let editing = self.editing_nb.is_some();
                             let title = if editing { "Editar carátula" } else { "Nueva carátula" };
+                            let screen_h = ctx.screen_rect().height();
                             egui::Window::new(egui::RichText::new(title).strong())
                                 .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-48.0, 0.0))
                                 .collapsible(false)
                                 .resizable(false)
                                 .default_width(380.0)
+                                // En laptops de pantalla baja el panel no cabe entero: la ventana se limita
+                                // al alto de la pantalla y se vuelve desplazable para llegar a "Crear".
+                                .vscroll(true)
+                                .min_height((screen_h - 96.0).max(260.0))
+                                .max_height((screen_h - 56.0).max(300.0))
                                 .show(ctx, |ui| {
                                     ui.add_space(2.0);
                                     // Nombre y tipo: solo al CREAR (al editar no se renombra ni cambia el tipo).
@@ -6185,7 +6353,6 @@ impl ApplicationHandler for App {
                                         ui.separator();
                                     }
                                     ui.label(egui::RichText::new("Diseño base").strong());
-                                    egui::ScrollArea::vertical().max_height(240.0).auto_shrink([false, false]).show(ui, |ui| {
                                         ui.label(egui::RichText::new("Foil").color(gray));
                                         ui.horizontal_wrapped(|ui| {
                                             for (id, name) in FOIL_DESIGNS {
@@ -6239,7 +6406,6 @@ impl ApplicationHandler for App {
                                                 }
                                             }
                                         });
-                                    });
                                     ui.add_space(8.0);
                                     ui.separator();
                                         ui.label(egui::RichText::new("Color · gama COPIC").strong());
@@ -6347,7 +6513,8 @@ impl ApplicationHandler for App {
                                             }
                                         }
                                     });
-                                    ui.add_space(10.0);
+                                    ui.add_space(6.0);
+                                    ui.separator();
                                     ui.horizontal(|ui| {
                                         let confirm = if editing { "Guardar" } else { "Crear" };
                                         if ui.button(egui::RichText::new(confirm).strong()).clicked() {
@@ -6438,6 +6605,17 @@ impl ApplicationHandler for App {
                 }
                 if lib_quick_note {
                     self.new_quick_note();
+                }
+                if lib_import {
+                    self.import_data_dialog();
+                }
+                if lib_export_all {
+                    self.export_library_dialog();
+                }
+                if lib_export_one {
+                    if let Some(&i) = self.lib_selected.iter().next() {
+                        self.export_one_dialog(i);
+                    }
                 }
                 if lib_close_preview {
                     self.close_preview();
@@ -6839,10 +7017,20 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(w) = &self.window {
-            w.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Limitador de FPS para no tener la GPU/CPU al 100% todo el tiempo (en laptop: ventilador,
+        // calor, bateria). Tras actividad reciente vamos a 120 fps (baja latencia para dibujar);
+        // en reposo bajamos a 30 fps (suficiente para las animaciones suaves del Home).
+        let now = Instant::now();
+        let active = now.duration_since(self.last_input).as_secs_f32() < 1.5;
+        let target_dt = if active { 1.0 / 120.0 } else { 1.0 / 30.0 };
+        if now >= self.next_frame {
+            self.next_frame = now + std::time::Duration::from_secs_f32(target_dt);
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
 }
 
@@ -7250,6 +7438,43 @@ fn set_dark_titlebar(hwnd: isize, caption: u32) {
     }
 }
 
+/// La barra de tareas de Windows usa el icono "grande" (ICON_BIG) de la ventana, pero winit en
+/// esta version solo asigna el "pequeno" (ICON_SMALL, el de la barra de titulo). Por eso el logo
+/// salia en la esquina de la ventana pero no en la barra de tareas. Aqui sacamos el icono ya
+/// incrustado en el .exe (lo mete build.rs/winresource) y lo asignamos como ICON_BIG e ICON_SMALL.
+#[cfg(windows)]
+fn set_taskbar_icon(hwnd: isize) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::Shell::ExtractIconExW;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, HICON};
+
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let mut large = HICON(core::ptr::null_mut());
+    let mut small = HICON(core::ptr::null_mut());
+    unsafe {
+        let n = ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut large), Some(&mut small), 1);
+        if n == 0 {
+            return;
+        }
+        if !large.0.is_null() {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG), LPARAM(large.0 as isize));
+        }
+        if !small.0.is_null() {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL), LPARAM(small.0 as isize));
+        }
+    }
+}
+
 /// Icono vectorial (dibujado, no depende de glifos de fuente) para los botones del Home.
 #[derive(Clone, Copy, PartialEq)]
 enum BtnIcon {
@@ -7485,6 +7710,29 @@ fn add_action_row(ui: &mut egui::Ui, label: &str, th: &HomeTheme) -> egui::Respo
     p.line_segment([egui::pos2(ic.x - r, ic.y), egui::pos2(ic.x + r, ic.y)], st);
     p.line_segment([egui::pos2(ic.x, ic.y - r), egui::pos2(ic.x, ic.y + r)], st);
     p.text(egui::pos2(rect.left() + 34.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.0), col);
+    resp
+}
+
+/// Fila de la barra lateral para exportar/importar: flecha VECTORIAL (hacia arriba = exportar /
+/// sacar, hacia abajo = importar / traer) + texto. Mismo estilo discreto que `add_action_row`.
+fn io_action_row(ui: &mut egui::Ui, label: &str, up: bool, th: &HomeTheme) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
+    let p = ui.painter();
+    let col = if resp.hovered() { th.title } else { th.sub };
+    let cx = rect.left() + 15.0;
+    let cy = rect.center().y;
+    let st = egui::Stroke::new(1.7, col);
+    let r = 6.0;
+    p.line_segment([egui::pos2(cx, cy - r), egui::pos2(cx, cy + r)], st);
+    if up {
+        p.line_segment([egui::pos2(cx, cy - r), egui::pos2(cx - 4.0, cy - r + 4.0)], st);
+        p.line_segment([egui::pos2(cx, cy - r), egui::pos2(cx + 4.0, cy - r + 4.0)], st);
+    } else {
+        p.line_segment([egui::pos2(cx, cy + r), egui::pos2(cx - 4.0, cy + r - 4.0)], st);
+        p.line_segment([egui::pos2(cx, cy + r), egui::pos2(cx + 4.0, cy + r - 4.0)], st);
+    }
+    p.text(egui::pos2(rect.left() + 34.0, cy), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.0), col);
     resp
 }
 
@@ -8851,6 +9099,16 @@ fn main() {
         env_logger::Env::default().default_filter_or("warn,ink_app=info,ink_core=info"),
     )
     .init();
+
+    // Windows: darle a la app una identidad propia (AppUserModelID) para que la barra de tareas use
+    // SU icono y no lo agrupe bajo el del proceso anfitrion (terminal). Sin esto, el icono de la
+    // ventana a veces no aparece en la barra de tareas.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+        let id: Vec<u16> = "Israel.Ink.Notas\0".encode_utf16().collect();
+        let _ = SetCurrentProcessExplicitAppUserModelID(windows::core::PCWSTR(id.as_ptr()));
+    }
 
     let event_loop = EventLoop::new().expect("crear event loop");
     event_loop.set_control_flow(ControlFlow::Poll);

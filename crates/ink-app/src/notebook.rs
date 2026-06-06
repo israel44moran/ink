@@ -411,3 +411,145 @@ pub fn load(path: &Path) -> Option<NotebookData> {
 pub fn delete(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
+
+// ============================== EXPORTAR / IMPORTAR ==============================
+// Un cuaderno se lleva a otra PC como archivo `.inknote` y toda la biblioteca como `.inklib`.
+// Ambos son JSON (el mismo formato interno) y 100% portatiles: no referencian imagenes ni
+// archivos externos, todo va incrustado. En otra PC con el programa se importan y quedan listos
+// para editar.
+
+/// Extension de un cuaderno individual exportado.
+pub const EXT_NOTE: &str = "inknote";
+/// Extension de un respaldo de la biblioteca completa.
+pub const EXT_LIB: &str = "inklib";
+
+/// Respaldo de la biblioteca: todos los cuadernos + los archiveros (carpetas) + el orden manual.
+#[derive(Serialize, Deserialize)]
+pub struct LibraryExport {
+    pub version: u32,
+    pub notebooks: Vec<NotebookData>,
+    #[serde(default)]
+    pub archiveros: Vec<String>,
+    #[serde(default)]
+    pub order: Vec<String>,
+}
+
+/// Exporta UN cuaderno (su NotebookData) al archivo `dest` elegido por el usuario.
+pub fn export_notebook(nb: &NotebookData, dest: &Path) -> std::io::Result<()> {
+    save(nb, dest)
+}
+
+/// Lee todos los NotebookData guardados en la carpeta de la biblioteca (omite los internos).
+fn read_all_notebooks() -> Vec<NotebookData> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(notebooks_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.file_name().map_or(false, |n| {
+                n == "_order.json" || n == "_tweaks.json" || n == "_archiveros.json"
+            }) {
+                continue;
+            }
+            if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) {
+                if let Some(nb) = load(&p) {
+                    out.push(nb);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Exporta TODA la biblioteca (cuadernos + archiveros + orden) a `dest`. Devuelve cuantos cuadernos.
+pub fn export_library(dest: &Path) -> std::io::Result<usize> {
+    let notebooks = read_all_notebooks();
+    let count = notebooks.len();
+    let lib = LibraryExport { version: 1, notebooks, archiveros: load_archiveros(), order: load_order() };
+    let s = serde_json::to_string(&lib)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(dest, s)?;
+    Ok(count)
+}
+
+/// Devuelve un nombre que no choque con un cuaderno ya existente (anade " (2)", " (3)"...).
+pub fn unique_name(base: &str) -> String {
+    let base = base.trim();
+    let base = if base.is_empty() { "Cuaderno" } else { base };
+    if !path_for(base).exists() {
+        return base.to_string();
+    }
+    for n in 2..10000 {
+        let cand = format!("{base} ({n})");
+        if !path_for(&cand).exists() {
+            return cand;
+        }
+    }
+    base.to_string()
+}
+
+/// Guarda un cuaderno importado con un nombre unico (sin pisar los existentes) y lo anade al
+/// final del orden de la biblioteca. Devuelve el nombre final.
+fn add_imported(mut nb: NotebookData) -> Option<String> {
+    nb.normalize();
+    let name = unique_name(&nb.name);
+    nb.name = name.clone();
+    let p = path_for(&name);
+    save(&nb, &p).ok()?;
+    if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+        let mut order = load_order();
+        if !order.iter().any(|o| o == fname) {
+            order.push(fname.to_string());
+            save_order(&order);
+        }
+    }
+    Some(name)
+}
+
+/// Importa UN cuaderno desde `src` (.inknote) y lo anade a la biblioteca. Devuelve su nombre final.
+pub fn import_notebook(src: &Path) -> Option<String> {
+    let nb = load(src)?;
+    add_imported(nb)
+}
+
+/// Importa una biblioteca completa (.inklib): anade todos sus cuadernos (con nombre unico) y
+/// fusiona los archiveros. Devuelve cuantos cuadernos se importaron.
+pub fn import_library(src: &Path) -> Option<usize> {
+    let s = std::fs::read_to_string(src).ok()?;
+    let lib: LibraryExport = serde_json::from_str(&s).ok()?;
+    let mut count = 0;
+    for nb in lib.notebooks {
+        if add_imported(nb).is_some() {
+            count += 1;
+        }
+    }
+    if !lib.archiveros.is_empty() {
+        let mut arch = load_archiveros();
+        for a in lib.archiveros {
+            if !arch.iter().any(|x| x == &a) {
+                arch.push(a);
+            }
+        }
+        save_archiveros(&arch);
+    }
+    Some(count)
+}
+
+/// Importa desde `src` detectando si es un cuaderno (.inknote) o una biblioteca (.inklib).
+/// Devuelve (cuadernos importados, era_biblioteca). Para extensiones desconocidas (.json) decide
+/// por el contenido.
+pub fn import_auto(src: &Path) -> Option<(usize, bool)> {
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == EXT_LIB {
+        return import_library(src).map(|n| (n, true));
+    }
+    if ext == EXT_NOTE {
+        return import_notebook(src).map(|_| (1, false));
+    }
+    // Extension desconocida: una biblioteca tiene el campo "notebooks"; un cuaderno no.
+    let s = std::fs::read_to_string(src).ok()?;
+    if s.contains("\"notebooks\"") {
+        import_library(src).map(|n| (n, true))
+    } else {
+        import_notebook(src).map(|_| (1, false))
+    }
+}
