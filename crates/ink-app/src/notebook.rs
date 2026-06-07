@@ -47,6 +47,10 @@ pub struct PageData {
     /// Alineacion del texto de la hoja: 0 izquierda, 1 centro, 2 derecha, 3 justificado.
     #[serde(default)]
     pub align: u32,
+    /// La hoja la creo el usuario a proposito (boton "+ Hoja"): aunque quede vacia NO se borra sola
+    /// al reequilibrar el texto. Las que crea el desbordamiento (manual=false) si se quitan vacias.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 impl PageData {
@@ -58,6 +62,7 @@ impl PageData {
             tick: 1.0,
             body: String::new(),
             align: 0,
+            manual: false,
         }
     }
 }
@@ -211,6 +216,7 @@ impl NotebookData {
                     tick: self.tick.unwrap_or(1.0),
                     body: String::new(),
                     align: 0,
+                    manual: false,
                 });
             } else {
                 self.pages.push(PageData::empty());
@@ -255,13 +261,27 @@ pub struct LibTweaks {
     /// Tema de la interfaz (chrome): 0 = Tinta (galeria oscura), 1 = Cuaderno (papel rayado).
     #[serde(default)]
     pub theme: u32,
+    /// Paleta de herramientas preferida: false = rueda, true = barra.
+    #[serde(default)]
+    pub tool_bar: bool,
+    /// Tamano de la rueda (1.0 = normal).
+    #[serde(default = "tw_one")]
+    pub wheel_scale: f32,
+    /// Tamano de la barra (1.0 = normal).
+    #[serde(default = "tw_one")]
+    pub bar_scale: f32,
+    /// Tope de FPS mientras se usa la app (30/60/120).
+    #[serde(default = "tw_fps")]
+    pub max_fps: u32,
 }
 fn tw_giro() -> f32 { 18.0 }
 fn tw_incl() -> f32 { 9.0 }
 fn tw_true() -> bool { true }
+fn tw_one() -> f32 { 1.0 }
+fn tw_fps() -> u32 { 120 }
 impl Default for LibTweaks {
     fn default() -> Self {
-        Self { giro: 18.0, inclinacion: 9.0, hover: 0, animate: true, theme: 0 }
+        Self { giro: 18.0, inclinacion: 9.0, hover: 0, animate: true, theme: 0, tool_bar: false, wheel_scale: 1.0, bar_scale: 1.0, max_fps: 120 }
     }
 }
 

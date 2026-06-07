@@ -129,6 +129,9 @@ pub struct Settings {
 
     // --- Ajuste de herramienta ---
     pub tool_ui: ToolUi,
+    pub wheel_scale: f32, // tamano de la rueda (1.0 = normal)
+    pub bar_scale: f32,   // tamano de la barra (1.0 = normal)
+    pub max_fps: u32,     // tope de fotogramas por segundo mientras se usa la app (30/60/120)
 
     // --- Interaccion: raton/teclado ---
     pub shortcuts_enabled: bool,
@@ -171,6 +174,9 @@ impl Default for Settings {
             show_stroke_length: false,
             show_scale_statusbar: false,
             tool_ui: ToolUi::Wheel,
+            wheel_scale: 1.0,
+            bar_scale: 1.0,
+            max_fps: 120,
             shortcuts_enabled: true,
             finger_action: FingerAction::ActiveTool,
             two_finger_zoom: true,

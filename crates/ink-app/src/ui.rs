@@ -83,6 +83,13 @@ pub struct UiState {
     pub last_grid: ink_core::GridKind, // ultimo tipo de cuadricula (para alternar)
     pub collapsed: bool,         // rueda oculta (solo queda el circulo de color)
     pub spiral_rot: f32,         // rotacion de la espiral de colores COPIC (grados)
+    /// Geometria (centro, radio) en PUNTOS de egui para que main.rs sepa si el scroll del raton
+    /// cae sobre la rueda de pinceles (la gira) o sobre el selector COPIC abierto (lo gira). Se
+    /// recalcula cada fotograma; None cuando ese elemento no esta visible.
+    pub wheel_geom: Option<(Pos2, f32)>,
+    pub copic_geom: Option<(Pos2, f32)>,
+    /// Nombre del cuaderno/lienzo abierto, para mostrarlo en la barra superior (lo pone main.rs).
+    pub notebook_name: String,
     pub copic_pop: Option<(usize, usize)>, // swatch COPIC recien elegido (para el "salto")
     pub copic_pop_t: f64,        // tiempo (s) de esa eleccion, para animar el salto
     pub copic_close_at: Option<f64>, // instante (s) en que cerrar el selector COPIC tras el salto
@@ -146,6 +153,9 @@ impl Default for UiState {
             last_grid: ink_core::GridKind::Squares,
             collapsed: false,
             spiral_rot: 0.0,
+            wheel_geom: None,
+            copic_geom: None,
+            notebook_name: String::new(),
             copic_pop: None,
             copic_pop_t: 0.0,
             copic_close_at: None,
@@ -310,13 +320,48 @@ fn num_label(w: f32) -> String {
 }
 
 fn fill_sector(p: &egui::Painter, c: Pos2, r0: f32, r1: f32, a0: f32, a1: f32, fill: Color32) {
+    // Un SOLO mesh continuo (vertices compartidos entre tramos): asi NO quedan lineas finas del
+    // fondo entre los poligonos. Antes eran 24 poligonos sueltos y el anti-aliasing de sus bordes
+    // adyacentes dejaba rayas claras, muy visibles sobre el segmento negro seleccionado.
     let steps = 24;
-    for i in 0..steps {
-        let t0 = a0 + (a1 - a0) * (i as f32 / steps as f32);
-        let t1 = a0 + (a1 - a0) * ((i + 1) as f32 / steps as f32);
-        let quad = vec![c + dir(t0) * r1, c + dir(t1) * r1, c + dir(t1) * r0, c + dir(t0) * r0];
-        p.add(Shape::convex_polygon(quad, fill, Stroke::NONE));
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=steps {
+        let t = a0 + (a1 - a0) * (i as f32 / steps as f32);
+        let d = dir(t);
+        mesh.colored_vertex(c + d * r1, fill);
+        mesh.colored_vertex(c + d * r0, fill);
     }
+    for i in 0..steps {
+        let o = (i * 2) as u32;
+        mesh.add_triangle(o, o + 1, o + 2);
+        mesh.add_triangle(o + 2, o + 1, o + 3);
+    }
+    p.add(Shape::mesh(mesh));
+}
+
+/// Interpola dos colores (0 = a, 1 = b), incluido el alfa.
+fn lerp_col(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgba_unmultiplied(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()), m(a.a(), b.a()))
+}
+
+/// Disco con GRADIENTE VERTICAL (color `top` arriba -> `bottom` abajo). Da sensacion de volumen
+/// (como un material iluminado desde arriba), en vez de un relleno plano.
+fn circle_vgrad(p: &egui::Painter, c: Pos2, r: f32, top: Color32, bottom: Color32) {
+    let n = 60;
+    let mut mesh = egui::Mesh::default();
+    let col_at = |y: f32| lerp_col(top, bottom, (y - (c.y - r)) / (2.0 * r));
+    mesh.colored_vertex(c, col_at(c.y));
+    for k in 0..=n {
+        let ang = k as f32 / n as f32 * 360.0;
+        let pp = c + dir(ang) * r;
+        mesh.colored_vertex(pp, col_at(pp.y));
+    }
+    for k in 0..n {
+        mesh.add_triangle(0, (k + 1) as u32, (k + 2) as u32);
+    }
+    p.add(Shape::mesh(mesh));
 }
 
 // --- Iconos vectoriales ---
@@ -1709,6 +1754,38 @@ fn workspace_tab(ui: &mut egui::Ui, cfg: &mut crate::settings::Settings, state: 
             cfg.tool_ui = ToolUi::Bar;
         }
     });
+    ui.add_space(18.0);
+
+    // Tamano de la paleta elegida (la rueda o la barra, segun cual este activa).
+    let is_wheel = cfg.tool_ui == ToolUi::Wheel;
+    sub_head(
+        ui,
+        "Tamaño",
+        if is_wheel { "Ajusta el tamaño de la rueda." } else { "Ajusta el tamaño de la barra." },
+    );
+    {
+        let val = if is_wheel { &mut cfg.wheel_scale } else { &mut cfg.bar_scale };
+        ui.add(
+            egui::Slider::new(val, 0.7..=1.5)
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                .custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
+        );
+    }
+    ui.add_space(18.0);
+
+    // Tope de FPS: limita los fotogramas por segundo mientras se usa la app (menos = menos consumo
+    // de CPU/GPU y bateria; en reposo siempre baja sola a ~30).
+    sub_head(ui, "Máximo de FPS", "Limita los fotogramas por segundo mientras dibujas o navegas.");
+    ui.horizontal(|ui| {
+        for fps in [30u32, 60, 120] {
+            if ui
+                .selectable_label(cfg.max_fps == fps, egui::RichText::new(format!("{fps} fps")).size(16.0).strong())
+                .clicked()
+            {
+                cfg.max_fps = fps;
+            }
+        }
+    });
     ui.add_space(20.0);
 
     if ui.link(egui::RichText::new("Restaurar a los ajustes predeterminados").color(Color32::from_rgb(40, 110, 210))).clicked() {
@@ -2128,6 +2205,20 @@ fn ps_category_picker(
     picked
 }
 
+/// Escala (dibujo + interaccion) una capa completa desde `center`, usando el transform de capa de
+/// egui (que tambien transforma el puntero). scale = 1.0 deja la capa igual.
+fn scale_layer(ctx: &egui::Context, layer: egui::LayerId, center: Pos2, scale: f32) {
+    let t = if (scale - 1.0).abs() < 0.001 {
+        egui::emath::TSTransform::IDENTITY
+    } else {
+        let c = center.to_vec2();
+        egui::emath::TSTransform::from_translation(c)
+            * egui::emath::TSTransform::from_scaling(scale)
+            * egui::emath::TSTransform::from_translation(-c)
+    };
+    ctx.set_transform_layer(layer, t);
+}
+
 pub fn build_panel(
     ctx: &egui::Context,
     state: &mut UiState,
@@ -2137,6 +2228,10 @@ pub fn build_panel(
     stats: Stats,
 ) -> UiActions {
     let mut actions = UiActions::default();
+    // Geometria de la rueda / selector COPIC para el scroll del raton (la usa main.rs). Se limpia
+    // cada fotograma y se rellena mas abajo solo si esos elementos estan visibles.
+    state.wheel_geom = None;
+    state.copic_geom = None;
 
     // Tema claro, como Concepts.
     ctx.set_visuals(egui::Visuals::light());
@@ -2161,7 +2256,13 @@ pub fn build_panel(
                     if icon_btn(ui, false, 32.0, icon_hamburger) {
                         state.open = !state.open;
                     }
-                    ui.label(egui::RichText::new("Dibujo").strong());
+                    // Nombre del cuaderno/lienzo abierto (si lo hay); si no, "Dibujo".
+                    let title = if state.notebook_name.trim().is_empty() {
+                        "Dibujo".to_string()
+                    } else {
+                        state.notebook_name.clone()
+                    };
+                    ui.label(egui::RichText::new(title).strong()).on_hover_text("Cuaderno abierto");
                     ui.separator();
                     let grid_on = cfg.grid != ink_core::GridKind::None;
                     if icon_btn(ui, grid_on, 32.0, |p, c| {
@@ -2212,7 +2313,7 @@ pub fn build_panel(
         };
     // ---------- La RUEDA radial (o el punto de color si esta colapsada) ----------
     // Un SOLO Area: asi no hay dos widgets que se turnen y se roben el clic.
-    egui::Area::new(egui::Id::new("wheel"))
+    let wheel_resp = egui::Area::new(egui::Id::new("wheel"))
         .fixed_pos(area_origin)
         .constrain(false) // no reubicar cerca de las orillas (evita el "salto" del circulo)
         .show(ctx, |ui| {
@@ -2273,6 +2374,8 @@ pub fn build_panel(
             let (rect, resp) = ui.allocate_exact_size(area_size, egui::Sense::click_and_drag());
             let c = rect.center() + egui::vec2(20.0, 0.0);
             wheel_center = c;
+            // Geometria para que el scroll del raton sobre la rueda la pueda GIRAR (lo usa main.rs).
+            state.wheel_geom = Some((c, R_OUT));
             let rot = state.wheel_rot;
             let time = ui.input(|i| i.time);
             // Progreso de RECONSTRUCCION (0 = nada, 1 = rueda completa). Al reabrir,
@@ -2285,7 +2388,6 @@ pub fn build_panel(
             let f_center = reveal(build, 0.10, 0.0); // centro de color
             let seg_f = |i: usize| reveal(build, 0.80, i as f32 / N_SEG as f32);
 
-            let gray = Color32::from_gray(208);
             let ring_bg = Color32::from_gray(250);
             let ink = Color32::from_gray(70);
 
@@ -2293,11 +2395,18 @@ pub fn build_panel(
             // borde de la hoja en los cuadernos) se vea a traves de la rueda. Alpha con rampa
             // rapida (ya opaco a 1/3 de la apertura) para tapar el fondo en todo estado abierto.
             let back_a = (build * 3.0).clamp(0.0, 1.0);
+            // PROFUNDIDAD (estilo vidrio iOS): sombra difusa debajo de la rueda para despegarla del
+            // fondo. Varios circulos con alfa decreciente, desplazados hacia abajo, simulan el blur.
             if back_a > 0.001 {
+                for k in 0..9 {
+                    let rr = R_OUT + 1.0 + k as f32 * 2.6;
+                    let a = ((22.0 - k as f32 * 2.3).max(0.0) * back_a) as u8;
+                    ui.painter().circle_filled(c + egui::vec2(0.0, 7.0), rr, Color32::from_black_alpha(a));
+                }
                 ui.painter().circle_filled(c, R_OUT, fade(ring_bg, back_a));
             }
-            // Anillo exterior.
-            p_circle(ui, c, R_OUT, fade(ring_bg, f_ring));
+            // Anillo exterior con GRADIENTE vertical (mas claro arriba): da volumen, no plano.
+            circle_vgrad(ui.painter(), c, R_OUT, fade(Color32::from_gray(255), f_ring), fade(Color32::from_gray(226), f_ring));
             // Segmento seleccionado (con el factor de su propio segmento).
             let sa = state.selected_seg as f32 * SEG_DEG + rot;
             fill_sector(ui.painter(), c, R_MID, R_OUT, sa - SEG_DEG / 2.0, sa + SEG_DEG / 2.0, fade(Color32::from_gray(28), seg_f(state.selected_seg)));
@@ -2306,9 +2415,50 @@ pub fn build_panel(
                 let a = i as f32 * SEG_DEG + SEG_DEG / 2.0 + rot;
                 ui.painter().line_segment([c + dir(a) * R_MID, c + dir(a) * R_OUT], Stroke::new(1.0, fade(Color32::from_gray(226), seg_f(i))));
             }
-            ui.painter().circle_stroke(c, R_OUT, Stroke::new(1.5, fade(Color32::from_gray(215), f_ring)));
-            // Donut gris.
-            p_circle(ui, c, R_MID, fade(gray, f_donut));
+            // Borde con VOLUMEN (vidrio): aro fino mas claro arriba (luz) y mas oscuro abajo
+            // (sombra), para que el canto parezca redondeado y no plano.
+            {
+                let bn = 72;
+                for k in 0..bn {
+                    let a0 = k as f32 / bn as f32 * 360.0;
+                    let a1 = (k + 1) as f32 / bn as f32 * 360.0;
+                    let up = -dir((a0 + a1) * 0.5).y; // +1 arriba, -1 abajo
+                    let col = if up >= 0.0 {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, (up * 160.0) as u8)
+                    } else {
+                        Color32::from_rgba_unmultiplied(40, 46, 60, (-up * 95.0) as u8)
+                    };
+                    ui.painter().line_segment(
+                        [c + dir(a0) * (R_OUT - 0.9), c + dir(a1) * (R_OUT - 0.9)],
+                        Stroke::new(2.6, fade(col, f_ring)),
+                    );
+                }
+                ui.painter().circle_stroke(c, R_OUT, Stroke::new(1.0, fade(Color32::from_gray(200), f_ring)));
+            }
+            // Donut con GRADIENTE vertical (volumen mas visible por ser gris).
+            circle_vgrad(ui.painter(), c, R_MID, fade(Color32::from_gray(220), f_donut), fade(Color32::from_gray(186), f_donut));
+            // Sombra interior del borde del donut (parte de abajo): da volumen, como un hueco.
+            {
+                let bn = 56;
+                for k in 0..bn {
+                    let a0 = k as f32 / bn as f32 * 360.0;
+                    let a1 = (k + 1) as f32 / bn as f32 * 360.0;
+                    let up = -dir((a0 + a1) * 0.5).y;
+                    if up < 0.0 {
+                        let col = Color32::from_rgba_unmultiplied(255, 255, 255, (-up * 120.0) as u8);
+                        ui.painter().line_segment(
+                            [c + dir(a0) * (R_MID - 0.9), c + dir(a1) * (R_MID - 0.9)],
+                            Stroke::new(2.0, fade(col, f_donut)),
+                        );
+                    } else {
+                        let col = Color32::from_rgba_unmultiplied(120, 126, 140, (up * 90.0) as u8);
+                        ui.painter().line_segment(
+                            [c + dir(a0) * (R_MID - 0.9), c + dir(a1) * (R_MID - 0.9)],
+                            Stroke::new(2.0, fade(col, f_donut)),
+                        );
+                    }
+                }
+            }
 
             // Resaltar la zona del control con panel abierto.
             let hl = Color32::from_rgb(206, 224, 248);
@@ -2508,6 +2658,8 @@ pub fn build_panel(
                 }
             }
         });
+        // Escala la rueda al tamano elegido (afecta dibujo E interaccion via el transform de capa).
+        scale_layer(ctx, wheel_resp.response.layer_id, wheel_center, cfg.wheel_scale);
     } else {
         // ---------- Interfaz de BARRA (alternativa a la rueda) ----------
         let item_h = 34.0;
@@ -2515,7 +2667,7 @@ pub fn build_panel(
         let bw = 58.0;
         let rows = 15usize;
         let bh = pad * 2.0 + rows as f32 * item_h;
-        egui::Area::new(egui::Id::new("toolbar"))
+        let bar_resp = egui::Area::new(egui::Id::new("toolbar"))
             .fixed_pos(wheel_pos)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(bw, bh), egui::Sense::click_and_drag());
@@ -2641,6 +2793,8 @@ pub fn build_panel(
                     }
                 }
             });
+        // Escala la barra al tamano elegido (crece desde su borde superior, afecta dibujo e interaccion).
+        scale_layer(ctx, bar_resp.response.layer_id, wheel_pos + egui::vec2(bw * 0.5, 0.0), cfg.bar_scale);
     }
 
     // ---------- Paneles de ajuste (grosor / suavidad / opacidad), dibujados a medida ----------
@@ -2847,6 +3001,10 @@ pub fn build_panel(
         // incluso los mas externos) y un poco mas; un clic fuera de ella dibuja y cierra.
         let copic_outer = SP_R0 + cols.iter().map(|col| col.len()).max().unwrap_or(7) as f32 * SP_DR;
         let pick_half = if state.color_mode == ColorMode::Copic { copic_outer + 36.0 } else { radii[2] + 44.0 };
+        // Solo para la espiral COPIC: el scroll del raton sobre ella la GIRA (lo usa main.rs).
+        if state.color_mode == ColorMode::Copic && state.show_colors {
+            state.copic_geom = Some((wheel_center, pick_half));
+        }
         egui::Area::new(egui::Id::new("color_picker"))
             .fixed_pos(wheel_center - egui::vec2(pick_half, pick_half))
             .constrain(false)
@@ -3129,20 +3287,6 @@ pub fn build_panel(
                     }
                 });
 
-                ui.checkbox(&mut state.snap, "Ajustar  ·  Opciones");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut state.measure, "Medir");
-                    ui.label("·");
-                    if ui
-                        .link(egui::RichText::new(format!("{:.0}:{:.0} {}", cfg.scale_from, cfg.scale_to, cfg.unit_abbrev())).color(Color32::from_rgb(40, 110, 210)))
-                        .clicked()
-                    {
-                        state.show_settings = true;
-                        state.settings_tab = SettingsTab::Workspace;
-                    }
-                });
-                ui.add_enabled(false, egui::Checkbox::new(&mut false, "Guía  ·  Arco"));
-                ui.add_enabled(false, egui::Checkbox::new(&mut false, "Reconocimiento  ·  Opciones"));
                 ui.label(
                     egui::RichText::new(format!("{:.0} FPS  ·  {} trazos  ·  {:.2}x", stats.fps, stats.strokes, stats.zoom))
                         .weak()

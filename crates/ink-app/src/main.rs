@@ -18,6 +18,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod copic;
+mod dropbox;
 mod notebook;
 #[cfg(windows)]
 mod pen_win;
@@ -133,9 +134,28 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// Mensaje del hilo de fondo de Dropbox (login o sincronizacion) hacia el bucle principal.
+enum DbxMsg {
+    Connected(dropbox::Creds),
+    Synced(dropbox::SyncReport),
+    Error(String),
+}
+
 struct App {
     gpu: Option<GpuState>,
     window: Option<Arc<Window>>,
+    /// HWND de la ventana (Windows). La ventana arranca "cloaked" (oculta al compositor DWM, pero
+    /// con su tamano/maximizado correctos) y se descubre tras el primer fotograma: sin destello.
+    win_hwnd: isize,
+    window_shown: bool,
+    // --- Sincronizacion con Dropbox ---
+    dropbox: Option<dropbox::Creds>, // sesion activa (None = no conectado)
+    dbx_verifier: Option<String>,    // code_verifier mientras se espera el codigo del login
+    dbx_code: String,                // codigo que pega el usuario en el dialogo de login
+    dbx_login_open: bool,            // dialogo de login abierto
+    dbx_busy: bool,                  // hay una operacion (login o sync) en curso en el hilo
+    dbx_status: String,              // mensaje breve para la UI
+    dbx_rx: Option<std::sync::mpsc::Receiver<DbxMsg>>, // resultado del hilo de fondo
 
     doc: Document,
     camera: Camera,
@@ -235,6 +255,9 @@ struct App {
     /// Rect de la barra "page_nav" (donde esta el boton "Página…"): para no cerrar el panel de
     /// Diseño de pagina con el mismo clic que lo abre.
     page_nav_rect: Option<egui::Rect>,
+    /// Rectangulo (en puntos egui) del editor de texto de la hoja en modo escritura. Sirve para que
+    /// la rueda del raton sobre la hoja haga ZOOM aunque el editor se "coma" el evento.
+    doc_editor_rect: Option<egui::Rect>,
     /// Vista "cubo": carrusel 3D de las hojas del cuaderno para navegar rapido.
     cube_view: bool,
     /// Progreso de la transicion de entrada/salida del cubo (0 = fuera, 1 = dentro).
@@ -348,6 +371,9 @@ struct App {
     current_page: usize,
     /// Hoja FIJADA: bloquea pan/zoom para que la pagina quede encajada (cuadernos de hojas).
     lock_page: bool,
+    /// Ultimo clic izquierdo en el lienzo (instante, posicion): para detectar el DOBLE clic que
+    /// pasa de modo trazo a modo escritura.
+    last_left_click: Option<(Instant, Vec2)>,
     /// Acumulador del scroll para pasar de pagina con la rueda.
     wheel_accum: f32,
     /// Nombre que se escribe al crear un cuaderno nuevo.
@@ -444,6 +470,15 @@ impl App {
         Self {
             gpu: None,
             window: None,
+            win_hwnd: 0,
+            window_shown: false,
+            dropbox: dropbox::load_creds(),
+            dbx_verifier: None,
+            dbx_code: String::new(),
+            dbx_login_open: false,
+            dbx_busy: false,
+            dbx_status: String::new(),
+            dbx_rx: None,
             doc: Document::new(),
             camera: Camera::new(vec2(1280.0, 800.0)),
             brush: Brush { color: ui::PALETTE[0], width: 4.0, ..Brush::default() },
@@ -495,6 +530,7 @@ impl App {
             table_scroll_seen: std::collections::HashSet::new(),
             table_size_popup: false,
             page_nav_rect: None,
+            doc_editor_rect: None,
             cube_view: false,
             cube_anim: 0.0,
             cube_scroll: 0.0,
@@ -551,6 +587,7 @@ impl App {
             pages: vec![notebook::PageData::empty()],
             current_page: 0,
             lock_page: false,
+            last_left_click: None,
             wheel_accum: 0.0,
             new_nb_name: String::new(),
             new_nb_infinite: true,
@@ -1037,6 +1074,12 @@ impl App {
             g.set_committed(self.doc.committed_vertices());
         }
         self.rebuild_mask();
+        // Cambiar de pagina NO debe disparar el reflujo de texto (solo la edicion del usuario lo
+        // hace). Marcamos `flow_last` con el cuerpo recien cargado: asi el siguiente fotograma ve
+        // que no hubo edicion y no equilibra. Sin esto, al navegar el "underflow" subia contenido
+        // de la hoja siguiente y el texto/tablas "viajaban" de hoja en hoja, borrando las hojas
+        // intermedias vacias.
+        self.flow_last = self.page_body.clone();
     }
 
     /// Vuelca el estado vivo a la pagina actual (antes de cambiar de pagina o guardar).
@@ -1093,11 +1136,24 @@ impl App {
     fn add_page(&mut self) {
         self.commit_text();
         self.stash_current_page();
-        self.pages.push(notebook::PageData::empty());
+        let mut pg = notebook::PageData::empty();
+        pg.manual = true; // hoja creada a proposito por el usuario: no se borra sola si queda vacia
+        self.pages.push(pg);
         let i = self.pages.len() - 1;
         self.current_page = i;
         self.load_page(i);
         self.center_on_page();
+    }
+
+    /// Entra al modo ESCRITURA (editor de teclado): fija y centra la hoja para que pan/zoom no
+    /// estorben al teclear, y cierra el panel de pincel. Mismo efecto que el boton "Escribir".
+    fn enter_write_mode(&mut self) {
+        if !self.write_mode {
+            self.write_mode = true;
+            self.lock_page = true;
+            self.center_on_page();
+            self.ui.show_brush_settings = false;
+        }
     }
 
     /// Carga un cuaderno (sus paginas) en el estado y reconstruye la GPU.
@@ -1648,6 +1704,101 @@ impl App {
     /// Muestra un aviso flotante temporal en el Home (unos segundos).
     fn set_toast(&mut self, msg: impl Into<String>) {
         self.lib_toast = Some((msg.into(), 3.2));
+    }
+
+    // ----------------------------- Dropbox -----------------------------
+
+    /// Abre el navegador en la pagina de autorizacion de Dropbox y deja listo el dialogo del codigo.
+    fn dbx_start_login(&mut self) {
+        let (url, verifier) = dropbox::auth_url();
+        self.dbx_verifier = Some(verifier);
+        self.dbx_code.clear();
+        self.dbx_login_open = true;
+        self.dbx_status.clear();
+        open_url(&url);
+    }
+
+    /// Cambia el codigo pegado por el usuario por un token (en un hilo aparte, no bloquea el render).
+    fn dbx_submit_code(&mut self) {
+        let Some(verifier) = self.dbx_verifier.clone() else { return };
+        let code = self.dbx_code.trim().to_string();
+        if code.is_empty() || self.dbx_busy {
+            return;
+        }
+        self.dbx_busy = true;
+        self.dbx_status = "Conectando...".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dbx_rx = Some(rx);
+        std::thread::spawn(move || {
+            let msg = match dropbox::connect(&code, &verifier) {
+                Ok(creds) => DbxMsg::Connected(creds),
+                Err(e) => DbxMsg::Error(e),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Lanza una sincronizacion con Dropbox en un hilo aparte.
+    fn dbx_start_sync(&mut self) {
+        let Some(creds) = self.dropbox.clone() else { return };
+        if self.dbx_busy {
+            return;
+        }
+        self.dbx_busy = true;
+        self.dbx_status = "Sincronizando...".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dbx_rx = Some(rx);
+        std::thread::spawn(move || {
+            let msg = match dropbox::sync_all(&creds) {
+                Ok(r) => DbxMsg::Synced(r),
+                Err(e) => DbxMsg::Error(e),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Cierra la sesion de Dropbox (borra el token local).
+    fn dbx_disconnect(&mut self) {
+        dropbox::forget();
+        self.dropbox = None;
+        self.dbx_login_open = false;
+        self.dbx_status.clear();
+    }
+
+    /// Revisa si el hilo de fondo de Dropbox termino y aplica el resultado. Se llama cada fotograma.
+    fn dbx_poll(&mut self) {
+        let got = self.dbx_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        let Some(msg) = got else { return };
+        self.dbx_rx = None;
+        self.dbx_busy = false;
+        match msg {
+            DbxMsg::Connected(creds) => {
+                self.dbx_status = format!("Conectado como {}", creds.cuenta);
+                self.dropbox = Some(creds);
+                self.dbx_login_open = false;
+                self.dbx_verifier = None;
+                self.dbx_code.clear();
+                self.dbx_start_sync(); // primera sincronizacion al conectar
+            }
+            DbxMsg::Synced(r) => {
+                self.dbx_status = if r.subidos == 0 && r.bajados == 0 {
+                    "Todo al dia".into()
+                } else {
+                    format!("Sincronizado: {} subidos, {} bajados", r.subidos, r.bajados)
+                };
+                if !r.conflictos.is_empty() {
+                    self.dbx_status = format!("{} ({} en conflicto, se guardo copia)", self.dbx_status, r.conflictos.len());
+                }
+                if r.bajados > 0 {
+                    // Bajaron cuadernos: recargar la biblioteca desde disco.
+                    self.notebooks = notebook::list();
+                    self.lib_tweaks = notebook::load_tweaks();
+                }
+            }
+            DbxMsg::Error(e) => {
+                self.dbx_status = format!("Error: {e}");
+            }
+        }
     }
 
     /// Recarga la biblioteca desde disco tras importar (lista, archiveros y arreglos de animacion).
@@ -3001,6 +3152,9 @@ impl App {
         let p0 = self.camera.world_to_screen(Vec2::new(-w * 0.5 + m[3], -h * 0.5 + m[0])) / ppp;
         let p1 = self.camera.world_to_screen(Vec2::new(w * 0.5 - m[1], h * 0.5 - m[2])) / ppp;
         let rect = egui::Rect::from_two_pos(egui::pos2(p0.x, p0.y), egui::pos2(p1.x, p1.y));
+        // Recordar el area del editor para que la rueda del raton encima haga ZOOM (modo escritura),
+        // aunque el editor de texto se "coma" el evento de la rueda.
+        self.doc_editor_rect = if self.write_mode { Some(rect) } else { None };
         if rect.width() < 20.0 || rect.height() < 20.0 {
             return;
         }
@@ -3096,6 +3250,11 @@ impl App {
         // Tab / Shift+Tab sobre una linea de lista la sangra / des-sangra (estilo Obsidian).
         // None = nada; Some(false) = sangrar (Tab); Some(true) = quitar sangria (Shift+Tab).
         let mut list_indent: Option<bool> = None;
+        // Enter en una linea de lista -> continuar la lista con una vieta nueva (estilo Obsidian);
+        // si la vieta esta vacia, salir de la lista. Guarda la posicion del cursor.
+        let mut list_enter: Option<usize> = None;
+        // Accion del menu contextual de edicion (clic derecho): copiar/cortar/pegar/seleccionar todo.
+        let mut clip_action: Option<ClipAction> = None;
         // Backspace al inicio del cuerpo (cursor en 0): regresar a la pagina anterior, si la hay.
         let can_go_back = self.current_page > 0;
         let mut back_to_prev = false;
@@ -3116,6 +3275,11 @@ impl App {
                         preview_top = Some(egui::pos2(rect.min.x, rect.min.y + cr.min.y + cr.height().max(size_pts)));
                     }
                 }
+                // Galley y posicion con que se ubican las DECORACIONES (viñetas, casillas, citas...).
+                // En modo escritura se toman del EDITOR real (su galley y donde lo pinto), para que NO
+                // se desfasen del texto al hacer zoom; en lectura, del galley fijo dibujado en rect.min.
+                let mut deco_galley = galley.clone();
+                let mut deco_pos = rect.min;
                 // Flujo de texto: si el cuerpo es mas ALTO que el area entre margenes, marcar el
                 // inicio de la primera linea logica que rebasa el margen inferior; lo de ahi en
                 // adelante pasara a la pagina siguiente. No interfiere con el reflow de tablas.
@@ -3136,6 +3300,10 @@ impl App {
                                 list_indent = Some(false);
                             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
                                 list_indent = Some(true);
+                            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                                // Enter en una vieta: continuar la lista (o salir si esta vacia). Se
+                                // consume el Enter para que el editor NO inserte un salto normal.
+                                list_enter = Some(cur);
                             }
                         }
                     }
@@ -3152,7 +3320,37 @@ impl App {
                         // clic en otra celda llega a la tabla (y no al editor grande, que se los robaba).
                         .interactive(editing_cstart.is_none())
                         .layouter(&mut layouter);
-                    let r = ui.add_sized(rect.size(), te);
+                    // `show()` (en un ui del tamano de la hoja) en vez de `add_sized`, para obtener el
+                    // galley REAL y donde lo pinta el editor: con ellos se colocan las decoraciones.
+                    let out = ui
+                        .allocate_ui_with_layout(rect.size(), egui::Layout::top_down(egui::Align::Min), |ui| te.show(ui))
+                        .inner;
+                    let r = out.response.response;
+                    deco_galley = out.galley.clone();
+                    deco_pos = out.galley_pos;
+                    // Menu contextual de edicion (clic derecho sobre el texto): copiar / cortar / pegar
+                    // / seleccionar todo. Solo se ANOTA la accion; se aplica tras cerrar el editor
+                    // (manipular el cuerpo aqui chocaria con su prestamo, y meter eventos a egui no
+                    // funciona: el editor de este fotograma ya se dibujo y egui los descarta).
+                    r.context_menu(|cui| {
+                        if cui.button("Copiar").clicked() {
+                            clip_action = Some(ClipAction::Copy);
+                            cui.close();
+                        }
+                        if cui.button("Cortar").clicked() {
+                            clip_action = Some(ClipAction::Cut);
+                            cui.close();
+                        }
+                        if cui.button("Pegar").clicked() {
+                            clip_action = Some(ClipAction::Paste);
+                            cui.close();
+                        }
+                        cui.separator();
+                        if cui.button("Seleccionar todo").clicked() {
+                            clip_action = Some(ClipAction::SelectAll);
+                            cui.close();
+                        }
+                    });
                     // No robar el foco mientras se edita una celda de tabla: si el editor del documento
                     // se autoenfoca en ese momento, el clic en la celda a veces NO arranca su edicion
                     // (de ahi el "a veces si, a veces no"). Con la celda en edicion, el documento cede.
@@ -3166,7 +3364,7 @@ impl App {
                         if let Some(p) = r.interact_pointer_pos() {
                             let line_h = (size_pts * ls.max(1.0)).max(1.0);
                             let rel_y = p.y - rect.min.y;
-                            let text_h = galley.size().y;
+                            let text_h = deco_galley.size().y;
                             if rel_y > text_h + line_h * 0.5 {
                                 let extra = ((rel_y - text_h) / line_h).floor() as usize;
                                 if extra > 0 {
@@ -3178,11 +3376,12 @@ impl App {
                 } else {
                     ui.painter().galley(rect.min, galley.clone(), text_col);
                 }
-                // Decoraciones (casilla, cita, regla, imagen) sobre el texto renderizado.
+                // Decoraciones (casilla, cita, regla, imagen) sobre el texto renderizado. Se ubican
+                // con el galley REAL del editor (deco_galley/deco_pos): asi no se desfasan al hacer zoom.
                 let painter = ui.painter();
                 for (cidx, deco) in &decos {
-                    let cr = galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
-                    let top = rect.min + cr.min.to_vec2();
+                    let cr = deco_galley.pos_from_cursor(egui::text::CCursor::new(*cidx));
+                    let top = deco_pos + cr.min.to_vec2();
                     let rowh = cr.height().max(size_pts);
                     match deco {
                         Deco::Check(done) => {
@@ -3198,6 +3397,17 @@ impl App {
                         Deco::Quote => {
                             let x = top.x + 2.0;
                             painter.line_segment([egui::pos2(x, top.y + 1.0), egui::pos2(x, top.y + rowh - 1.0)], egui::Stroke::new(3.0, accent));
+                        }
+                        Deco::Bullet(kind) => {
+                            // Forma de la viñeta centrada en el hueco reservado: punto / circulo / cuadrado.
+                            let cy = top.y + rowh * 0.5;
+                            let r = (size_pts * 0.14).max(2.0);
+                            let cx = top.x + r + 1.5;
+                            match *kind {
+                                1 => painter.circle_stroke(egui::pos2(cx, cy), r, egui::Stroke::new(1.5, accent)),
+                                2 => painter.rect_filled(egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(r * 1.7, r * 1.7)), egui::CornerRadius::ZERO, accent),
+                                _ => painter.circle_filled(egui::pos2(cx, cy), r, accent),
+                            };
                         }
                         Deco::Hr => {
                             let y = top.y + rowh * 0.5;
@@ -3263,6 +3473,12 @@ impl App {
         // inserta o quita 2 espacios al inicio de la linea del cursor y reposiciona el cursor.
         if let Some(out) = list_indent {
             self.apply_md(ctx, if out { Md::Outdent } else { Md::Indent });
+        }
+        if let Some(cur) = list_enter {
+            self.apply_list_enter(ctx, cur);
+        }
+        if let Some(action) = clip_action {
+            self.apply_clipboard_action(ctx, action);
         }
         // Backspace al inicio del cuerpo: ir al FINAL de la pagina anterior (cruzar hacia atras). Si
         // la hoja que se DEJA queda vacia (sin texto, tablas ni tinta), se quita en el acto. Solo
@@ -4168,10 +4384,12 @@ impl App {
                 i += 1;
             }
         }
-        // Quitar las paginas VACIAS del final (su contenido se recorrio), salvo la actual.
+        // Quitar las paginas VACIAS del final (su contenido se recorrio), salvo la actual y las que
+        // el usuario creo a proposito (manual): esas se quedan aunque queden vacias.
         while self.pages.len() > 1
             && (self.pages.len() - 1) != self.current_page
             && self.page_data_is_empty(self.pages.len() - 1)
+            && !self.pages[self.pages.len() - 1].manual
         {
             self.pages.pop();
         }
@@ -4255,6 +4473,178 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Aplica una accion del menu contextual de edicion sobre el cuerpo de la pagina segun la
+    /// SELECCION actual del editor. Copiar/cortar/pegar usan el portapapeles del sistema (arboard).
+    fn apply_clipboard_action(&mut self, ctx: &egui::Context, action: ClipAction) {
+        let id = egui::Id::new("doc_te");
+        let chars: Vec<char> = self.page_body.chars().collect();
+        let n = chars.len();
+        // Rango seleccionado (sin seleccion: lo == hi en la posicion del cursor).
+        let (mut lo, mut hi) = (n, n);
+        if let Some(state) = egui::TextEdit::load_state(ctx, id) {
+            if let Some(r) = state.cursor.char_range() {
+                lo = r.primary.index.min(r.secondary.index).min(n);
+                hi = r.primary.index.max(r.secondary.index).min(n);
+            }
+        }
+        match action {
+            ClipAction::Copy => {
+                if hi > lo {
+                    let sel: String = chars[lo..hi].iter().collect();
+                    let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(sel));
+                }
+            }
+            ClipAction::Cut => {
+                if hi > lo {
+                    let sel: String = chars[lo..hi].iter().collect();
+                    let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(sel));
+                    self.doc_snapshot();
+                    let mut new: String = chars[..lo].iter().collect();
+                    new.extend(chars[hi..].iter());
+                    self.page_body = new;
+                    self.set_doc_cursor(ctx, lo);
+                }
+            }
+            ClipAction::Paste => {
+                let text = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok());
+                if let Some(text) = text {
+                    if !text.is_empty() {
+                        self.doc_snapshot();
+                        let mut new: String = chars[..lo].iter().collect();
+                        new.push_str(&text);
+                        new.extend(chars[hi..].iter());
+                        self.page_body = new;
+                        self.set_doc_cursor(ctx, lo + text.chars().count());
+                    }
+                }
+            }
+            ClipAction::SelectAll => {
+                let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(n),
+                )));
+                egui::TextEdit::store_state(ctx, id, state);
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        }
+    }
+
+    /// Enter en una linea de lista: continua la lista con una vieta nueva (estilo Obsidian). Si la
+    /// vieta esta vacia (solo el marcador, sin texto), la quita y sale de la lista.
+    fn apply_list_enter(&mut self, ctx: &egui::Context, cursor: usize) {
+        let chars: Vec<char> = self.page_body.chars().collect();
+        let n = chars.len();
+        let cur = cursor.min(n);
+        // Inicio de la linea del cursor.
+        let mut start = cur;
+        while start > 0 && chars[start - 1] != '\n' {
+            start -= 1;
+        }
+        // Sangria (espacios/tabuladores) al inicio de la linea.
+        let mut i = start;
+        while i < n && (chars[i] == ' ' || chars[i] == '\t') {
+            i += 1;
+        }
+        let indent: String = chars[start..i].iter().collect();
+        let rest: String = chars[i..].iter().collect();
+        // Marcador de la vieta de esta linea y el que tocaria en la SIGUIENTE.
+        let (marker_len, next_marker): (usize, String) =
+            if let Some(m) = ["- ", "* ", "+ "].iter().find(|m| rest.starts_with(**m)) {
+                (2, m.to_string())
+            } else {
+                let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                if digits == 0 {
+                    return;
+                }
+                let after: String = rest.chars().skip(digits).take(2).collect();
+                let sep = if after.starts_with(". ") {
+                    ". "
+                } else if after.starts_with(") ") {
+                    ") "
+                } else {
+                    return;
+                };
+                let num: u32 = rest.chars().take(digits).collect::<String>().parse().unwrap_or(1);
+                (digits + 2, format!("{}{}", num + 1, sep))
+            };
+        // Contenido de la linea tras el marcador.
+        let mut line_end = cur;
+        while line_end < n && chars[line_end] != '\n' {
+            line_end += 1;
+        }
+        let content_start = (i + marker_len).min(line_end);
+        let content: String = chars[content_start..line_end].iter().collect();
+        self.doc_snapshot();
+        if content.trim().is_empty() {
+            // Vieta vacia: quitar sangria + marcador (la linea queda en blanco) -> salir de la lista.
+            let mut new: String = chars[..start].iter().collect();
+            new.extend(chars[line_end..].iter());
+            self.page_body = new;
+            self.set_doc_cursor(ctx, start);
+        } else {
+            // Insertar una vieta nueva en el cursor.
+            let insert = format!("\n{indent}{next_marker}");
+            let mut new: String = chars[..cur].iter().collect();
+            new.push_str(&insert);
+            new.extend(chars[cur..].iter());
+            self.page_body = new;
+            self.set_doc_cursor(ctx, cur + insert.chars().count());
+        }
+    }
+
+    /// Aplica un tipo de viñeta a la linea del cursor REEMPLAZANDO el marcador de lista que ya
+    /// hubiera (-, *, + o numerada "N. "), conservando la sangria. Asi elegir otro tipo de viñeta
+    /// no acumula marcadores. No toca las tareas "- [ ]". `marker` es el nuevo ("- ", "* " o "+ ").
+    fn apply_bullet(&mut self, ctx: &egui::Context, marker: &str) {
+        self.doc_snapshot();
+        let id = egui::Id::new("doc_te");
+        let mut chars: Vec<char> = self.page_body.chars().collect();
+        let n = chars.len();
+        let mut lo = n;
+        if let Some(state) = egui::TextEdit::load_state(ctx, id) {
+            if let Some(r) = state.cursor.char_range() {
+                lo = r.primary.index.min(r.secondary.index).min(n);
+            }
+        }
+        // Inicio de la linea del cursor.
+        let mut start = lo;
+        while start > 0 && chars[start - 1] != '\n' {
+            start -= 1;
+        }
+        // Saltar la sangria (se conserva).
+        let mut i = start;
+        while i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+            i += 1;
+        }
+        // Quitar el marcador de lista que ya hubiera, para REEMPLAZARLO: tarea "- [ ] " (o "- [x] "),
+        // viñeta "- "/"* "/"+ ", o numerada "N. ".
+        if i + 5 < chars.len() && chars[i] == '-' && chars[i + 1] == ' ' && chars[i + 2] == '[' && chars[i + 4] == ']' && chars[i + 5] == ' ' {
+            chars.drain(i..i + 6);
+        } else if i + 1 < chars.len() && matches!(chars[i], '-' | '*' | '+') && chars[i + 1] == ' ' {
+            chars.drain(i..i + 2);
+        } else {
+            let digits = chars[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 && chars.get(i + digits) == Some(&'.') && chars.get(i + digits + 1) == Some(&' ') {
+                chars.drain(i..i + digits + 2);
+            }
+        }
+        // Insertar el nuevo marcador justo despues de la sangria.
+        let mk: Vec<char> = marker.chars().collect();
+        for (k, &c) in mk.iter().enumerate() {
+            chars.insert(i + k, c);
+        }
+        self.page_body = chars.into_iter().collect();
+        let count = self.page_body.chars().count();
+        let new_cursor = (i + mk.len()).min(count);
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(new_cursor))));
+        egui::TextEdit::store_state(ctx, id, state);
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.doc_snap = self.page_body.clone();
+        self.doc_snap_at = self.clock;
     }
 
     /// Aplica un comando Markdown de la toolbar al `page_body` segun la SELECCION del editor:
@@ -4420,6 +4810,8 @@ impl App {
                     Md::H5 => "##### ",
                     Md::H6 => "###### ",
                     Md::Bullet => "- ",
+                    Md::BulletCircle => "* ",
+                    Md::BulletSquare => "+ ",
                     Md::Number => "1. ",
                     Md::Task => "- [ ] ",
                     Md::Quote => "> ",
@@ -4756,6 +5148,10 @@ impl ApplicationHandler for App {
                     // Asignar el icono "grande" para que el logo aparezca en la barra de tareas
                     // (winit solo pone el pequeno, el de la barra de titulo).
                     set_taskbar_icon(w.hwnd.get());
+                    // Ocultar la ventana (DWM cloak) hasta pintar el primer fotograma: asi no se ve
+                    // el destello en blanco/negro de la ventana vacia mientras arranca el motor.
+                    self.win_hwnd = w.hwnd.get();
+                    set_window_cloak(self.win_hwnd, true);
                 }
             }
         }
@@ -4791,6 +5187,17 @@ impl ApplicationHandler for App {
         // Cargar la lista de cuadernos guardados y empezar en la biblioteca.
         self.notebooks = notebook::list();
         self.app_mode = AppMode::Library;
+
+        // Aplicar las preferencias de herramienta guardadas (paleta elegida y tamanos de rueda/barra).
+        self.settings.tool_ui = if self.lib_tweaks.tool_bar { settings::ToolUi::Bar } else { settings::ToolUi::Wheel };
+        self.settings.wheel_scale = self.lib_tweaks.wheel_scale;
+        self.settings.bar_scale = self.lib_tweaks.bar_scale;
+        self.settings.max_fps = self.lib_tweaks.max_fps;
+
+        // Si ya hay sesion de Dropbox guardada, sincronizar al arrancar (en segundo plano).
+        if self.dropbox.is_some() {
+            self.dbx_start_sync();
+        }
 
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -4937,35 +5344,55 @@ impl ApplicationHandler for App {
                         } else if self.try_eyedropper() {
                             // Cuentagotas: tomo el color y no dibujo.
                         } else {
-                            // Tocar el lienzo cierra los paneles flotantes (color, "Mis
-                            // pinceles", selector PS y Ajustes) para no estorbar al dibujar.
-                            self.ui.show_colors = false;
-                            self.ui.brush_panel = false;
-                            self.ui.show_ps_panel = false;
-                            self.ui.show_brush_settings = false;
-                            // Dibujar/usar herramienta cierra los deslizadores de la rueda
-                            // (tamano / opacidad / suavidad).
-                            self.ui.popup = ui::Popup::None;
-                            if self.alt_down {
-                                // Alt + arrastrar = zoom (deslizar para acercar/alejar).
-                                self.zooming = true;
-                                self.zoom_anchor = self.cursor;
-                            } else if self.space_down {
-                                self.panning = true;
-                            } else if self.eraser_mode {
-                                // Goma activa: borra la zona tocada (prioridad maxima).
-                                self.start_stroke(0.5);
-                            } else if self.ps_settings.is_some() {
-                                // Pincel PS activo: tiene prioridad sobre herramientas.
-                                self.start_stroke(0.5);
-                            } else if let Some(tool) = self.ui.active_tool() {
-                                if tool == Tool::PolyLasso {
-                                    self.poly_lasso_click();
-                                } else {
-                                    self.tool_press(tool);
-                                }
+                            // DOBLE CLIC en el lienzo (cuaderno de hojas, modo trazo) -> pasar a modo
+                            // ESCRITURA con teclado, para que sea mas rapido. El primer clic dibujo un
+                            // punto: se deshace. Solo con pincel normal (sin goma/herramienta/Alt/Espacio).
+                            let now = Instant::now();
+                            let is_dbl = self.last_left_click.map_or(false, |(t, p)| {
+                                now.duration_since(t).as_secs_f32() < 0.35 && (self.cursor - p).length() < 14.0
+                            });
+                            self.last_left_click = Some((now, self.cursor));
+                            let is_sheets = !matches!(self.settings.artboard, settings::Artboard::Infinite);
+                            let plain = !self.alt_down
+                                && !self.space_down
+                                && !self.eraser_mode
+                                && self.ps_settings.is_none()
+                                && self.ui.active_tool().is_none();
+                            if is_dbl && is_sheets && !self.write_mode && plain {
+                                self.undo_op(); // quitar el punto de tinta que dejo el primer clic
+                                self.enter_write_mode();
+                                self.last_left_click = None; // un 3er clic no debe re-disparar
                             } else {
-                                self.start_stroke(0.5);
+                                // Tocar el lienzo cierra los paneles flotantes (color, "Mis
+                                // pinceles", selector PS y Ajustes) para no estorbar al dibujar.
+                                self.ui.show_colors = false;
+                                self.ui.brush_panel = false;
+                                self.ui.show_ps_panel = false;
+                                self.ui.show_brush_settings = false;
+                                // Dibujar/usar herramienta cierra los deslizadores de la rueda
+                                // (tamano / opacidad / suavidad).
+                                self.ui.popup = ui::Popup::None;
+                                if self.alt_down {
+                                    // Alt + arrastrar = zoom (deslizar para acercar/alejar).
+                                    self.zooming = true;
+                                    self.zoom_anchor = self.cursor;
+                                } else if self.space_down {
+                                    self.panning = true;
+                                } else if self.eraser_mode {
+                                    // Goma activa: borra la zona tocada (prioridad maxima).
+                                    self.start_stroke(0.5);
+                                } else if self.ps_settings.is_some() {
+                                    // Pincel PS activo: tiene prioridad sobre herramientas.
+                                    self.start_stroke(0.5);
+                                } else if let Some(tool) = self.ui.active_tool() {
+                                    if tool == Tool::PolyLasso {
+                                        self.poly_lasso_click();
+                                    } else {
+                                        self.tool_press(tool);
+                                    }
+                                } else {
+                                    self.start_stroke(0.5);
+                                }
                             }
                         }
                     }
@@ -5102,32 +5529,48 @@ impl ApplicationHandler for App {
                     }
                 }
                 if self.app_mode == AppMode::Canvas && !self.cube_view && amount != 0.0 {
-                    // Hace zoom el lienzo infinito siempre; en los cuadernos de hojas la rueda
-                    // pasa de pagina, salvo con Alt (zoom) cuando la hoja no esta fija.
-                    let is_sheets = !matches!(self.settings.artboard, settings::Artboard::Infinite);
-                    let zoom_now = !is_sheets || (self.alt_down && !self.page_locked());
-                    if zoom_now {
-                        // El zoom respeta a egui (no hace zoom si el puntero esta sobre un panel).
-                        if !egui_consumed {
-                            let factor = 1.12_f32.powf(amount);
-                            self.camera.zoom_at(self.cursor, factor);
-                        }
+                    // Scroll del raton SOBRE la rueda de pinceles -> girarla; sobre la espiral COPIC
+                    // abierta -> girarla. Si el cursor no esta sobre ninguna, el comportamiento normal.
+                    let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+                    let cur = egui::pos2(self.cursor.x / ppp, self.cursor.y / ppp);
+                    let over = |g: Option<(egui::Pos2, f32)>| g.map_or(false, |(gc, r)| (cur - gc).length() <= r);
+                    if over(self.ui.copic_geom) {
+                        self.ui.spiral_rot = (self.ui.spiral_rot - amount * 14.0).rem_euclid(360.0);
+                    } else if over(self.ui.wheel_geom) {
+                        self.ui.wheel_rot = (self.ui.wheel_rot - amount * 14.0).rem_euclid(360.0);
                     } else {
-                        // Cuaderno de hojas: la rueda pasa de pagina (abajo = siguiente). Funciona
-                        // AUNQUE la hoja este fijada o el cursor este sobre el editor de texto, por
-                        // eso NO se mira `egui_consumed`.
-                        self.wheel_accum += amount;
-                        while self.wheel_accum <= -1.0 {
-                            if self.current_page + 1 < self.pages.len() {
-                                self.switch_page(self.current_page + 1);
+                        // En lienzo infinito la rueda siempre hace zoom. En cuadernos de hojas la rueda
+                        // hace ZOOM cuando la hoja NO esta fijada (o con Alt), y PASA DE PAGINA cuando si.
+                        let is_sheets = !matches!(self.settings.artboard, settings::Artboard::Infinite);
+                        let zoom_now = !is_sheets || !self.page_locked() || self.alt_down;
+                        if zoom_now {
+                            // El zoom respeta a egui (no hace zoom si el cursor esta sobre un panel),
+                            // PERO si esta sobre la hoja-editor en modo escritura igual hace zoom: ahi
+                            // el editor de texto se "come" la rueda y de otro modo no se podria acercar.
+                            let over_editor = self.write_mode
+                                && !self.ui.show_settings
+                                && self.doc_editor_rect.map_or(false, |r| r.contains(cur));
+                            if !egui_consumed || over_editor {
+                                let factor = 1.12_f32.powf(amount);
+                                self.camera.zoom_at(self.cursor, factor);
                             }
-                            self.wheel_accum += 1.0;
-                        }
-                        while self.wheel_accum >= 1.0 {
-                            if self.current_page > 0 {
-                                self.switch_page(self.current_page - 1);
+                        } else {
+                            // Cuaderno de hojas: la rueda pasa de pagina (abajo = siguiente). Funciona
+                            // AUNQUE la hoja este fijada o el cursor este sobre el editor de texto, por
+                            // eso NO se mira `egui_consumed`.
+                            self.wheel_accum += amount;
+                            while self.wheel_accum <= -1.0 {
+                                if self.current_page + 1 < self.pages.len() {
+                                    self.switch_page(self.current_page + 1);
+                                }
+                                self.wheel_accum += 1.0;
                             }
-                            self.wheel_accum -= 1.0;
+                            while self.wheel_accum >= 1.0 {
+                                if self.current_page > 0 {
+                                    self.switch_page(self.current_page - 1);
+                                }
+                                self.wheel_accum -= 1.0;
+                            }
                         }
                     }
                 }
@@ -5453,6 +5896,12 @@ impl ApplicationHandler for App {
                 let mut lib_import = false;
                 let mut lib_export_all = false;
                 let mut lib_export_one = false;
+                // Flags de Dropbox (se procesan tras cerrar el panel, fuera del prestamo de la UI).
+                let mut dbx_login_click = false;
+                let mut dbx_sync_click = false;
+                let mut dbx_submit_click = false;
+                let mut dbx_cancel_click = false;
+                let mut dbx_disconnect_click = false;
                 let mut lib_merge_save = false;
                 let mut lib_merge_swap = false;
                 let mut lib_merge_cancel = false;
@@ -5515,6 +5964,37 @@ impl ApplicationHandler for App {
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
+                  // Dialogo de conexion a Dropbox (pegar el codigo que muestra el navegador).
+                  if self.dbx_login_open {
+                      egui::Window::new("Conectar Dropbox")
+                          .collapsible(false)
+                          .resizable(false)
+                          .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                          .show(ctx, |ui| {
+                              ui.set_width(430.0);
+                              ui.label("Se abrio tu navegador para autorizar Ink en tu Dropbox.");
+                              ui.label("Cuando autorices, Dropbox te dara un codigo. Pegalo aqui:");
+                              ui.add_space(8.0);
+                              ui.add(egui::TextEdit::singleline(&mut self.dbx_code).hint_text("Codigo de Dropbox").desired_width(f32::INFINITY));
+                              ui.add_space(10.0);
+                              ui.horizontal(|ui| {
+                                  let ok = !self.dbx_busy && !self.dbx_code.trim().is_empty();
+                                  if ui.add_enabled(ok, egui::Button::new("Conectar")).clicked() {
+                                      dbx_submit_click = true;
+                                  }
+                                  if ui.button("Cancelar").clicked() {
+                                      dbx_cancel_click = true;
+                                  }
+                                  if self.dbx_busy {
+                                      ui.label("Conectando...");
+                                  }
+                              });
+                              if !self.dbx_status.is_empty() {
+                                  ui.add_space(6.0);
+                                  ui.label(egui::RichText::new(&self.dbx_status).size(12.0).color(egui::Color32::from_rgb(180, 90, 80)));
+                              }
+                          });
+                  }
                   // Aviso flotante (toast) del Home: banda centrada abajo que se desvanece al final.
                   if in_library {
                       if let Some((msg, t)) = self.lib_toast.clone() {
@@ -5537,6 +6017,14 @@ impl ApplicationHandler for App {
                       }
                   }
                   if self.app_mode == AppMode::Canvas {
+                    // Nombre del cuaderno/lienzo abierto (del nombre de su archivo) para la barra superior.
+                    self.ui.notebook_name = self
+                        .current_path
+                        .as_ref()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     actions = ui::build_panel(ctx, &mut self.ui, &mut self.brush, &mut self.settings, &mut self.doc, stats);
                     // Conectar las acciones del panel "Mis pinceles" (pincel PS elegido y
                     // gestor de packs) a las variables que se procesan tras construir la UI.
@@ -5642,7 +6130,18 @@ impl ApplicationHandler for App {
                                             if md_button(ui, Md::Callout, "Callout").clicked() { md_action = Some(Md::Callout); }
                                             ui.separator();
                                             // Listas y sangría.
-                                            if md_button(ui, Md::Bullet, "Lista").clicked() { md_action = Some(Md::Bullet); }
+                                            // Vietas: desplegable para elegir el tipo (• ◦ ▪), igual que los titulos H4-H6.
+                                            let rbu = md_button(ui, Md::BulletMenu, "Tipo de viñeta");
+                                            let pbu = ui.make_persistent_id("md_bullet_pop");
+                                            if rbu.clicked() { ui.memory_mut(|m| m.toggle_popup(pbu)); }
+                                            #[allow(deprecated)]
+                                            egui::popup_below_widget(ui, pbu, &rbu, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    if md_button(ui, Md::Bullet, "Punto •").clicked() { md_action = Some(Md::Bullet); }
+                                                    if md_button(ui, Md::BulletCircle, "Círculo ◦").clicked() { md_action = Some(Md::BulletCircle); }
+                                                    if md_button(ui, Md::BulletSquare, "Cuadrado ▪").clicked() { md_action = Some(Md::BulletSquare); }
+                                                });
+                                            });
                                             if md_button(ui, Md::Number, "Lista numerada").clicked() { md_action = Some(Md::Number); }
                                             if md_button(ui, Md::Indent, "Sangrar").clicked() { md_action = Some(Md::Indent); }
                                             if md_button(ui, Md::Outdent, "Quitar sangría").clicked() { md_action = Some(Md::Outdent); }
@@ -5797,6 +6296,25 @@ impl ApplicationHandler for App {
                                     lib_export_one = true;
                                 }
                                 if io_action_row(ui, "Exportar biblioteca...", true, &th).clicked() { lib_export_all = true; }
+                                // Dropbox: conectar o sincronizar (sube/baja los cuadernos entre PCs).
+                                let dbx_label = if self.dropbox.is_none() {
+                                    "Conectar Dropbox..."
+                                } else if self.dbx_busy {
+                                    "Sincronizando..."
+                                } else {
+                                    "Sincronizar (Dropbox)"
+                                };
+                                if io_action_row(ui, dbx_label, true, &th).clicked() {
+                                    if self.dropbox.is_some() { dbx_sync_click = true; } else { dbx_login_click = true; }
+                                }
+                                if !self.dbx_status.is_empty() {
+                                    ui.add(egui::Label::new(egui::RichText::new(&self.dbx_status).size(11.0).color(th.sub)).selectable(false));
+                                }
+                                if self.dropbox.is_some() {
+                                    if ui.add(egui::Label::new(egui::RichText::new("desconectar Dropbox").size(11.0).underline().color(th.sub)).sense(egui::Sense::click())).clicked() {
+                                        dbx_disconnect_click = true;
+                                    }
+                                }
                                 ui.add_space(20.0);
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Label::new(egui::RichText::new("ARCHIVEROS").font(egui::FontId::new(10.5, egui::FontFamily::Monospace)).color(th.kicker)).selectable(false));
@@ -6558,6 +7076,18 @@ impl ApplicationHandler for App {
                                     if ui.checkbox(&mut self.lib_tweaks.animate, "Portadas animadas").changed() {
                                         tweaks_save = true;
                                     }
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    // Tope de FPS (mismo ajuste que en el panel de Ajustes); se guarda
+                                    // solo via about_to_wait al detectar el cambio en settings.max_fps.
+                                    ui.label(egui::RichText::new("Máximo de FPS").strong());
+                                    ui.horizontal_wrapped(|ui| {
+                                        for fps in [30u32, 60, 120] {
+                                            if ui.selectable_label(self.settings.max_fps == fps, format!("{fps} fps")).clicked() {
+                                                self.settings.max_fps = fps;
+                                            }
+                                        }
+                                    });
                                     ui.add_space(8.0);
                                     if ui.button("Cerrar").clicked() {
                                         lib_close_tweaks = true;
@@ -6616,6 +7146,23 @@ impl ApplicationHandler for App {
                     if let Some(&i) = self.lib_selected.iter().next() {
                         self.export_one_dialog(i);
                     }
+                }
+                if dbx_login_click {
+                    self.dbx_start_login();
+                }
+                if dbx_sync_click {
+                    self.dbx_start_sync();
+                }
+                if dbx_submit_click {
+                    self.dbx_submit_code();
+                }
+                if dbx_cancel_click {
+                    self.dbx_login_open = false;
+                    self.dbx_verifier = None;
+                    self.dbx_status.clear();
+                }
+                if dbx_disconnect_click {
+                    self.dbx_disconnect();
                 }
                 if lib_close_preview {
                     self.close_preview();
@@ -6707,16 +7254,12 @@ impl ApplicationHandler for App {
                     }
                 }
                 if toggle_write {
-                    self.write_mode = !self.write_mode;
-                    // Al escribir conviene fijar la hoja (que el pan/zoom no estorbe al teclear).
                     if self.write_mode {
-                        self.lock_page = true;
-                        self.center_on_page();
-                        // El panel de pincel no tiene sentido escribiendo: cerrarlo.
-                        self.ui.show_brush_settings = false;
-                    } else {
                         // Al salir de escritura, cerrar cualquier celda de tabla en edicion.
+                        self.write_mode = false;
                         self.editing_cell = None;
+                    } else {
+                        self.enter_write_mode();
                     }
                 }
                 if toggle_setup {
@@ -6750,7 +7293,14 @@ impl ApplicationHandler for App {
                 self.table_size_popup = table_popup_open;
                 if let Some(md) = md_action {
                     let c = self.egui_ctx.clone();
-                    self.apply_md(&c, md);
+                    match md {
+                        // Las viñetas usan apply_bullet: REEMPLAZAN el marcador de lista que ya
+                        // hubiera en la linea (asi cambiar de tipo no acumula "* - texto").
+                        Md::Bullet => self.apply_bullet(&c, "- "),
+                        Md::BulletCircle => self.apply_bullet(&c, "* "),
+                        Md::BulletSquare => self.apply_bullet(&c, "+ "),
+                        _ => self.apply_md(&c, md),
+                    }
                 }
                 if let Some((rgb, hl)) = md_color {
                     let c = self.egui_ctx.clone();
@@ -7011,6 +7561,13 @@ impl ApplicationHandler for App {
                     g.update_camera(self.camera.view_proj());
                     g.render(&primitives, &full_output.textures_delta, &screen);
                 }
+                // Tras pintar el primer fotograma, "descubrir" la ventana (quitar el DWM cloak):
+                // ya muestra el Home directamente, sin el destello inicial.
+                #[cfg(windows)]
+                if !self.window_shown && self.win_hwnd != 0 {
+                    self.window_shown = true;
+                    set_window_cloak(self.win_hwnd, false);
+                }
             }
 
             _ => {}
@@ -7018,12 +7575,31 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Recibir el resultado del hilo de Dropbox (login / sincronizacion) si ya termino.
+        self.dbx_poll();
+        // Persistir las preferencias de herramienta si el usuario las cambio (paleta y tamanos): se
+        // guardan en _tweaks.json para que se recuerden la proxima vez que abra la app.
+        let tool_bar = self.settings.tool_ui == settings::ToolUi::Bar;
+        if tool_bar != self.lib_tweaks.tool_bar
+            || self.settings.wheel_scale != self.lib_tweaks.wheel_scale
+            || self.settings.bar_scale != self.lib_tweaks.bar_scale
+            || self.settings.max_fps != self.lib_tweaks.max_fps
+        {
+            self.lib_tweaks.tool_bar = tool_bar;
+            self.lib_tweaks.wheel_scale = self.settings.wheel_scale;
+            self.lib_tweaks.bar_scale = self.settings.bar_scale;
+            self.lib_tweaks.max_fps = self.settings.max_fps;
+            notebook::save_tweaks(&self.lib_tweaks);
+        }
         // Limitador de FPS para no tener la GPU/CPU al 100% todo el tiempo (en laptop: ventilador,
         // calor, bateria). Tras actividad reciente vamos a 120 fps (baja latencia para dibujar);
         // en reposo bajamos a 30 fps (suficiente para las animaciones suaves del Home).
         let now = Instant::now();
+        // Tope de FPS elegido por el usuario (30/60/120); en reposo siempre baja a ~30 (o menos)
+        // para no tener la GPU/CPU al 100%.
+        let max_fps = self.settings.max_fps.max(15) as f32;
         let active = now.duration_since(self.last_input).as_secs_f32() < 1.5;
-        let target_dt = if active { 1.0 / 120.0 } else { 1.0 / 30.0 };
+        let target_dt = if active { 1.0 / max_fps } else { 1.0 / 30.0_f32.min(max_fps) };
         if now >= self.next_frame {
             self.next_frame = now + std::time::Duration::from_secs_f32(target_dt);
             if let Some(w) = &self.window {
@@ -7407,6 +7983,46 @@ fn accent_color(accent: u32) -> [f32; 3] {
 /// Oscurece la barra de TITULO de la ventana (Windows 11) para que combine con el Home y no
 /// haya un corte de color abrupto: modo oscuro + color de barra/borde = fondo de la app.
 #[cfg(windows)]
+/// Abre una URL en el navegador por defecto del sistema (para el login de Dropbox).
+#[cfg(windows)]
+fn open_url(url: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let op: Vec<u16> = std::ffi::OsStr::new("open").encode_wide().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND(std::ptr::null_mut()),
+            PCWSTR(op.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+#[cfg(not(windows))]
+fn open_url(_url: &str) {}
+
+/// Oculta/descubre la ventana del compositor DWM (cloak). A diferencia de `set_visible`, NO cambia
+/// el tamano ni el estado maximizado: solo deja de pintarla. Se usa para no ver la ventana vacia
+/// (destello blanco/negro) mientras arranca el motor; se descubre tras pintar el primer fotograma.
+#[cfg(windows)]
+fn set_window_cloak(hwnd: isize, cloak: bool) {
+    use windows::Win32::Foundation::{BOOL, HWND};
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+    // DWMWA_CLOAK = 13.
+    const DWMWA_CLOAK: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(13);
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let val = BOOL(if cloak { 1 } else { 0 });
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &val as *const _ as *const core::ffi::c_void, 4);
+    }
+}
+
 fn set_dark_titlebar(hwnd: isize, caption: u32) {
     use windows::Win32::Foundation::{BOOL, COLORREF, HWND};
     use windows::Win32::Graphics::Dwm::{
@@ -7983,6 +8599,15 @@ fn draw_page_mini(painter: &egui::Painter, ui: &egui::Ui, r: egui::Rect, preview
     let _ = pw;
 }
 
+/// Accion del menu contextual de edicion de texto (clic derecho en el editor).
+#[derive(Clone, Copy, PartialEq)]
+enum ClipAction {
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+}
+
 /// Comando de formato Markdown de la toolbar de edicion.
 #[derive(Clone, Copy, PartialEq)]
 enum Md {
@@ -8003,6 +8628,9 @@ enum Md {
     AlignRight,
     AlignJustify,
     Bullet,
+    BulletCircle,
+    BulletSquare,
+    BulletMenu,
     Number,
     Task,
     Quote,
@@ -8087,6 +8715,27 @@ fn md_button(ui: &mut egui::Ui, md: Md, tip: &str) -> egui::Response {
                 p.circle_filled(egui::pos2(c.x - 7.0, c.y + dy), 1.3, col);
                 p.line_segment([egui::pos2(c.x - 3.0, c.y + dy), egui::pos2(c.x + 8.0, c.y + dy)], st);
             }
+        }
+        Md::BulletCircle => {
+            // Tres lineas con vietas de circulo HUECO (◦).
+            for dy in [-4.5_f32, 0.0, 4.5] {
+                p.circle_stroke(egui::pos2(c.x - 7.0, c.y + dy), 1.7, egui::Stroke::new(1.2, col));
+                p.line_segment([egui::pos2(c.x - 3.0, c.y + dy), egui::pos2(c.x + 8.0, c.y + dy)], st);
+            }
+        }
+        Md::BulletSquare => {
+            // Tres lineas con vietas de cuadrado (▪).
+            for dy in [-4.5_f32, 0.0, 4.5] {
+                p.rect_filled(egui::Rect::from_center_size(egui::pos2(c.x - 7.0, c.y + dy), egui::vec2(2.8, 2.8)), egui::CornerRadius::ZERO, col);
+                p.line_segment([egui::pos2(c.x - 3.0, c.y + dy), egui::pos2(c.x + 8.0, c.y + dy)], st);
+            }
+        }
+        Md::BulletMenu => {
+            // Vieta (•) + linea + chevron: abre el desplegable de tipos de viñeta.
+            p.circle_filled(egui::pos2(c.x - 6.0, c.y), 2.0, col);
+            p.line_segment([egui::pos2(c.x - 2.0, c.y), egui::pos2(c.x + 3.0, c.y)], st);
+            p.line_segment([egui::pos2(c.x + 2.0, c.y - 1.0), egui::pos2(c.x + 5.0, c.y + 2.0)], st);
+            p.line_segment([egui::pos2(c.x + 5.0, c.y + 2.0), egui::pos2(c.x + 8.0, c.y - 1.0)], st);
         }
         Md::Number => { p.text(c, egui::Align2::CENTER_CENTER, "1.", egui::FontId::new(13.0, egui::FontFamily::Monospace), col); }
         Md::Task => {
@@ -8439,6 +9088,9 @@ fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 enum Deco {
     Check(bool),
     Quote,
+    /// Viñeta dibujada como forma (la fuente no distingue •/▪): 0 = punto relleno, 1 = circulo
+    /// hueco, 2 = cuadrado. Asi los tres tipos se ven claramente distintos.
+    Bullet(u8),
     Hr,
     /// Imagen `![alt](ruta)`: se carga y dibuja la textura en una fila alta.
     Image(String),
@@ -8814,14 +9466,22 @@ fn markdown_job(
             push_inline(&mut job, &chars[6..], base, lh, &fam, if done { quote_col } else { col }, false, reveal);
             continue;
         }
-        // --- Vineta ("- " / "* ") -> bullet ---
-        if (chars.first() == Some(&'-') || chars.first() == Some(&'*')) && chars.get(1) == Some(&' ') {
+        // --- Vineta ("- " -> punto, "* " -> circulo hueco, "+ " -> cuadrado) ---
+        // La forma se DIBUJA (Deco::Bullet) porque la fuente del cuerpo pinta "•" como un cuadrado
+        // (indistinguible de "▪"). En reveal se muestra el marcador crudo para poder editarlo.
+        if matches!(chars.first(), Some(&'-') | Some(&'*') | Some(&'+')) && chars.get(1) == Some(&' ') {
             if reveal {
                 plain(&mut job, &chars[0].to_string(), base, lh, accent);
+                plain(&mut job, " ", base, lh, col);
             } else {
-                plain(&mut job, "•", base, lh, accent);
+                let kind = match chars[0] {
+                    '*' => 1u8,
+                    '+' => 2,
+                    _ => 0,
+                };
+                reserve(&mut job, "• ", base, lh); // hueco para la forma + separacion
+                decos.push((start, Deco::Bullet(kind)));
             }
-            plain(&mut job, " ", base, lh, col);
             push_inline(&mut job, &chars[2..], base, lh, &fam, col, false, reveal);
             continue;
         }
