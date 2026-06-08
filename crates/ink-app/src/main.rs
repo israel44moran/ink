@@ -3352,10 +3352,16 @@ impl App {
                         j.wrap.max_width = wrap;
                         ui.painter().layout_job(j)
                     };
+                    // El editor debe ocupar TODA la hoja (no solo el alto del texto), para que un clic
+                    // en el espacio vacio de abajo tambien llegue a el (posicionar el cursor con un clic,
+                    // o "clic y escribe" con doble clic). Por eso se pide un alto en renglones que llene
+                    // la hoja; el galley real (para las decoraciones) sigue siendo solo el del texto.
+                    let fill_rows = (rect.height() / (size_pts * ls.max(1.0)).max(1.0)).ceil().max(1.0) as usize;
                     let te = egui::TextEdit::multiline(body)
                         .id(id_te)
                         .frame(egui::Frame::NONE)
                         .desired_width(rect.width())
+                        .desired_rows(fill_rows)
                         // Mientras se edita una celda, el editor del documento NO captura clics: asi el
                         // clic en otra celda llega a la tabla (y no al editor grande, que se los robaba).
                         .interactive(editing_cstart.is_none())
@@ -3403,7 +3409,7 @@ impl App {
                     if r.double_clicked() {
                         if let Some(p) = r.interact_pointer_pos() {
                             let line_h = (size_pts * ls.max(1.0)).max(1.0);
-                            let rel_y = p.y - rect.min.y;
+                            let rel_y = p.y - deco_pos.y;
                             let text_h = deco_galley.size().y;
                             if rel_y > text_h + line_h * 0.5 {
                                 let extra = ((rel_y - text_h) / line_h).floor() as usize;
