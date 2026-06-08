@@ -3406,15 +3406,23 @@ impl App {
                     // Doble clic DEBAJO del texto ya escrito: rellenar con renglones vacios hasta
                     // ahi para poder escribir donde se quiera (estilo "clic y escribe"). El editor va
                     // entre margenes, asi que un clic en el margen no llega aqui.
-                    if r.double_clicked() {
-                        if let Some(p) = r.interact_pointer_pos() {
-                            let line_h = (size_pts * ls.max(1.0)).max(1.0);
-                            let rel_y = p.y - deco_pos.y;
-                            let text_h = deco_galley.size().y;
-                            if rel_y > text_h + line_h * 0.5 {
-                                let extra = ((rel_y - text_h) / line_h).floor() as usize;
-                                if extra > 0 {
-                                    dblclick_lines = Some(extra);
+                    // Doble clic DEBAJO del texto: colocar el cursor ahi rellenando con renglones
+                    // vacios (estilo "clic y escribe"). Se detecta por el input GLOBAL (mas fiable que
+                    // la Response del editor para el espacio vacio) y se acota a la hoja (rect) y a la
+                    // zona bajo el texto. El alto se mide con el galley FIJO del cuerpo, porque el del
+                    // editor viene "estirado" por los renglones que pedimos para llenar la hoja.
+                    let dbl = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+                    if dbl {
+                        if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                            if rect.contains(p) {
+                                let line_h = (size_pts * ls.max(1.0)).max(1.0);
+                                let rel_y = p.y - deco_pos.y;
+                                let text_h = galley.size().y;
+                                if rel_y > text_h + line_h * 0.5 {
+                                    let extra = ((rel_y - text_h) / line_h).floor() as usize;
+                                    if extra > 0 {
+                                        dblclick_lines = Some(extra);
+                                    }
                                 }
                             }
                         }
@@ -5539,6 +5547,13 @@ impl ApplicationHandler for App {
                                     self.zoom_anchor = self.cursor;
                                 } else if self.space_down {
                                     self.panning = true;
+                                } else if self.write_mode {
+                                    // En modo ESCRITURA el raton NO dibuja tinta: el editor de texto
+                                    // (egui) se encarga del clic (colocar el cursor / seleccionar /
+                                    // "clic y escribe"). Asi el doble clic o el arrastre no dejan trazos.
+                                    // No se mira `egui_consumed` porque va con un fotograma de retraso y
+                                    // dejaba pasar el primer clic. El zoom (Alt) y el pan (Espacio) ya se
+                                    // atendieron arriba; el lapiz dibuja por sus propios eventos.
                                 } else if self.eraser_mode {
                                     // Goma activa: borra la zona tocada (prioridad maxima).
                                     self.start_stroke(0.5);
