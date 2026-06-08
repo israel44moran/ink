@@ -4,7 +4,6 @@
 
 #define MyAppName "Ink"
 #define MyAppVersion "0.2"
-#define MyAppPublisher "Israel Rivera"
 #define MyAppExeName "Ink.exe"
 ; Misma identidad (AppUserModelID) que fija el programa por dentro (SetCurrentProcessExplicitAppUserModelID).
 ; Debe coincidir EXACTAMENTE para que la barra de tareas asocie el icono al acceso directo.
@@ -16,7 +15,6 @@
 AppId={{A1B2C3D4-E5F6-47A8-9B0C-1D2E3F4A5B6C}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher={#MyAppPublisher}
 VersionInfoVersion=0.2.0.0
 DefaultDirName={autopf}\Ink
 DefaultGroupName=Ink

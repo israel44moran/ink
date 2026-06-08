@@ -16,3 +16,9 @@
 # Documentos de prueba generados por la app
 /scratch/
 *.ink
+
+# Instaladores generados y material de diseno (no son codigo fuente)
+/dist/
+/export/
+/tweaks-panel.jsx
+/Dise*/
