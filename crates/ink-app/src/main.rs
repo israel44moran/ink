@@ -464,6 +464,9 @@ struct App {
     sort_mode: u32, // 0 Recientes, 1 A-Z, 2 Cuadernos, 3 Notas
     new_archivero_buf: String,
     creating_archivero: bool,
+    /// Renombrado de un archivero (clic derecho sobre su fila): nombre original en edicion y texto.
+    renaming_archivero: Option<String>,
+    rename_archivero_buf: String,
     /// Zonas (px fisicos) de los archiveros en la barra lateral, para soltar un cuaderno encima y
     /// asignarlo: (min_x, min_y, max_x, max_y, nombre_archivero). "" = Todos (quitar de archivero).
     archivero_drop: Vec<(f32, f32, f32, f32, String)>,
@@ -646,6 +649,8 @@ impl App {
             sort_mode: 0,
             new_archivero_buf: String::new(),
             creating_archivero: false,
+            renaming_archivero: None,
+            rename_archivero_buf: String::new(),
             archivero_drop: Vec::new(),
         }
     }
@@ -1614,6 +1619,28 @@ impl App {
         }
         if let Some(nb) = self.notebooks.get_mut(i) {
             nb.archivero = name;
+        }
+    }
+
+    /// Renombra un archivero: reasigna sus cuadernos al nombre nuevo, actualiza la lista lateral y
+    /// persiste todo (cada cuaderno afectado y el indice de archiveros).
+    fn rename_archivero(&mut self, orig: &str, new: &str) {
+        for i in 0..self.notebooks.len() {
+            if self.notebooks[i].archivero == orig {
+                self.assign_archivero(i, new.to_string());
+            }
+        }
+        for a in self.archiveros.iter_mut() {
+            if a == orig {
+                *a = new.to_string();
+            }
+        }
+        notebook::save_archiveros(&self.archiveros);
+        if self.active_archivero == orig {
+            self.active_archivero = new.to_string();
+        }
+        if self.current_archivero == orig {
+            self.current_archivero = new.to_string();
         }
     }
 
@@ -6088,6 +6115,8 @@ impl ApplicationHandler for App {
                 let mut lib_set_archivero: Option<String> = None;
                 let mut lib_new_archivero = false;
                 let mut lib_create_archivero = false;
+                let mut lib_arch_rename: Option<String> = None;
+                let mut lib_rename_archivero = false;
                 let mut lib_set_sort: Option<u32> = None;
                 let mut lib_cancel_new = false;
                 let mut lib_toggle_tweaks = false;
@@ -6528,9 +6557,24 @@ impl ApplicationHandler for App {
                                 self.archivero_drop.push((r0.rect.min.x * ppp_s, r0.rect.min.y * ppp_s, r0.rect.max.x * ppp_s, r0.rect.max.y * ppp_s, String::new()));
                                 if r0.clicked() { lib_set_archivero = Some(String::new()); }
                                 for a in self.archiveros.clone() {
-                                    let r = archivero_row(ui, &a, self.archivero_count(&a), self.active_archivero == a, &th, nb_dragging, cursor_pts, pulse);
-                                    self.archivero_drop.push((r.rect.min.x * ppp_s, r.rect.min.y * ppp_s, r.rect.max.x * ppp_s, r.rect.max.y * ppp_s, a.clone()));
-                                    if r.clicked() { lib_set_archivero = Some(a.clone()); }
+                                    if self.renaming_archivero.as_deref() == Some(a.as_str()) {
+                                        // Clic derecho: este archivero se esta renombrando -> campo de texto.
+                                        // Enter o perder el foco confirma; Escape cancela.
+                                        let r = ui.add(egui::TextEdit::singleline(&mut self.rename_archivero_buf).desired_width(fw));
+                                        r.request_focus();
+                                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                            self.renaming_archivero = None;
+                                            self.rename_archivero_buf.clear();
+                                        } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) || r.lost_focus() {
+                                            lib_rename_archivero = true;
+                                        }
+                                    } else {
+                                        let r = archivero_row(ui, &a, self.archivero_count(&a), self.active_archivero == a, &th, nb_dragging, cursor_pts, pulse);
+                                        self.archivero_drop.push((r.rect.min.x * ppp_s, r.rect.min.y * ppp_s, r.rect.max.x * ppp_s, r.rect.max.y * ppp_s, a.clone()));
+                                        if r.clicked() { lib_set_archivero = Some(a.clone()); }
+                                        // Clic DERECHO sobre la fila: empezar a renombrar este archivero.
+                                        if r.secondary_clicked() { lib_arch_rename = Some(a.clone()); }
+                                    }
                                 }
                                 ui.add_space(4.0);
                                 if self.creating_archivero {
@@ -7392,6 +7436,20 @@ impl ApplicationHandler for App {
                     }
                     self.new_archivero_buf.clear();
                     self.creating_archivero = false;
+                }
+                if let Some(orig) = lib_arch_rename {
+                    self.rename_archivero_buf = orig.clone();
+                    self.renaming_archivero = Some(orig);
+                    self.creating_archivero = false; // no crear y renombrar a la vez
+                }
+                if lib_rename_archivero {
+                    if let Some(orig) = self.renaming_archivero.take() {
+                        let new = self.rename_archivero_buf.trim().to_string();
+                        if !new.is_empty() && new != orig && !self.archiveros.iter().any(|a| a == &new) {
+                            self.rename_archivero(&orig, &new);
+                        }
+                    }
+                    self.rename_archivero_buf.clear();
                 }
                 if lib_preview_next {
                     self.preview_flip(1);
