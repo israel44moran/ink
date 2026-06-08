@@ -148,6 +148,10 @@ struct App {
     /// con su tamano/maximizado correctos) y se descubre tras el primer fotograma: sin destello.
     win_hwnd: isize,
     window_shown: bool,
+    /// Pantalla de bienvenida al abrir: instante de inicio de la animacion (None cuando ya termino)
+    /// y la textura del logo (se carga al vuelo y se libera al acabar el splash).
+    splash_start: Option<Instant>,
+    splash_tex: Option<egui::TextureHandle>,
     // --- Sincronizacion con Dropbox ---
     dropbox: Option<dropbox::Creds>, // sesion activa (None = no conectado)
     dbx_verifier: Option<String>,    // code_verifier mientras se espera el codigo del login
@@ -472,6 +476,8 @@ impl App {
             window: None,
             win_hwnd: 0,
             window_shown: false,
+            splash_start: None,
+            splash_tex: None,
             dropbox: dropbox::load_creds(),
             dbx_verifier: None,
             dbx_code: String::new(),
@@ -5122,6 +5128,115 @@ fn load_app_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
+/// Carga el logo de la app como textura egui para la pantalla de bienvenida.
+fn load_splash_tex(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw());
+    Some(ctx.load_texture("splash_logo", color, egui::TextureOptions::LINEAR))
+}
+
+/// Dibuja la pantalla de bienvenida: fondo que cubre el Home, un resplandor de luz pulsante y el
+/// logo recortado en CIRCULO (sin el borde cuadrado del icono), todo con fundido. `t` es el tiempo
+/// transcurrido y `total` la duracion; al final todo se desvanece para revelar el Home.
+fn draw_splash(ctx: &egui::Context, t: f32, total: f32, tex: &egui::TextureHandle, bg: egui::Color32) {
+    use egui::{pos2, vec2, Color32, CornerRadius, Shape, Stroke};
+    let tau = std::f32::consts::TAU;
+    let pi = std::f32::consts::PI;
+    let screen = ctx.content_rect();
+    let ease_out = |x: f32| 1.0 - (1.0 - x).powi(3);
+    let fade_in = (t / 0.35).clamp(0.0, 1.0);
+    let fade_out = ((total - t) / 0.4).clamp(0.0, 1.0);
+    let appear = (ease_out(fade_in) * fade_out).clamp(0.0, 1.0);
+    let scale = 0.9 + 0.1 * ease_out(fade_in);
+    egui::Area::new(egui::Id::new("splash"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let p = ui.painter();
+            // Fondo solido que tapa el Home y se desvanece al final (revelandolo).
+            p.rect_filled(screen, CornerRadius::ZERO, bg.gamma_multiply(fade_out));
+            let center = screen.center();
+            let side = (screen.height().min(screen.width()) * 0.24 * scale).max(60.0);
+            let rect = egui::Rect::from_center_size(center, vec2(side, side));
+            let radius = side * 0.18; // esquinas redondeadas del recorte
+
+            // Resplandor de luz DIFUSO detras del logo: disco radial amplio y suave (no un halo
+            // pegado al borde), que respira lentamente.
+            let pulse = 0.5 + 0.5 * (t * 3.0).sin();
+            let glow_r = side * (1.15 + 0.3 * pulse);
+            let glow_a = (appear * (0.34 + 0.22 * pulse) * 255.0) as u8;
+            let gc = Color32::from_rgba_unmultiplied(255, 240, 214, glow_a);
+            let ge = Color32::from_rgba_unmultiplied(255, 240, 214, 0);
+            let n = 64u32;
+            let mut glow = egui::Mesh::default();
+            glow.colored_vertex(center, gc);
+            for i in 0..=n {
+                let a = i as f32 / n as f32 * tau;
+                glow.colored_vertex(center + vec2(a.cos(), a.sin()) * glow_r, ge);
+            }
+            for i in 0..n {
+                glow.add_triangle(0, 1 + i, 2 + i);
+            }
+            p.add(glow);
+
+            // Logo recortado LIMPIO a un cuadrado redondeado por codigo: un mesh con esquinas
+            // redondeadas cuyo muestreo del icono va "metido" hacia dentro (inset), de modo que se
+            // corta TODO el contorno del PNG (donde estan la sombra/el dentado oscuros) y solo se
+            // ve el interior limpio.
+            let inset = 0.075_f32;
+            let (lo, span) = (inset, 1.0 - 2.0 * inset);
+            let tintc = Color32::from_white_alpha((appear * 255.0) as u8);
+            let mut logo = egui::Mesh::with_texture(tex.id());
+            logo.vertices.push(egui::epaint::Vertex { pos: center, uv: pos2(0.5, 0.5), color: tintc });
+            let corners = [
+                (rect.right() - radius, rect.bottom() - radius, 0.0_f32),
+                (rect.left() + radius, rect.bottom() - radius, 90.0_f32),
+                (rect.left() + radius, rect.top() + radius, 180.0_f32),
+                (rect.right() - radius, rect.top() + radius, 270.0_f32),
+            ];
+            let mut ring: Vec<egui::Pos2> = Vec::new();
+            for (cx, cy, base) in corners {
+                for i in 0..=8 {
+                    let a = (base + 90.0 * i as f32 / 8.0).to_radians();
+                    ring.push(pos2(cx + a.cos() * radius, cy + a.sin() * radius));
+                }
+            }
+            for pt in &ring {
+                let fx = (pt.x - rect.left()) / rect.width();
+                let fy = (pt.y - rect.top()) / rect.height();
+                logo.vertices.push(egui::epaint::Vertex {
+                    pos: *pt,
+                    uv: pos2(lo + fx * span, lo + fy * span),
+                    color: tintc,
+                });
+            }
+            let nv = ring.len() as u32;
+            for i in 0..nv {
+                logo.indices.extend_from_slice(&[0, 1 + i, 1 + ((i + 1) % nv)]);
+            }
+            p.add(logo);
+
+            // Toque "liquid glass": un reflejo de luz tenue que recorre SOLO el borde superior,
+            // siguiendo el radio real del icono (sin salirse en las esquinas).
+            let spec = Color32::from_rgba_unmultiplied(255, 255, 255, (appear * (95.0 + 70.0 * pulse)).min(255.0) as u8);
+            let tl = pos2(rect.left() + radius, rect.top() + radius);
+            let tr = pos2(rect.right() - radius, rect.top() + radius);
+            let arc = |c: egui::Pos2, base: f32| -> Vec<egui::Pos2> {
+                (0..=10)
+                    .map(|i| {
+                        let a = pi * (base + 0.5 * (i as f32 / 10.0));
+                        c + vec2(a.cos(), a.sin()) * (radius - 0.6)
+                    })
+                    .collect()
+            };
+            let mut top = arc(tl, 1.0); // esquina superior-izquierda
+            top.extend(arc(tr, 1.5)); // borde recto + esquina superior-derecha
+            p.add(Shape::line(top, Stroke::new(1.6, spec)));
+        });
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -5131,7 +5246,7 @@ impl ApplicationHandler for App {
             .with_title("Ink v0.2 — motor de tinta + panel")
             .with_window_icon(load_app_icon())
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
-            .with_maximized(true);
+            .with_visible(false); // crear OCULTA; se mostrara (ya cloaked) tras configurarla
         let window = Arc::new(event_loop.create_window(attrs).expect("crear ventana"));
 
         // Windows: interceptar los mensajes de puntero para leer el boton del lapiz
@@ -5141,20 +5256,23 @@ impl ApplicationHandler for App {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(h) = window.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
-                    pen_win::install(w.hwnd.get());
-                    // Barra de titulo segun el tema: Tinta (RGB 14,15,20) / Cuaderno (#1c1813).
-                    let cap = if self.lib_tweaks.theme == 1 { 0x0013_181C } else { 0x0014_0F0E };
-                    set_dark_titlebar(w.hwnd.get(), cap);
-                    // Asignar el icono "grande" para que el logo aparezca en la barra de tareas
-                    // (winit solo pone el pequeno, el de la barra de titulo).
-                    set_taskbar_icon(w.hwnd.get());
-                    // Ocultar la ventana (DWM cloak) hasta pintar el primer fotograma: asi no se ve
-                    // el destello en blanco/negro de la ventana vacia mientras arranca el motor.
+                    // Ocultar (DWM cloak) ANTES de mostrar la ventana: asi el compositor nunca
+                    // llega a pintar un fotograma de la ventana vacia (el destello que parecia
+                    // "otra ventana" abriendose justo antes de la animacion del logo).
                     self.win_hwnd = w.hwnd.get();
                     set_window_cloak(self.win_hwnd, true);
+                    pen_win::install(w.hwnd.get());
+                    let cap = if self.lib_tweaks.theme == 1 { 0x0013_181C } else { 0x0014_0F0E };
+                    set_dark_titlebar(w.hwnd.get(), cap);
+                    set_taskbar_icon(w.hwnd.get());
                 }
             }
         }
+        // La ventana se creo OCULTA y ya esta cloaked: ahora se hace visible (sigue sin verse por
+        // el cloak) y se maximiza. Maximizar con la ventana ya visible evita que winit la colapse
+        // (lo que ocurria al maximizar una ventana aun oculta).
+        window.set_visible(true);
+        window.set_maximized(true);
 
         let size = window.inner_size();
         self.camera = Camera::new(vec2(size.width.max(1) as f32, size.height.max(1) as f32));
@@ -5198,6 +5316,9 @@ impl ApplicationHandler for App {
         if self.dropbox.is_some() {
             self.dbx_start_sync();
         }
+
+        // Pantalla de bienvenida (logo centrado con fundido) al abrir.
+        self.splash_start = Some(Instant::now());
 
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -5964,6 +6085,27 @@ impl ApplicationHandler for App {
                 let ctx = self.egui_ctx.clone();
                 #[allow(deprecated)]
                 let full_output = ctx.run(raw_input, |ctx| {
+                  // Pantalla de bienvenida: el logo centrado con fundido suave, por encima de todo.
+                  if let Some(start) = self.splash_start {
+                      let t = start.elapsed().as_secs_f32();
+                      let total = 1.4_f32;
+                      if t >= total {
+                          self.splash_start = None;
+                          self.splash_tex = None; // liberar la textura del logo
+                      } else {
+                          if self.splash_tex.is_none() {
+                              self.splash_tex = load_splash_tex(ctx);
+                          }
+                          if let Some(tex) = self.splash_tex.clone() {
+                              let bg = if self.lib_tweaks.theme == 1 {
+                                  egui::Color32::from_rgb(28, 24, 19)
+                              } else {
+                                  egui::Color32::from_rgb(16, 15, 20)
+                              };
+                              draw_splash(ctx, t, total, &tex, bg);
+                          }
+                      }
+                  }
                   // Dialogo de conexion a Dropbox (pegar el codigo que muestra el navegador).
                   if self.dbx_login_open {
                       egui::Window::new("Conectar Dropbox")
@@ -7598,7 +7740,8 @@ impl ApplicationHandler for App {
         // Tope de FPS elegido por el usuario (30/60/120); en reposo siempre baja a ~30 (o menos)
         // para no tener la GPU/CPU al 100%.
         let max_fps = self.settings.max_fps.max(15) as f32;
-        let active = now.duration_since(self.last_input).as_secs_f32() < 1.5;
+        // Durante la pantalla de bienvenida se anima a FPS completo (para un fundido suave).
+        let active = now.duration_since(self.last_input).as_secs_f32() < 1.5 || self.splash_start.is_some();
         let target_dt = if active { 1.0 / max_fps } else { 1.0 / 30.0_f32.min(max_fps) };
         if now >= self.next_frame {
             self.next_frame = now + std::time::Duration::from_secs_f32(target_dt);
