@@ -20,6 +20,7 @@
 mod copic;
 mod dropbox;
 mod notebook;
+mod pdf_export;
 #[cfg(windows)]
 mod pen_win;
 mod renderer;
@@ -1217,6 +1218,39 @@ impl App {
         nb.doc_layout = self.doc_layout;
         nb.pages = self.pages.clone();
         let _ = notebook::save(&nb, &path);
+    }
+
+    /// Exporta el cuaderno/nota actual a un PDF (una hoja = una pagina). Pregunta el destino.
+    fn export_pdf_dialog(&mut self) {
+        // Volcar el texto en edicion y la pagina activa a `self.pages` antes de exportar.
+        self.commit_text();
+        self.stash_current_page();
+        let name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Nota")
+            .to_string();
+        let infinite = matches!(self.settings.artboard, settings::Artboard::Infinite);
+        let mut nb = notebook::NotebookData::new(&name, infinite, self.current_finish);
+        nb.doc_layout = self.doc_layout;
+        nb.pages = self.pages.clone();
+        let page_pt = self.settings.artboard_size();
+        let margins = self.doc_layout.margins;
+        let base = self.doc_layout.font_size;
+        let default = format!("{name}.pdf");
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_title("Exportar a PDF")
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(&default)
+            .save_file()
+        {
+            match pdf_export::export_notebook_pdf(&nb, page_pt, margins, base, &dest) {
+                Ok(()) => self.set_toast(format!("Exportado a PDF ({} hojas)", nb.pages.len().max(1))),
+                Err(_) => self.set_toast("Error al exportar el PDF"),
+            }
+        }
     }
 
     /// Abre un cuaderno desde disco y entra al lienzo.
@@ -7576,6 +7610,9 @@ impl ApplicationHandler for App {
                 }
                 if actions.redo {
                     self.redo_op();
+                }
+                if actions.export_pdf {
+                    self.export_pdf_dialog();
                 }
                 if actions.clear {
                     self.doc.clear();

@@ -261,6 +261,7 @@ pub struct UiActions {
     pub undo: bool,
     pub redo: bool,
     pub clear: bool,
+    pub export_pdf: bool, // exportar el cuaderno/nota actual a PDF (boton de la barra inferior)
     pub layers_dirty: bool, // el panel de capas modifico el documento (re-subir malla)
     /// Se selecciono un slot de la RUEDA con pincel procedural/herramienta: hay que
     /// salir del pincel de Photoshop y volver al pincel del slot.
@@ -1100,6 +1101,32 @@ fn icon_precision(p: &egui::Painter, c: Pos2) {
     p.circle_stroke(c, 5.5, st);
     p.line_segment([c + egui::vec2(-8.0, 0.0), c + egui::vec2(8.0, 0.0)], st);
     p.line_segment([c + egui::vec2(0.0, -8.0), c + egui::vec2(0.0, 8.0)], st);
+}
+
+/// Icono de exportar a PDF: una hoja (con la esquina doblada) y una flecha hacia abajo.
+fn icon_pdf(p: &egui::Painter, c: Pos2) {
+    let col = Color32::from_gray(70);
+    let st = Stroke::new(1.4, col);
+    let (l, r, t, b, fold) = (c.x - 5.0, c.x + 5.0, c.y - 7.0, c.y + 7.0, 3.0);
+    let sheet = vec![
+        egui::pos2(l, t),
+        egui::pos2(r - fold, t),
+        egui::pos2(r, t + fold),
+        egui::pos2(r, b),
+        egui::pos2(l, b),
+    ];
+    p.add(Shape::closed_line(sheet, st));
+    // Flecha de exportar (hacia abajo) en el centro de la hoja.
+    p.line_segment([egui::pos2(c.x, c.y - 2.5), egui::pos2(c.x, c.y + 3.5)], st);
+    p.add(Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - 2.6, c.y + 1.5),
+            egui::pos2(c.x + 2.6, c.y + 1.5),
+            egui::pos2(c.x, c.y + 4.8),
+        ],
+        col,
+        Stroke::NONE,
+    ));
 }
 
 /// Icono de engranaje (ajustes).
@@ -3258,6 +3285,9 @@ pub fn build_panel(
                 if icon_text_row(ui, false, "Precisión", icon_precision) {
                     state.show_settings = true;
                     state.settings_tab = SettingsTab::Workspace;
+                }
+                if icon_text_row(ui, false, "Exportar PDF", icon_pdf) {
+                    actions.export_pdf = true;
                 }
                 ui.separator();
 
